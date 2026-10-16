@@ -303,7 +303,7 @@ log, nothing that looks wrong.
 
 ## 11. License
 
-MIT — see [LICENSE](./LICENSE).
+MIT License — see [LICENSE](./LICENSE).
 
 ## 12. Contributing
 
