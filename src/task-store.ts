@@ -44,10 +44,25 @@ export interface TaskRecord {
   write_scopes: string[]
 }
 
-/** A task plus the two derived facts callers actually schedule on. */
+/** A task plus the derived facts callers actually schedule on. */
 export interface TaskView extends TaskRecord {
   ready: boolean
   blocked_by_open: string[]
+  /**
+   * Seconds since the claim, or `undefined` when nothing is claimed.
+   *
+   * Reported so a caller can see how long a block has been held; it is not a
+   * decision on its own.
+   */
+  claimed_age_sec?: number
+  /**
+   * True when the claim is older than the configured threshold.
+   *
+   * A *suspicion* that the holder died mid-task, not a verdict: the plugin has
+   * no way to distinguish "stuck" from "slow", so nothing is released
+   * automatically. Callers surface it and a human/Lead decides.
+   */
+  stale: boolean
 }
 
 export interface IoOutcome {
@@ -629,19 +644,47 @@ export async function setDependencies(
 }
 
 /**
- * Derive readiness: pending, with every blocker already completed.
+ * Derive readiness, and whether a claim looks abandoned.
  *
  * A blocker that does not exist counts as *not* completed, so a task can never
  * become ready because its dependency was deleted.
+ *
+ * `staleAfterSec` defaults to `0`, which means "do not judge staleness" — that
+ * keeps this function's result stable for callers that pass nothing, rather than
+ * making every view time-dependent by default.
+ *
+ * @param now - injectable clock, so a caller (or a test) can reason about the
+ *   age without waiting for real time to pass.
  */
-export function viewOf(task: TaskRecord, byId: ReadonlyMap<string, TaskRecord>): TaskView {
+export function viewOf(
+  task: TaskRecord,
+  byId: ReadonlyMap<string, TaskRecord>,
+  now: number = Date.now(),
+  staleAfterSec: number = 0,
+): TaskView {
   const open = task.blocked_by.filter(id => byId.get(id)?.status !== 'completed')
-  return { ...task, ready: task.status === 'pending' && open.length === 0, blocked_by_open: open }
+  const claimedMs = Date.parse(task.claimed_at)
+  const hasClaimTime = task.status === 'claimed' && task.claimed_at.length > 0 && !Number.isNaN(claimedMs)
+  // A claim with no parseable timestamp cannot be judged; report age 0 rather
+  // than inventing one, and never call it stale on a guess.
+  const ageSec = hasClaimTime ? Math.max(0, Math.floor((now - claimedMs) / 1000)) : 0
+  const stale = hasClaimTime && staleAfterSec > 0 && ageSec > staleAfterSec
+  return {
+    ...task,
+    ready: task.status === 'pending' && open.length === 0,
+    blocked_by_open: open,
+    ...hasClaimTime ? { claimed_age_sec: ageSec } : {},
+    stale,
+  }
 }
 
-export function viewsOf(tasks: readonly TaskRecord[]): TaskView[] {
+export function viewsOf(
+  tasks: readonly TaskRecord[],
+  now: number = Date.now(),
+  staleAfterSec: number = 0,
+): TaskView[] {
   const byId = new Map(tasks.map(task => [task.task_id, task]))
-  return tasks.map(task => viewOf(task, byId))
+  return tasks.map(task => viewOf(task, byId, now, staleAfterSec))
 }
 
 /**

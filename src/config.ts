@@ -21,10 +21,26 @@ export interface Config {
    * without shipping anyone's local paths.
    */
   debugLogPath: string
+  /**
+   * A `claimed` task older than this many **seconds** is reported as `STALE` by
+   * `swarm_status`. Default 600 (ten minutes).
+   *
+   * This marks a suspicion, it does not act on one: a claim has no expiry, so a
+   * worker that dies mid-task leaves the task `claimed` forever and everything
+   * blocked by it unreachable. `swarm_status` makes that visible; releasing it is
+   * still the Lead's decision, via `swarm_release`. Automatic reclamation would
+   * need a watchdog that can tell "stuck" from "slow", which this plugin does not
+   * have — so the threshold is deliberately a reporting knob, not a reaper.
+   *
+   * Added back in v0.2.5 after being removed in v0.2.4 as dead configuration.
+   * It is read by `viewsOf` in the same change that declares it, which is the
+   * rule this interface states for itself.
+   */
+  staleAssignmentSec: number
 }
 
 /**
- * Exactly two settings, because exactly two are read.
+ * Three settings, because three are read.
  *
  * This interface used to declare fourteen fields. Twelve of them were never
  * read anywhere in `src/` — they were vestigial from the pre-route-B design
@@ -35,12 +51,17 @@ export interface Config {
  * no error to explain why.
  *
  * Post-release feedback flagged this, so the dead fields were removed rather
- * than documented. If a setting is added back, it must be read by code in the
- * same change.
+ * than documented. `staleAssignmentSec` was one of the twelve and came back in
+ * v0.2.5 for a real purpose — it is read by the same change that declares it,
+ * which is the rule below.
+ *
+ * **Rule: if a setting is added back, it must be read by code in the same
+ * change.**
  */
 export const Config: Schema<Config> = Schema.object({
   tasksRoot: Schema.string().default(''),
   debugLogPath: Schema.string().default(''),
+  staleAssignmentSec: Schema.number().default(600),
 })
 
 /** Team board limits from the kernel: exceeding them fails creation outright. */

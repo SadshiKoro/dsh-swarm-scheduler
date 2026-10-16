@@ -144,6 +144,8 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
 
 6. 如果 worker 在执行中撞到依赖冲突（比如两个任务要改同一个文件、或者串行链在规划期没声明），它会通过 send_message 报告你。你收到报告后，用 swarm_set_deps 调整任务的 blocked_by，把冲突的任务串行化。依赖调整只由你做，不要让 worker 自己改。
 
+7. 定期用 swarm_status 查看进度。如果某个任务被标为 STALE（claimed 时间超过阈值，可能 worker 卡死或消失），用 swarm_release 释放它，让其他 worker 能重新领取。
+
 不要自己领任务、不要自己做具体编码。你的角色是调度者。`
 
 /**
@@ -168,7 +170,12 @@ export function apply(ctx: Context, config: SwarmConfig) {
     const store = new TaskStore(ctx, cwd)
     const disposers: Array<() => void> = []
 
-    registerFileTools({ ctx, store, disposers })
+    // A negative or non-finite threshold would make every claim look stale (or
+    // none); clamp to 0 meaning "do not judge", which is the safe reading.
+    const staleAssignmentSec = Number.isFinite(config.staleAssignmentSec) && config.staleAssignmentSec > 0
+      ? config.staleAssignmentSec
+      : 0
+    registerFileTools({ ctx, store, staleAssignmentSec, disposers })
 
     // Best-effort directory creation. `ctx.fs` has no mkdir in the slice this
     // plugin uses, so `ensureDir` writes a sentinel through the filesystem; a

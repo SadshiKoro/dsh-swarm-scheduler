@@ -30,9 +30,31 @@ const MAX_PLAN_TASKS = 200
 /** Longest accepted compressed result; detail belongs in a handoff file. */
 const MAX_RESULT_CHARS = 4_000
 
+/**
+ * Render an age in seconds as a short human interval: `45s`, `15m`, `2h3m`.
+ *
+ * Coarse on purpose — the number exists to tell a reader "this has been held a
+ * long time", not to be arithmetically precise.
+ */
+function formatAge(seconds: number): string {
+  if (seconds < 60) return `${Math.max(0, Math.floor(seconds))}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return rest === 0 ? `${hours}h` : `${hours}h${rest}m`
+}
+
 export interface FileToolDeps {
   ctx: Context
   store: TaskStore
+  /**
+   * Staleness threshold in seconds, read once at registration.
+   *
+   * Only `swarm_status` uses it: a claim older than this is reported as STALE so
+   * the Lead can decide whether to release it. Nothing here acts on the value.
+   */
+  staleAssignmentSec: number
   /** Collects every disposer from this registration, in one ownership list. */
   disposers: Array<() => void>
 }
@@ -51,7 +73,7 @@ function viewRow(view: TaskView): Record<string, unknown> {
   }
 }
 
-export function registerFileTools({ ctx, store, disposers }: FileToolDeps): void {
+export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }: FileToolDeps): void {
   // ------------------------------------------------------------- swarm_plan ---
   disposers.push(ctx.tools.register(defineTool({
     name: 'swarm_plan',
@@ -301,8 +323,11 @@ export function registerFileTools({ ctx, store, disposers }: FileToolDeps): void
     name: 'swarm_status',
     description:
       'Report the whole pool in one call: how many tasks exist, how many are pending, claimed or completed, '
-      + 'how many are ready to start, how many are still blocked, and a compact line per task. Use it to '
-      + 'decide whether to plan more, assign more, or stop.',
+      + 'how many are ready to start, how many are still blocked, and a compact line per task. A claim older '
+      + 'than `staleAssignmentSec` is marked STALE — a suspicion that its worker died mid-task, because a claim '
+      + 'never expires on its own. Release such a task with swarm_release if you agree it is abandoned; this '
+      + 'report only makes it visible and never reclaims anything by itself. Use it to decide whether to plan '
+      + 'more, assign more, or stop.',
     parameters: {},
     output: {
       schema: {
@@ -316,6 +341,8 @@ export function registerFileTools({ ctx, store, disposers }: FileToolDeps): void
           completed: { type: 'integer' },
           ready: { type: 'integer' },
           blocked: { type: 'integer' },
+          stale: { type: 'integer' },
+          stale_after_sec: { type: 'integer' },
           big_tasks: { type: 'array', items: { type: 'string' } },
           tasks: { type: 'array', items: { type: 'string' } },
           degraded: { type: 'string' },
@@ -323,21 +350,26 @@ export function registerFileTools({ ctx, store, disposers }: FileToolDeps): void
       },
       render: (_args, value) => {
         const tasks = value.tasks ?? []
+        const stale = value.stale ?? 0
         const head = `pool ${value.dir ?? TASKS_DIR}: total ${value.total ?? 0} · pending ${value.pending ?? 0}`
-          + ` · claimed ${value.claimed ?? 0} · completed ${value.completed ?? 0}`
+          + ` · claimed ${value.claimed ?? 0}${stale > 0 ? ` (${stale} stale)` : ''} · completed ${value.completed ?? 0}`
           + ` · ready ${value.ready ?? 0} · blocked ${value.blocked ?? 0}`
-        return text([head, ...tasks.map(line => `  ${line}`),
+        const hint = stale > 0
+          ? [`  ⚠ ${stale} claim(s) older than ${value.stale_after_sec ?? 0}s — release with swarm_release if abandoned`]
+          : []
+        return text([head, ...hint, ...tasks.map(line => `  ${line}`),
           ...(value.degraded !== undefined && value.degraded !== '' ? [`  degraded: ${value.degraded}`] : [])].join('\n'))
       },
     },
     async execute() {
       const all = await store.readAll()
-      const views = viewsOf(all.tasks)
+      const views = viewsOf(all.tasks, Date.now(), staleAssignmentSec)
       const pending = views.filter(view => view.status === 'pending').length
       const claimed = views.filter(view => view.status === 'claimed').length
       const completed = views.filter(view => view.status === 'completed').length
       const ready = views.filter(view => view.ready).length
       const blocked = views.filter(view => view.status === 'pending' && !view.ready).length
+      const stale = views.filter(view => view.stale).length
       const bigTasks = [...new Set(views.map(view => view.big_task_id).filter(id => id.length > 0))].sort()
       return {
         dir: TASKS_DIR,
@@ -347,9 +379,12 @@ export function registerFileTools({ ctx, store, disposers }: FileToolDeps): void
         completed,
         ready,
         blocked,
+        stale,
+        stale_after_sec: staleAssignmentSec,
         big_tasks: bigTasks,
         tasks: views.map(view => `${view.task_id} [${view.status}${view.ready ? ', ready' : ''}]`
           + (view.claimed_by.length > 0 ? ` by ${view.claimed_by}` : '')
+          + (view.stale ? ` [STALE, claimed ${formatAge(view.claimed_age_sec ?? 0)} ago]` : '')
           + (view.blocked_by_open.length > 0 ? ` waiting on ${view.blocked_by_open.join(',')}` : '')
           + ` — ${view.title}`),
         degraded: all.io.degraded ?? store.degraded ?? '',
