@@ -221,7 +221,8 @@ chain — `swarm_ready` (who may work), `swarm_claim` (the work lands in a worke
 `swarm_complete` (the result returns to the pool). The team board's `reassign` runs the other
 direction: a Lead *assigns* work to a person. Two different goals, not two implementations of one.
 
-Route B also dissolves three defects that route A suffered from (all measured, see DESIGN.md §12.1):
+Route B also dissolves three defects that route A suffered from — all measured, see
+[DESIGN.md §12.1](./DESIGN.md#121-three-architectural-defects-found-by-measurement-recorded-after-the-v015-concurrency-verification):
 
 | Defect under route A | Why it disappears under route B |
 |---|---|
@@ -244,7 +245,8 @@ chain that is the whole point, and would tie the plugin to the experimental `age
 1. **No visualisation panel.** The header panel was removed in v0.2.0. Its data route
    (`/api/swarm/board`) needed `ctx.webServer`, which is **not reliably resolvable** from this
    plugin's fiber (measured: one `ROUTE REGISTERED`, the rest `ROUTE SKIPPED webServer not mounted`).
-   A button opening a "board unavailable" panel was worse than no button. See DESIGN.md §5.
+   A button opening a "board unavailable" panel was worse than no button. See
+   [DESIGN.md §5](./DESIGN.md#5-visualization-active-session-management-area).
 2. **No memory isolation.** The plugin contract exposes no memory service. Context passes between
    blocks as **files**, not through memory.
 3. **`ctx.fs` sandbox degradation.** Writes through `ctx.fs` need a per-call sandbox policy; when the
@@ -308,5 +310,6 @@ MIT License — see [LICENSE](./LICENSE).
 ## 12. Contributing
 
 Issues and pull requests are welcome. If you are changing the scheduler itself, please read
-`DESIGN.md` first: §12.1 records the defects that shaped the current design, and §12.2 the
-architecture decision (route B) that the rest of the code assumes.
+[`DESIGN.md`](./DESIGN.md) first: [§12.1](./DESIGN.md#121-three-architectural-defects-found-by-measurement-recorded-after-the-v015-concurrency-verification)
+records the defects that shaped the current design, and [§12.2](./DESIGN.md#122-architectural-decision-route-b-file-pool-as-authority)
+the architecture decision (route B) that the rest of the code assumes.
