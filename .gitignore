@@ -1,0 +1,8 @@
+node_modules/
+*.tgz
+.removed-src-backup/
+.dsh-tasks/
+swarm-scheduler-load.log
+pnpm-lock.yaml.broken-
+cordis.patch.yml.bak-insert
+package-lock.json

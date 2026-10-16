@@ -1,0 +1,451 @@
+/**
+ * The file-driven tool surface: five tools, all of them plain task-pool I/O.
+ *
+ * None of these touch a Cordis service beyond `ctx.fs` (through `TaskStore`),
+ * because every richer service this plugin once relied on proved unreachable
+ * from its fiber. Dispatch is therefore not this plugin's job any more: the Lead
+ * reads `swarm_ready` and assigns work with its own kernel subagent tools, while
+ * this layer owns only the durable record of what exists, what is taken and what
+ * finished.
+ */
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import {
+  TASKS_DIR,
+  TaskStore,
+  blankTask,
+  claimTask,
+  completeTask,
+  releaseTask,
+  setDependencies,
+  viewsOf,
+  type TaskRecord,
+  type TaskView,
+} from './task-store.js'
+
+const text = (value: string) => [{ type: 'text' as const, text: value }]
+
+/** Maximum tasks accepted in one `swarm_plan` call. */
+const MAX_PLAN_TASKS = 200
+/** Longest accepted compressed result; detail belongs in a handoff file. */
+const MAX_RESULT_CHARS = 4_000
+
+export interface FileToolDeps {
+  ctx: Context
+  store: TaskStore
+  /** Collects every disposer from this registration, in one ownership list. */
+  disposers: Array<() => void>
+}
+
+function viewRow(view: TaskView): Record<string, unknown> {
+  return {
+    task_id: view.task_id,
+    big_task_id: view.big_task_id,
+    title: view.title,
+    status: view.status,
+    claimed_by: view.claimed_by,
+    ready: view.ready,
+    blocked_by: view.blocked_by,
+    blocked_by_open: view.blocked_by_open,
+    write_scopes: view.write_scopes,
+  }
+}
+
+export function registerFileTools({ ctx, store, disposers }: FileToolDeps): void {
+  // ------------------------------------------------------------- swarm_plan ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_plan',
+    description:
+      'Create the task pool on disk: one JSON file per task under .dsh-tasks/. Call this first, with the '
+      + 'whole decomposition. An existing task_id is never overwritten — it is reported as a conflict so a '
+      + 'repeated call cannot silently reset finished work. blocked_by names other task_ids in the same call '
+      + 'or already on disk; a task is ready only once every blocker is completed.',
+    parameters: {
+      tasks: {
+        type: 'array',
+        required: true,
+        description: 'Tasks to create. Each becomes <task_id>.json.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            task_id: { type: 'string', required: true, description: 'Unique id, e.g. big-1/small-1-1' },
+            big_task_id: { type: 'string', required: true, description: 'Owning big task block, e.g. big-1' },
+            title: { type: 'string', required: true, description: 'Short title' },
+            description: { type: 'string', required: true, description: 'Inputs, outputs and acceptance criteria' },
+            blocked_by: { type: 'array', description: 'Task ids that must complete first', items: { type: 'string' } },
+            write_scopes: { type: 'array', description: 'Files or directory prefixes this task will modify', items: { type: 'string' } },
+          },
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          created: { type: 'array', items: { type: 'string' } },
+          conflicts: { type: 'array', items: { type: 'string' } },
+          errors: { type: 'array', items: { type: 'string' } },
+          dir: { type: 'string' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const created = value.created ?? []
+        const conflicts = value.conflicts ?? []
+        const errors = value.errors ?? []
+        const lines = [`pool: ${created.length} created, ${conflicts.length} conflict(s), ${errors.length} error(s)`]
+        if (created.length > 0) lines.push(`  created: ${created.join(', ')}`)
+        if (conflicts.length > 0) lines.push(`  already present (not overwritten): ${conflicts.join(', ')}`)
+        if (errors.length > 0) lines.push(...errors.map(line => `  ! ${line}`))
+        if (value.degraded !== undefined && value.degraded !== '') lines.push(`  degraded: ${value.degraded}`)
+        return text(lines.join('\n'))
+      },
+    },
+    async execute(args) {
+      const created: string[] = []
+      const conflicts: string[] = []
+      const errors: string[] = []
+      const incoming = args.tasks ?? []
+      if (incoming.length > MAX_PLAN_TASKS) {
+        return { created, conflicts, errors: [`${incoming.length} tasks exceeds the ${MAX_PLAN_TASKS} limit for one call`], dir: TASKS_DIR, degraded: '' }
+      }
+      const ensured = await store.ensureDir()
+      if (!ensured.ok) errors.push(`pool directory unavailable: ${ensured.error ?? 'unknown'}`)
+
+      const seen = new Set<string>()
+      for (const spec of incoming) {
+        const taskId = spec.task_id.trim()
+        if (taskId.length === 0) { errors.push('a task arrived with an empty task_id'); continue }
+        if (seen.has(taskId)) { conflicts.push(taskId); continue }
+        seen.add(taskId)
+        const record: TaskRecord = blankTask(taskId, {
+          big_task_id: spec.big_task_id,
+          title: spec.title,
+          description: spec.description,
+          blocked_by: spec.blocked_by ?? [],
+          write_scopes: spec.write_scopes ?? [],
+        })
+        const written = await store.createExclusive(record)
+        if (written.ok) created.push(taskId)
+        else if ((written.error ?? '').includes('already exists')) conflicts.push(taskId)
+        else errors.push(`${taskId}: ${written.error ?? 'write failed'}`)
+      }
+      return {
+        created,
+        conflicts,
+        errors,
+        dir: TASKS_DIR,
+        degraded: ensured.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ------------------------------------------------------------ swarm_ready ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_ready',
+    description:
+      'List the tasks a worker can start right now: status pending with every blocked_by entry completed. '
+      + 'Readiness is derived from the files on disk on every call, so it needs no bookkeeping. Use this to '
+      + 'decide what to assign next; assign with your own subagent tools, not from here.',
+    parameters: {
+      big_task_id: { type: 'string', description: 'Limit to one big task block' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          total: { type: 'integer' },
+          dir: { type: 'string' },
+          tasks: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                task_id: { type: 'string' },
+                big_task_id: { type: 'string' },
+                title: { type: 'string' },
+                description: { type: 'string' },
+                write_scopes: { type: 'array', items: { type: 'string' } },
+                blocked_by: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const tasks = value.tasks ?? []
+        if (tasks.length === 0) return text(`ready: 0 (pool: ${value.dir ?? TASKS_DIR})`)
+        return text(`ready: ${value.total ?? tasks.length}\n`
+          + tasks.map(task => `  ${task.task_id} [${task.big_task_id ?? ''}] ${task.title ?? ''}`
+            + ((task.write_scopes ?? []).length > 0 ? `  scope: ${(task.write_scopes ?? []).join(', ')}` : '')).join('\n'))
+      },
+    },
+    async execute(args) {
+      const all = await store.readAll()
+      const filter = args.big_task_id
+      const ready = viewsOf(all.tasks)
+        .filter(view => view.ready)
+        .filter(view => filter === undefined || view.big_task_id === filter)
+      return {
+        total: ready.length,
+        dir: TASKS_DIR,
+        tasks: ready.map(view => ({
+          task_id: view.task_id,
+          big_task_id: view.big_task_id,
+          title: view.title,
+          description: view.description,
+          write_scopes: view.write_scopes,
+          blocked_by: view.blocked_by,
+        })),
+        degraded: all.io.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ------------------------------------------------------------ swarm_claim ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_claim',
+    description:
+      'Claim one task for one worker, atomically. Two concurrent callers cannot both win: the loser is told '
+      + 'the task is taken so it can pick another. Normally the Lead claims on the worker\'s behalf before '
+      + 'assigning it; a worker that polls the pool itself may claim its own task instead. Claiming never '
+      + 'overwrites completed work.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Task to claim' },
+      claimed_by: { type: 'string', required: true, description: 'Agent id of the worker taking it' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'io_error'] },
+          message: { type: 'string' },
+          claimed_by: { type: 'string' },
+          claimed_at: { type: 'string' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      const outcome = await claimTask(store, args.task_id, args.claimed_by)
+      const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
+      return {
+        ok: outcome.ok,
+        code: outcome.code,
+        message: outcome.message,
+        claimed_by: after.task?.claimed_by ?? '',
+        claimed_at: after.task?.claimed_at ?? '',
+        degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // --------------------------------------------------------- swarm_complete ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_complete',
+    description:
+      'Record that one task finished, with its outcome. Call it yourself when you did the work, or on a '
+      + 'worker\'s behalf when it reported back. The result is the compressed outcome — paths, decisions, '
+      + 'evidence — and a second completion of the same task is refused rather than silently accepted.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Task that finished' },
+      result: { type: 'string', required: true, description: 'Compressed outcome: files, decisions, evidence' },
+      completed_by: { type: 'string', required: true, description: 'Agent id that did the work' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['completed', 'not_found', 'invalid_state', 'io_error', 'result_too_long'] },
+          message: { type: 'string' },
+          completed_at: { type: 'string' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      if (args.result.length > MAX_RESULT_CHARS) {
+        return {
+          ok: false, code: 'result_too_long' as const,
+          message: `result is ${args.result.length} chars; keep it under ${MAX_RESULT_CHARS} and put detail in a handoff file`,
+          completed_at: '', degraded: '',
+        }
+      }
+      const outcome = await completeTask(store, args.task_id, args.result, args.completed_by)
+      const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
+      return {
+        ok: outcome.ok,
+        code: outcome.code,
+        message: outcome.message,
+        completed_at: after.task?.completed_at ?? '',
+        degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ----------------------------------------------------------- swarm_status ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_status',
+    description:
+      'Report the whole pool in one call: how many tasks exist, how many are pending, claimed or completed, '
+      + 'how many are ready to start, how many are still blocked, and a compact line per task. Use it to '
+      + 'decide whether to plan more, assign more, or stop.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          dir: { type: 'string' },
+          total: { type: 'integer' },
+          pending: { type: 'integer' },
+          claimed: { type: 'integer' },
+          completed: { type: 'integer' },
+          ready: { type: 'integer' },
+          blocked: { type: 'integer' },
+          big_tasks: { type: 'array', items: { type: 'string' } },
+          tasks: { type: 'array', items: { type: 'string' } },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const tasks = value.tasks ?? []
+        const head = `pool ${value.dir ?? TASKS_DIR}: total ${value.total ?? 0} · pending ${value.pending ?? 0}`
+          + ` · claimed ${value.claimed ?? 0} · completed ${value.completed ?? 0}`
+          + ` · ready ${value.ready ?? 0} · blocked ${value.blocked ?? 0}`
+        return text([head, ...tasks.map(line => `  ${line}`),
+          ...(value.degraded !== undefined && value.degraded !== '' ? [`  degraded: ${value.degraded}`] : [])].join('\n'))
+      },
+    },
+    async execute() {
+      const all = await store.readAll()
+      const views = viewsOf(all.tasks)
+      const pending = views.filter(view => view.status === 'pending').length
+      const claimed = views.filter(view => view.status === 'claimed').length
+      const completed = views.filter(view => view.status === 'completed').length
+      const ready = views.filter(view => view.ready).length
+      const blocked = views.filter(view => view.status === 'pending' && !view.ready).length
+      const bigTasks = [...new Set(views.map(view => view.big_task_id).filter(id => id.length > 0))].sort()
+      return {
+        dir: TASKS_DIR,
+        total: views.length,
+        pending,
+        claimed,
+        completed,
+        ready,
+        blocked,
+        big_tasks: bigTasks,
+        tasks: views.map(view => `${view.task_id} [${view.status}${view.ready ? ', ready' : ''}]`
+          + (view.claimed_by.length > 0 ? ` by ${view.claimed_by}` : '')
+          + (view.blocked_by_open.length > 0 ? ` waiting on ${view.blocked_by_open.join(',')}` : '')
+          + ` — ${view.title}`),
+        degraded: all.io.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ---------------------------------------------------------- swarm_release ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_release',
+    description:
+      'Return a claimed task to the pool so another worker can pick it up. Use it when the worker holding a task '
+      + 'disappeared before finishing (interrupted, closed, crashed): without this, the claim never expires, the '
+      + 'task stays claimed forever, and every task blocked by it stays unreachable. Only a claimed task can be '
+      + 'released — completing a task is a different transition, and a completed task is never re-opened by this.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Claimed task to return to the pool' },
+      released_by: { type: 'string', required: true, description: 'Who is releasing it, e.g. lead' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['released', 'not_found', 'invalid_state', 'io_error'] },
+          message: { type: 'string' },
+          released_by: { type: 'string' },
+          released_at: { type: 'string' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      const outcome = await releaseTask(store, args.task_id, args.released_by)
+      return {
+        ok: outcome.ok,
+        code: outcome.code,
+        message: outcome.message,
+        released_by: outcome.released_by,
+        released_at: outcome.released_at,
+        degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // --------------------------------------------------------- swarm_set_deps ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_set_deps',
+    description:
+      'LEAD ONLY — replace one task\'s blocked_by list. Do not call this as a worker: if you hit a dependency '
+      + 'conflict while executing (two tasks touching one file, or a serialisation chain that was never declared '
+      + 'at plan time), report it to the Lead with send_message and let the Lead decide. Dependency editing is '
+      + 'centralised on purpose — concurrent edits by workers would race each other and could interleave into a '
+      + 'cycle. The Lead uses this to serialise conflicting tasks after the fact, which planning could not know '
+      + 'about. Rejects unknown task ids (invalid_dependency) and any change that would close a dependency cycle '
+      + '(cycle_detected), including a self-reference.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Task whose dependency list is being replaced' },
+      blocked_by: {
+        type: 'array',
+        required: true,
+        description: 'The complete new dependency list; an empty array clears all dependencies',
+        items: { type: 'string' },
+      },
+      updated_by: { type: 'string', required: true, description: 'Who is making the change, e.g. lead' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['updated', 'not_found', 'invalid_dependency', 'cycle_detected', 'io_error'] },
+          message: { type: 'string' },
+          blocked_by: { type: 'array', items: { type: 'string' } },
+          updated_by: { type: 'string' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + ((value.blocked_by ?? []).length > 0 ? `\n  blocked_by now: ${(value.blocked_by ?? []).join(', ')}` : '')
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      const outcome = await setDependencies(store, args.task_id, args.blocked_by ?? [], args.updated_by)
+      return {
+        ok: outcome.ok,
+        code: outcome.code,
+        message: outcome.message,
+        blocked_by: outcome.blocked_by,
+        updated_by: outcome.updated_by,
+        degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+}
