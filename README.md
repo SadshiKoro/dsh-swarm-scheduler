@@ -115,7 +115,10 @@ the service is never provided and must be mounted explicitly. Add it to your pro
 > with the Team versions (`spawn_teammate`, `send_message`, `team_task_*`, …). Expect those tools to
 > change. Roll back by removing the bundle line and restarting.
 
-**Restart is mandatory** — the bundle composition is resolved at startup.
+> **Rolling back.** To undo the side effect you must **remove
+> `@deepseek-ai/dsh-experimental-agent-team-profile` from the profile's bundle list and then restart
+> DSH**. Removing only the plugin does **not** restore the native subagent tools — the bundle is what
+> swapped them, and the bundle is independent of this plugin.
 
 ### 4.2 Install the plugin
 
@@ -126,7 +129,24 @@ dsh plugin --profile <your-profile> add link:/path/to/dsh-swarm-scheduler
 (Or add a `file:`/`link:` entry to the profile's `dependencies` and the package name to
 `dsh.profile.bundles`.)
 
-### 4.3 If the plugin does not load
+### 4.3 `tasksRoot` is required — set it before using the plugin
+
+**You must fill in an absolute path.** The default is empty, and an empty value makes the task pool
+fall back to `process.cwd()` — which in DSH Desktop is the **profile directory, not the session
+workspace**. Leave it unset and every task file is created in the wrong place.
+
+Give the `swarm-scheduler` entry a `config` block in the profile's `cordis.patch.yml`:
+
+```yaml
+- id: swarm-scheduler
+  config:
+    tasksRoot: 'C:/your/workspace/absolute/path'
+```
+
+Use forward slashes and an absolute path. The pool is created as
+`<tasksRoot>/.dsh-tasks/<task_id>.json`.
+
+### 4.4 If the plugin does not load
 
 Set the environment variable `DSH_SWARM_SCHEDULER_MODULE_PROBE` to a file path. When the module is
 imported it appends one line, `MODULE EVALUATED pid=<pid>`:
@@ -143,10 +163,10 @@ to tell those two failure domains apart, since the loader never awaits `apply()`
 `APPLY OK` / `APPLY FAILED` lines are separate: they are written only when the plugin's
 `debugLogPath` config value is set (empty by default = no log at all).
 
-### 4.4 Restart
+### 4.5 Restart
 
-**You must restart DSH.** Tools, the prompt section, and the bundle list are all applied at startup.
-There is no hot reload.
+**You must restart DSH.** Tools, the prompt section, the bundle list and `tasksRoot` are all applied
+at startup. There is no hot reload.
 
 ---
 
@@ -262,6 +282,28 @@ chain that is the whole point, and would tie the plugin to the experimental `age
 6. **`swarm_set_deps` cannot be enforced at runtime.** It is Lead-only by description and protocol,
    not by a permission check — checking would require `agentTeams.membership`, i.e. reintroducing the
    service route B deliberately removed.
+7. **`write_scopes` warns, it does not lock.** Overlap only produces an advisory warning; two tasks
+   that write the same file are **not blocked by each other**. Conflict protection depends on the
+   decomposition serialising them (via `blocked_by`) or on the workers negotiating it themselves —
+   the pool enforces nothing. **Two tasks editing one file in parallel can still overwrite each
+   other.** Treat `write_scopes` as a signal to the planner, never as mutual exclusion.
+8. **This plugin depends on an experimental package.** It needs
+   `@deepseek-ai/dsh-experimental-agent-team-profile`, which is **not in any DSH default bundle** and
+   must be mounted by hand. That has three consequences:
+   - installing the plugin takes one extra configuration step (mounting the bundle) before it works
+     at all;
+   - the bundle **may change with a DSH update**, and this plugin does **not** guarantee long-term
+     compatibility with it. `experimental` is the package's own label, not a note of caution added
+     here;
+   - if DSH promotes that package into a default bundle, or removes it, **the installation steps in
+     §4 will change** and this README may be out of date.
+9. **There is no automated test suite yet.** Concurrency correctness was established by **manual
+   measurement**, not by tests that run on every change: the single-task closed loop, a 3-worker
+   concurrent run with atomic claiming, and the route-B closed loop. `swarm_set_deps` has all four
+   return paths (`updated` / `not_found` / `invalid_dependency` / `cycle_detected`) exercised by hand,
+   and `swarm_release` likewise. Be aware of what that does and does not cover: the behaviour was
+   verified on the days it was tested, but **nothing re-verifies it after a change**. If you intend to
+   use this in production, run your own verification in your own scenario first.
 
 ---
 

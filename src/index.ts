@@ -76,9 +76,9 @@ function debugLog(configured: string, line: string): void {
  * scope isolation, and the old probe removed the `inject` declaration before
  * testing `ctx.agentTeams`, so `cannot get property "agentTeams" without inject`
  * was guaranteed — a self-fulfilling test. The real cause was that nothing ever
- * provided the service: `agentTeams` comes from `@deepseek-ai/dsh-experimental-
- * agent-team`, which IS registered in the profile's bundle list as of this
- * build, so the service now exists.
+ * provided the service: `agentTeams` comes from
+ * `@deepseek-ai/dsh-experimental-agent-team-profile`, which IS registered in the
+ * profile's bundle list as of this build, so the service now exists.
  *
  * Declared dependencies — **route B only** (see DESIGN.md §12.2):
  *   - `tools`        — the registry the five tools are published to.

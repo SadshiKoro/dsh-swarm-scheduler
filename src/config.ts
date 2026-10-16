@@ -1,34 +1,6 @@
 import Schema from '@deepseek-ai/schemastery'
 
 export interface Config {
-  /** Maximum spawned teammates this scheduler will create and drive. */
-  maxWorkers: number
-  /** Refuse a plan larger than this, so a decomposition cannot exhaust the Team task board. */
-  maxTasksPerPlan: number
-  /** Run the pump automatically from agent/status + a fallback timer. */
-  autoDispatch: boolean
-  /** Fallback poll interval; covers missed events and cold resumes (seed events never publish). */
-  autoDispatchFallbackMs: number
-  /** An in-progress block whose worker has no turn for this long is flagged STALE_ASSIGNMENT. */
-  staleAssignmentSec: number
-  /** Hard cap on the compressed report a worker may send back. */
-  maxSummaryChars: number
-  /**
-   * Subagent provider used to materialize a teammate. Empty means "this
-   * deployment has not told us which provider to use": spawning a worker then
-   * fails loudly with an actionable message rather than guessing a name.
-   */
-  workerProvider: string
-  /** Require every task subject to start with "[<big_task_id>] ". */
-  strictGroupPrefix: boolean
-  /** Workspace-relative directory for handoff notes. */
-  handoffDir: string
-  /** Hard cap on handoff note bytes; the note is a summary, not a transcript. */
-  maxHandoffBytes: number
-  /** Read-only board route path for the Web panel (must be plugin-prefixed). */
-  boardRoutePath: string
-  /** Browser-side panel poll interval. */
-  pollIntervalMs: number
   /**
    * Root directory the task pool lives under. Empty means `process.cwd()`.
    *
@@ -51,19 +23,22 @@ export interface Config {
   debugLogPath: string
 }
 
+/**
+ * Exactly two settings, because exactly two are read.
+ *
+ * This interface used to declare fourteen fields. Twelve of them were never
+ * read anywhere in `src/` — they were vestigial from the pre-route-B design
+ * (`maxWorkers` / `maxSummaryChars` / `handoffDir` and friends belonged to
+ * modules that were deleted). A configuration surface that accepts values it
+ * ignores is the same class of defect as documentation that describes behaviour
+ * the code does not have: the user sets something, nothing happens, and there is
+ * no error to explain why.
+ *
+ * Post-release feedback flagged this, so the dead fields were removed rather
+ * than documented. If a setting is added back, it must be read by code in the
+ * same change.
+ */
 export const Config: Schema<Config> = Schema.object({
-  maxWorkers: Schema.number().default(3),
-  maxTasksPerPlan: Schema.number().default(60),
-  autoDispatch: Schema.boolean().default(true),
-  autoDispatchFallbackMs: Schema.number().default(60_000),
-  staleAssignmentSec: Schema.number().default(180),
-  maxSummaryChars: Schema.number().default(1500),
-  workerProvider: Schema.string().default(''),
-  strictGroupPrefix: Schema.boolean().default(true),
-  handoffDir: Schema.string().default('.dsh-swarm/reports'),
-  maxHandoffBytes: Schema.number().default(16_384),
-  boardRoutePath: Schema.string().default('/api/swarm/board'),
-  pollIntervalMs: Schema.number().default(2_000),
   tasksRoot: Schema.string().default(''),
   debugLogPath: Schema.string().default(''),
 })
