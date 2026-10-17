@@ -403,6 +403,97 @@ export class TaskStore {
 /** Locks held by this process, used only when the filesystem lock is denied. */
 const heldLocks = new Set<string>()
 
+/** Path of one task's claim lock. */
+function lockPath(dirPath: string, taskId: string): string {
+  return join(dirPath, `${taskId}${LOCK_SUFFIX}`)
+}
+
+/**
+ * Delete a task's lock file, ignoring every failure.
+ *
+ * A missing lock is the normal case (the holder released it, or it was never
+ * taken because the caller used the in-process guard), so "not found" must not
+ * be reported as an error. A lock that cannot be removed here is not a dead end:
+ * `claimTask` clears a residual lock (one present while the task still reads
+ * `pending`) before taking its own, so the next claimer recovers either way.
+ */
+function removeLock(dirPath: string, taskId: string): void {
+  try {
+    unlinkSync(lockPath(dirPath, taskId))
+  } catch {
+    // Deliberately silent: absent is success here.
+  }
+}
+
+/** True when the lock file exists on disk. */
+function lockExists(dirPath: string, taskId: string): boolean {
+  try {
+    return existsSync(lockPath(dirPath, taskId))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Normalize one write scope for comparison.
+ *
+ * Mirrors the kernel's rule (`writeScope()` in the agent-team package): forward
+ * slashes, no leading `./`, no trailing slash, no empty segments. Keeping the
+ * same normalization matters — the two are compared against each other, and
+ * `src/api` vs `./src/api/` is the same scope written two ways.
+ */
+function normalizeScope(raw: string): string {
+  return raw
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/+$/, '')
+    .trim()
+}
+
+/**
+ * Whether two scopes overlap, meaning a single-file write could land in both.
+ *
+ * Equal scopes overlap, and so do ancestor/descendant pairs: a task owning
+ * `src` and a task owning `src/api` can edit the same file. The comparison is
+ * therefore **directory-granular, not file-granular** — two tasks that both
+ * declare `src/` are refused even when they would touch different files in it.
+ * That is the intended trade: a false refusal costs one serialisation step,
+ * while a false admission costs a silently overwritten file.
+ */
+export function scopesOverlap(a: string, b: string): boolean {
+  const left = normalizeScope(a)
+  const right = normalizeScope(b)
+  if (left.length === 0 || right.length === 0) return false
+  if (left === right) return true
+  return left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
+}
+
+/**
+ * Find the first claimed task whose write scopes collide with `task`'s.
+ *
+ * Returns the conflicting task and the exact scope pair, so the refusal can name
+ * both — "scope_conflict" alone would leave the caller guessing which of its
+ * scopes is the problem.
+ */
+export function findScopeConflict(
+  task: TaskRecord,
+  others: readonly TaskRecord[],
+): { task_id: string; claimed_by: string; scope: string; other_scope: string } | undefined {
+  if (task.write_scopes.length === 0) return undefined
+  for (const other of others) {
+    if (other.task_id === task.task_id) continue
+    if (other.status !== 'claimed') continue
+    for (const mine of task.write_scopes) {
+      for (const theirs of other.write_scopes) {
+        if (scopesOverlap(mine, theirs)) {
+          return { task_id: other.task_id, claimed_by: other.claimed_by, scope: mine, other_scope: theirs }
+        }
+      }
+    }
+  }
+  return undefined
+}
+
 /**
  * Claim a task for one agent, atomically, and record who won.
  *
@@ -415,13 +506,24 @@ const heldLocks = new Set<string>()
  *
  * `EEXIST` is a normal outcome here, never an error: the loser is told to pick
  * another task rather than retrying in a loop.
+ *
+ * Three guards run before the lock is taken:
+ *   - a **residual lock** (`.lock` present while the task reads `pending`) is
+ *     cleared, because it means a previous holder died inside its lock window
+ *     and never released it. Without this the task would answer
+ *     `already_claimed` forever with no holder to blame;
+ *   - a **scope conflict** with an already-claimed task is refused as
+ *     `scope_conflict`. This is the enforcing half of `write_scopes`; the soft
+ *     half is informational — `swarm_ready` lists each task's declared scopes,
+ *     so a likely collision is visible while planning, before anyone claims;
+ *   - the usual state checks (missing / completed / already claimed).
  */
 export async function claimTask(
   store: TaskStore,
   taskId: string,
   claimedBy: string,
   clock: Clock = defaultClock,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -430,7 +532,28 @@ export async function claimTask(
     return { ok: false, code: 'invalid_state', message: `${taskId} is already completed` }
   }
   if (found.task.status === 'claimed') {
+    // The lock being present is expected in this state; the holder is named.
     return { ok: false, code: 'already_claimed', message: `${taskId} is held by ${found.task.claimed_by || 'another agent'}` }
+  }
+
+  const all = await store.readAll()
+  const byId = new Map(all.tasks.map(task => [task.task_id, task]))
+  const conflict = findScopeConflict(byId.get(taskId) ?? found.task, all.tasks)
+  if (conflict !== undefined) {
+    const holder = conflict.claimed_by.length > 0 ? conflict.claimed_by : 'another agent'
+    return {
+      ok: false,
+      code: 'scope_conflict',
+      message: `${taskId} refused: write scope "${conflict.scope}" overlaps "${conflict.other_scope}" `
+        + `of ${conflict.task_id} (held by ${holder}). Serialise them with swarm_set_deps, or make the scopes narrower.`,
+    }
+  }
+
+  // The state says pending, so any lock still on disk belongs to a dead holder.
+  let staleLockCleared = false
+  if (lockExists(store.dirPath, taskId)) {
+    removeLock(store.dirPath, taskId)
+    staleLockCleared = true
   }
 
   const lock = await acquireLock(store, taskId)
@@ -454,12 +577,28 @@ export async function claimTask(
     if (!written.ok) {
       return { ok: false, code: 'io_error', message: `claim not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
     }
-    return { ok: true, code: 'claimed', message: `${taskId} claimed by ${claimedBy}`, degraded: written.degraded ?? lock.degraded }
+    return {
+      ok: true,
+      code: 'claimed',
+      message: `${taskId} claimed by ${claimedBy}`,
+      degraded: written.degraded ?? lock.degraded,
+      ...staleLockCleared ? { stale_lock_cleared: true } : {},
+    }
   } finally {
-    releaseLock(store.dirPath, taskId, lock.mode)  }
+    releaseLock(store.dirPath, taskId, lock.mode)
+  }
 }
 
-/** Mark a task completed and store its outcome. */
+/**
+ * Mark a task completed and store its outcome.
+ *
+ * Only a `claimed` task can be completed. An earlier version accepted a
+ * `pending` one as well, to let a caller close work without claiming it first —
+ * but that made the state machine wrong: it allowed a task nobody holds to
+ * become `completed`, which reads as "someone did this" when nobody did. The
+ * claim is what records *who* did the work, so requiring it keeps `claimed_by`
+ * meaningful. Callers that want to close unclaimed work should claim it first.
+ */
 export async function completeTask(
   store: TaskStore,
   taskId: string,
@@ -472,14 +611,21 @@ export async function completeTask(
   if (found.task.status === 'completed') {
     return { ok: false, code: 'invalid_state', message: `${taskId} is already completed` }
   }
+  if (found.task.status !== 'claimed') {
+    return {
+      ok: false,
+      code: 'invalid_state',
+      message: `${taskId} is ${found.task.status}; only a claimed task can be completed`,
+    }
+  }
   const stamp = clock().toISOString()
   const next: TaskRecord = {
     ...found.task,
     status: 'completed',
     completed_at: stamp,
     result,
-    // Record who finished it even when the claim step was skipped.
-    claimed_by: found.task.claimed_by.length > 0 ? found.task.claimed_by : completedBy,
+    // `claimed_by` already names the holder; the status guard above guarantees
+    // it is non-empty, so `completedBy` is informational rather than a fallback.
   }
   const written = await store.writeExisting(next)
   if (!written.ok) {
@@ -500,16 +646,22 @@ export async function completeTask(
  * Releasing clears the claim fields and nothing else. `completed_at` and
  * `result` are deliberately left untouched so a release can never launder a
  * finished task into a fresh one; the status guard makes that impossible anyway.
+ *
+ * It also **deletes the task's `.lock`**. Changing the status alone is not
+ * enough: a worker that dies inside its lock window leaves the lock behind, and
+ * a surviving lock would make every later claim answer `already_claimed` — with
+ * no holder and no way out. Releasing is the documented recovery path, so it has
+ * to clear both halves of the claim.
  */
 export async function releaseTask(
   store: TaskStore,
   taskId: string,
   releasedBy: string,
   clock: Clock = defaultClock,
-): Promise<{ ok: boolean; code: 'released' | 'not_found' | 'invalid_state' | 'io_error'; message: string; released_by: string; released_at: string; degraded?: string }> {
+): Promise<{ ok: boolean; code: 'released' | 'not_found' | 'invalid_state' | 'io_error'; message: string; released_by: string; released_at: string; lock_removed: boolean; degraded?: string }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
-    return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}`, released_by: '', released_at: '' }
+    return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}`, released_by: '', released_at: '', lock_removed: false }
   }
   if (found.task.status !== 'claimed') {
     return {
@@ -518,6 +670,7 @@ export async function releaseTask(
       message: `${taskId} is ${found.task.status}; only a claimed task can be released`,
       released_by: '',
       released_at: '',
+      lock_removed: false,
     }
   }
   const stamp = clock().toISOString()
@@ -533,17 +686,23 @@ export async function releaseTask(
     return {
       ok: false, code: 'io_error',
       message: `release not persisted: ${written.error ?? 'unknown'}`,
-      released_by: '', released_at: '',
+      released_by: '', released_at: '', lock_removed: false,
       degraded: written.degraded,
     }
   }
+  // Clear the other half of the claim. Failure is not an error: a missing lock
+  // is the normal case, and an undeletable one is cleared on the next claim.
+  const hadLock = lockExists(store.dirPath, taskId)
+  removeLock(store.dirPath, taskId)
   const holder = previousHolder.length > 0 ? previousHolder : 'an unknown holder'
   return {
     ok: true,
     code: 'released',
-    message: `${taskId} released from ${holder} by ${releasedBy}`,
+    message: `${taskId} released from ${holder} by ${releasedBy}`
+      + (hadLock ? '; stale lock removed' : ''),
     released_by: releasedBy,
     released_at: stamp,
+    lock_removed: hadLock,
     degraded: written.degraded,
   }
 }
@@ -746,15 +905,12 @@ async function acquireLock(
   }
 }
 
-function releaseLock(dirPath: string, taskId: string, mode: 'file' | 'memory'): void {  if (mode === 'memory') {
+function releaseLock(dirPath: string, taskId: string, mode: 'file' | 'memory'): void {
+  if (mode === 'memory') {
     heldLocks.delete(taskId)
     return
   }
-  try {
-    unlinkSync(join(dirPath, `${taskId}${LOCK_SUFFIX}`))
-  } catch {
-    // A lock that cannot be removed is left for the next claimer's EEXIST path.
-  }
+  removeLock(dirPath, taskId)
 }
 
 function parseTask(text: string, fallbackId: string): TaskRecord | undefined {

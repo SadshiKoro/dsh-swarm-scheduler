@@ -236,7 +236,13 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
       'Claim one task for one worker, atomically. Two concurrent callers cannot both win: the loser is told '
       + 'the task is taken so it can pick another. Normally the Lead claims on the worker\'s behalf before '
       + 'assigning it; a worker that polls the pool itself may claim its own task instead. Claiming never '
-      + 'overwrites completed work.',
+      + 'overwrites completed work. '
+      + 'This is also where `write_scopes` is enforced: if the task\'s scopes overlap '
+      + 'those of a task that is already claimed, the claim is refused with `scope_conflict` naming both the '
+      + 'conflicting task and the overlapping scopes. Serialise the two with `swarm_set_deps`, or declare '
+      + 'narrower scopes. Overlap is judged at directory granularity, so two tasks that both declare `src/` '
+      + 'are refused even when they would edit different files. '
+      + 'A lock left behind by a worker that died mid-claim is cleared automatically.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'Task to claim' },
       claimed_by: { type: 'string', required: true, description: 'Agent id of the worker taking it' },
@@ -247,14 +253,16 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
+          stale_lock_cleared: { type: 'boolean' },
           degraded: { type: 'string' },
         },
       },
       render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.stale_lock_cleared === true ? '\n  note: a stale lock left by a dead holder was cleared' : '')
         + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
     },
     async execute(args) {
@@ -266,6 +274,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         message: outcome.message,
         claimed_by: after.task?.claimed_by ?? '',
         claimed_at: after.task?.claimed_at ?? '',
+        stale_lock_cleared: outcome.stale_lock_cleared === true,
         degraded: outcome.degraded ?? store.degraded ?? '',
       }
     },
@@ -414,10 +423,12 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
           message: { type: 'string' },
           released_by: { type: 'string' },
           released_at: { type: 'string' },
+          lock_removed: { type: 'boolean' },
           degraded: { type: 'string' },
         },
       },
       render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.lock_removed === true ? '\n  note: the stale lock file was removed too' : '')
         + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
     },
     async execute(args) {
@@ -428,6 +439,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         message: outcome.message,
         released_by: outcome.released_by,
         released_at: outcome.released_at,
+        lock_removed: outcome.lock_removed,
         degraded: outcome.degraded ?? store.degraded ?? '',
       }
     },

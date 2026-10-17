@@ -40,8 +40,10 @@ description**:
    one configuration item, or one independently verifiable behaviour.
 3. Real dependencies declared with `blocked_by`. Do not serialise "just to be safe": that collapses
    parallelism to 1.
-4. Files touched are declared in `write_scopes`. **Advisory, not a lock** — overlap produces a
-   warning, not mutual exclusion.
+4. Files touched are declared in `write_scopes`. As of v0.2.6 this is **enforced at claim time**: a
+   task whose scopes overlap an already-claimed task is refused with `scope_conflict` instead of being
+   admitted, so declare the narrowest scope that is still honest. Overlap is judged at **directory**
+   granularity — see the `write_scopes` entry in §9.
 
 ### Roles
 
@@ -278,15 +280,24 @@ chain that is the whole point, and would tie the plugin to the experimental `age
    creating new ones.
 5. **Claims had no reclamation** — *fixed*: a worker that disappears leaves its task `claimed`
    forever, and everything blocked by it becomes unreachable. `swarm_release` (v0.1.9) returns such a
-   task to the pool.
+   task to the pool, and as of v0.2.6 it also **deletes the task's `.lock` file**. `swarm_claim`
+   clears a **residual lock** (one present while the task still reads `pending`, i.e. left by a holder
+   that died mid-claim) before claiming. So neither a dead worker's task nor its stale lock blocks the
+   pool permanently.
 6. **`swarm_set_deps` cannot be enforced at runtime.** It is Lead-only by description and protocol,
    not by a permission check — checking would require `agentTeams.membership`, i.e. reintroducing the
    service route B deliberately removed.
-7. **`write_scopes` warns, it does not lock.** Overlap only produces an advisory warning; two tasks
-   that write the same file are **not blocked by each other**. Conflict protection depends on the
-   decomposition serialising them (via `blocked_by`) or on the workers negotiating it themselves —
-   the pool enforces nothing. **Two tasks editing one file in parallel can still overwrite each
-   other.** Treat `write_scopes` as a signal to the planner, never as mutual exclusion.
+7. **`write_scopes` is checked at claim time, and the check is directory-granular.** If a task's
+   scopes overlap those of a task that is **already claimed**, the claim is refused with
+   `scope_conflict`, naming the conflicting task and the overlapping scope. This upgraded a purely
+   advisory *posture* into a hard refusal (v0.2.6) — and to be exact about what changed: **this pool
+   never emitted an overlap warning of its own.** The soft, early view is `swarm_ready`, which lists
+   each task's declared `scope:`; the hard view is the refusal, at the moment of admission.
+   (`writeScopeWarnings` is the *kernel*'s rule for the team board — see the appendix in DESIGN.md —
+   not one of these seven tools.) **Be aware of the
+   granularity**: two tasks that both declare `src/` are refused even when they would edit different
+   files in it. When you need finer resolution, declare narrower scopes — `src/api/routes.ts` rather
+   than `src/`.
 8. **This plugin depends on an experimental package.** It needs
    `@deepseek-ai/dsh-experimental-agent-team-profile`, which is **not in any DSH default bundle** and
    must be mounted by hand. That has three consequences:
@@ -297,13 +308,19 @@ chain that is the whole point, and would tie the plugin to the experimental `age
      here;
    - if DSH promotes that package into a default bundle, or removes it, **the installation steps in
      §4 will change** and this README may be out of date.
-9. **There is no automated test suite yet.** Concurrency correctness was established by **manual
-   measurement**, not by tests that run on every change: the single-task closed loop, a 3-worker
-   concurrent run with atomic claiming, and the route-B closed loop. `swarm_set_deps` has all four
-   return paths (`updated` / `not_found` / `invalid_dependency` / `cycle_detected`) exercised by hand,
-   and `swarm_release` likewise. Be aware of what that does and does not cover: the behaviour was
-   verified on the days it was tested, but **nothing re-verifies it after a change**. If you intend to
-   use this in production, run your own verification in your own scenario first.
+9. **Concurrency correctness is verified by hand; the core logic now has regression tests.** Unit
+   tests cover `task-store.ts` — `claim` / `release` / `complete` / `setDependencies`, the
+   `write_scopes` admission check, residual-lock cleanup, and readiness/staleness — run them with
+   `npm test` (Node's built-in runner, no extra dependency; it runs the `.ts` sources directly, which
+   needs Node 22.18+, or 22.6+ with `--experimental-strip-types`). If your shell forbids a child process
+   from capturing piped stdio — a sandboxed DSH session is the case this was measured in — the test
+   runner cannot spawn its per-file worker and fails with `spawn EPERM`; run
+   `npm run test:sandbox` instead, which runs the same cases in a single process
+   (`--test-isolation=none`). What is still measured manually is the
+   *concurrent* behaviour: the single-task closed loop, a 3-worker run with atomic claiming, and the
+   route-B closed loop. So the logic has regression protection; the claim that it is safe under real
+   concurrency still rests on those manual runs. If you intend to use this in production, repeat them
+   in your own scenario.
 
 ---
 
