@@ -1,4 +1,17 @@
-# dsh-swarm-scheduler
+# dsh-swarm-scheduler (beta)
+
+> **实验性插件（beta，0.x）**
+>
+> 对于下载并尝试安装此插件的朋友，先作声明：这是一个实验性插件，处在 0.x 阶段，建立在 DeepSeek
+> Harness（DSH）的 **Agent Teams** 之上——它依赖的 `@deepseek-ai/dsh-experimental-agent-team-profile`
+> 本身带 `experimental` 标记，且必须手动挂载，仍有许多不稳定性。欢迎改进这个插件；如果它让谁的工作
+> 受了损失，我深表歉意，也希望你把意见或改进方向提给我。
+>
+> **English** — Before installing: this is an experimental (beta, 0.x) plugin built on DeepSeek
+> Harness's Agent Teams layer. That layer comes from `@deepseek-ai/dsh-experimental-agent-team-profile`,
+> a package marked experimental by its own label that must be mounted by hand. Expect instability.
+> Improvements and bug reports are welcome. If this plugin cost you work, I am sorry — please tell me
+> what broke or what should change.
 
 A multi-session parallel coding scheduler plugin for **DeepSeek Harness**. Its core claim is
 **"work finds the worker"** (活找人): the Lead only decomposes and wakes; workers pull work out of a
