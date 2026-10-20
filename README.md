@@ -13,6 +13,10 @@
 > Improvements and bug reports are welcome. If this plugin cost you work, I am sorry — please tell me
 > what broke or what should change.
 
+Licensed under the **MIT License** and provided **"as is", without warranty of any kind**. The notice
+above is a courtesy, not a substitute for the terms in `LICENSE`: no warranty is given, and the author
+is not liable for any loss arising from use of this plugin.
+
 A multi-session parallel coding scheduler plugin for **DeepSeek Harness**. Its core claim is
 **"work finds the worker"** (活找人): the Lead only decomposes and wakes; workers pull work out of a
 shared on-disk pool by atomic claim.
