@@ -131,11 +131,24 @@ dsh plugin --profile <your-profile> add link:/path/to/dsh-swarm-scheduler
 (Or add a `file:`/`link:` entry to the profile's `dependencies` and the package name to
 `dsh.profile.bundles`.)
 
-### 4.3 `tasksRoot` is required — set it before using the plugin
+### 4.3 `tasksRoot` is required — and an empty value is refused
 
-**You must fill in an absolute path.** The default is empty, and an empty value makes the task pool
-fall back to `process.cwd()` — which in DSH Desktop is the **profile directory, not the session
-workspace**. Leave it unset and every task file is created in the wrong place.
+**You must fill in an absolute path.** The default is empty, and in DSH Desktop `process.cwd()` is the
+**profile directory, not the session workspace** — so leaving it unset used to create every task file
+in the wrong place.
+
+Since **v0.2.7** the plugin no longer falls back silently: activation throws, the fiber reports
+`failed`, and the message names the setting and the line to add:
+
+```
+tasksRoot is empty. Refusing to place the task pool under process.cwd() (<cwd>) — in this deployment
+that is the profile directory, not the workspace being scheduled, so every task would land where you
+never look. Set it where this plugin is configured, e.g.
+  tasksRoot: 'C:/path/to/the/workspace/being/scheduled'
+```
+
+That error means the plugin is mounted but not configured: add the `config` block below and restart.
+Nothing is written until `tasksRoot` resolves.
 
 Give the `swarm-scheduler` entry a `config` block in the profile's `cordis.patch.yml`:
 
@@ -348,7 +361,8 @@ log, nothing that looks wrong.
    `--lockfile-only` rebuilds the lockfile; delete the stale entry if it must be re-resolved.
 7. **`process.cwd()` is not the session workspace.** In this deployment it is the profile directory,
    so a pool at a relative path lands in the wrong place. The root is therefore an explicit config
-   value (`tasksRoot`).
+   value (`tasksRoot`), and since v0.2.7 an empty value is **refused at activation** rather than
+   silently resolved against `process.cwd()`.
 8. **`ctx.fs` writes are refused by the sandbox.** `dsh-fs-sandbox` fences every mutation by a
    per-call policy and falls back to the deployment default; the plugin does not fabricate that
    policy, so writes can be denied even when the target directory exists. Hence the labelled

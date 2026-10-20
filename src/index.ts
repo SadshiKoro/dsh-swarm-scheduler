@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { appendFileSync } from 'node:fs'
-import { Config, type Config as SwarmConfig } from './config.js'
+import { Config, resolveTasksRoot, type Config as SwarmConfig } from './config.js'
 import { TaskStore, TASKS_DIR } from './task-store.js'
 import { registerFileTools } from './tools-file.js'
 
@@ -161,12 +161,14 @@ export function apply(ctx: Context, config: SwarmConfig) {
     /**
      * Base for the pool's relative paths.
      *
-     * `process.cwd()` is the profile directory in this deployment — NOT the
-     * session workspace — so an empty `tasksRoot` is only a safe fallback for
-     * deployments that happen to launch from the workspace they schedule.
-     * Real deployments set `tasksRoot` explicitly.
+     * Throws when `tasksRoot` is empty (v0.2.7). The old fallback to
+     * `process.cwd()` put the pool in the profile directory — NOT the session
+     * workspace — and did it silently, which is the failure mode this plugin
+     * keeps warning about in its own documentation. Throwing here means the
+     * `catch` below records the reason and the fiber reports `failed`, so the
+     * omission surfaces at activation rather than at "where did my tasks go".
      */
-    const cwd = config.tasksRoot.trim().length > 0 ? config.tasksRoot.trim() : process.cwd()
+    const cwd = resolveTasksRoot(config.tasksRoot)
     const store = new TaskStore(ctx, cwd)
     const disposers: Array<() => void> = []
 
@@ -216,7 +218,7 @@ export function apply(ctx: Context, config: SwarmConfig) {
       for (const dispose of disposers.reverse()) dispose()
     })
 
-    debugLog(config.debugLogPath, `APPLY OK pool=${TASKS_DIR} root=${cwd} (source=${config.tasksRoot.trim().length > 0 ? 'config.tasksRoot' : 'process.cwd()'})`)
+    debugLog(config.debugLogPath, `APPLY OK pool=${TASKS_DIR} root=${cwd} (source=config.tasksRoot)`)
   } catch (error) {
     // Record the real failure, then rethrow so the fiber still reports `failed`
     // and the failure stays observable.

@@ -2,11 +2,15 @@ import Schema from '@deepseek-ai/schemastery'
 
 export interface Config {
   /**
-   * Root directory the task pool lives under. Empty means `process.cwd()`.
+   * Root directory the task pool lives under. **Required in practice**: an empty
+   * value is refused at activation (v0.2.7) instead of falling back to
+   * `process.cwd()`.
    *
    * `process.cwd()` is NOT the session workspace: in this deployment it is the
    * profile directory, which is where the pool was first created by mistake.
-   * Deployments therefore set this explicitly to the workspace being scheduled.
+   * The old fallback kept that mistake available — a deployment that forgot the
+   * setting still "worked" and wrote its tasks where nobody looks.
+   * `resolveTasksRoot` below turns the omission into a startup error.
    */
   tasksRoot: string
   /**
@@ -63,6 +67,33 @@ export const Config: Schema<Config> = Schema.object({
   debugLogPath: Schema.string().default(''),
   staleAssignmentSec: Schema.number().default(600),
 })
+
+/**
+ * Resolve `tasksRoot`, refusing an empty value instead of falling back to
+ * `process.cwd()`.
+ *
+ * The fallback was a defect that fails silently: activation succeeded, the pool
+ * was created somewhere, and every task appeared "lost" because it went to a
+ * directory the user never opens. A wrong rule that reports itself is better
+ * than a forgiving rule that hides.
+ *
+ * The message names the setting, the consequence, the path the fallback would
+ * have used, and the line to add — a startup error is the one moment the user
+ * is guaranteed to be looking.
+ */
+export function resolveTasksRoot(raw: string): string {
+  const trimmed = raw.trim()
+  if (trimmed.length > 0) return trimmed
+
+  const fallback = process.cwd()
+  throw new Error(
+    'tasksRoot is empty. Refusing to place the task pool under process.cwd() '
+    + `(${fallback}) — in this deployment that is the profile directory, not the workspace `
+    + 'being scheduled, so every task would land where you never look. '
+    + 'Set it where this plugin is configured, e.g.\n'
+    + "  tasksRoot: 'C:/path/to/the/workspace/being/scheduled'",
+  )
+}
 
 /** Team board limits from the kernel: exceeding them fails creation outright. */
 export const KERNEL_MAX_TASKS = 256
