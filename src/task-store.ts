@@ -262,7 +262,7 @@ export class TaskStore {
     }
     try {
       const target = await this.#fs.resolve(`${TASKS_DIR}/${KEEP_FILE}`, { cwd: this.#cwd })
-      await this.#fs.writeText(target, '# dsh-swarm-scheduler task pool\n')
+      await this.#fs.writeText(target, '# dsh-swarm-scheduler-beta task pool\n')
       return { ok: true }
     } catch (error) {
       // The directory now exists, which is what callers need; the marker is

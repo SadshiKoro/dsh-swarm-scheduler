@@ -1,5 +1,5 @@
 {
-  "name": "dsh-swarm-scheduler",
+  "name": "dsh-swarm-scheduler-beta",
   "version": "0.2.7",
   "description": "(beta) Experimental parallel coding scheduler for DSH — a Lead that only schedules, teammates that only execute, and a file-backed ready pool with atomic claiming. Requires the manually mounted experimental Agent Teams bundle.",
   "type": "module",
@@ -43,7 +43,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/SadshiKoro/dsh-swarm-scheduler.git"
+    "url": "https://github.com/SadshiKoro/dsh-swarm-scheduler-beta.git"
   },
   "author": "SadshiKoro",
   "license": "MIT"

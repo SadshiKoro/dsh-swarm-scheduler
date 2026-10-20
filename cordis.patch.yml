@@ -1,9 +1,11 @@
-# dsh-swarm-scheduler bundle patch: inserts this plugin's host row into the profile
-# roster. Install with:
+# dsh-swarm-scheduler-beta bundle patch: inserts this plugin's host row into the
+# profile roster. Install with:
 #
-#   dsh plugin --profile web add link:<repo-path>/dsh-swarm-scheduler
+#   dsh plugin --profile web add link:<repo-path>/dsh-swarm-scheduler-beta
 #
 # The id is owned by this plugin: reusing a shipped id would replace that entry.
+# `name` must equal `package.json` `name`: the loader resolves the inserted row by
+# package name, so a stale value here fails the boot rather than warning.
 - insert:
     - id: swarm-scheduler
-      name: 'dsh-swarm-scheduler'
+      name: 'dsh-swarm-scheduler-beta'

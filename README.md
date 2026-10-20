@@ -142,7 +142,7 @@ the service is never provided and must be mounted explicitly. Add it to your pro
 ### 4.2 Install the plugin
 
 ```bash
-dsh plugin --profile <your-profile> add link:/path/to/dsh-swarm-scheduler
+dsh plugin --profile <your-profile> add link:/path/to/dsh-swarm-scheduler-beta
 ```
 
 (Or add a `file:`/`link:` entry to the profile's `dependencies` and the package name to

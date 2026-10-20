@@ -52,7 +52,7 @@ export interface ClientContextLike {
   readonly [key: string]: unknown
 }
 
-export const name = 'dsh-swarm-scheduler-client'
+export const name = 'dsh-swarm-scheduler-beta-client'
 
 /**
  * Keep the client entry point valid but contribution-free.

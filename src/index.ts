@@ -4,7 +4,7 @@ import { Config, resolveTasksRoot, type Config as SwarmConfig } from './config.j
 import { TaskStore, TASKS_DIR } from './task-store.js'
 import { registerFileTools } from './tools-file.js'
 
-export const name = 'dsh-swarm-scheduler'
+export const name = 'dsh-swarm-scheduler-beta'
 export { Config }
 
 /**

@@ -1,7 +1,7 @@
 import { defineConfig } from 'tsup'
 
 /** Must equal `package.json` `name`: the web loader keys the module registry on it. */
-const PLUGIN_ID = 'dsh-swarm-scheduler'
+const PLUGIN_ID = 'dsh-swarm-scheduler-beta'
 
 /**
  * Provided by the DSH web app at load time and reached through the factory's
