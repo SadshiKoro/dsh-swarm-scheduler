@@ -1,5 +1,7 @@
 # dsh-swarm-scheduler (beta)
 
+[![test](https://github.com/SadshiKoro/dsh-swarm-scheduler/actions/workflows/test.yml/badge.svg)](https://github.com/SadshiKoro/dsh-swarm-scheduler/actions/workflows/test.yml)
+
 > **实验性插件（beta，0.x）**
 >
 > 对于下载并尝试安装此插件的朋友，先作声明：这是一个实验性插件，处在 0.x 阶段，建立在 DeepSeek
@@ -211,6 +213,27 @@ to tell those two failure domains apart, since the loader never awaits `apply()`
 **You must restart DSH.** Tools, the prompt section, the bundle list and `tasksRoot` are all applied
 at startup. There is no hot reload.
 
+### 4.6 安装（npm，发布后）
+
+包已准备好发布到 npm（`publishConfig.access: public`、`prepublishOnly` 会先跑测试与构建）。发布后可直接从 registry 安装：
+
+```bash
+dsh plugin --profile <your-profile> add dsh-swarm-scheduler-beta
+```
+
+与源码安装一样，仍需：
+
+1. 在 profile 的 `dsh.profile.bundles` 里加入 `dsh-swarm-scheduler-beta`；
+2. 挂载 `@deepseek-ai/dsh-experimental-agent-team-profile`（见 4.1）；
+3. 配 `tasksRoot`（见 4.3）；
+4. 重启 DSH。
+
+维护者发布流程：
+
+```bash
+npm publish        # prepublishOnly: npm test && tsc --noEmit && tsup
+```
+
 ---
 
 ## 5. Usage
@@ -222,7 +245,7 @@ band just before the kernel's own Team policy). When you ask the Agent for somet
 files, several modules, several steps — it **switches to scheduling mode by itself**: it calls
 `swarm_plan`, wakes or creates workers, and then reports progress instead of writing the code itself.
 
-The nine tools remain directly callable for explicit control.
+The ten tools remain directly callable for explicit control.
 
 ### Explicit instruction example
 
@@ -241,14 +264,15 @@ Use the swarm scheduler for this:
 
 ---
 
-## 6. The nine tools
+## 6. The ten tools
 
 | Tool | Purpose | Main parameters |
 |---|---|---|
-| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`) |
+| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`, `required_hashes`) |
 | `swarm_ready` | List the tasks a worker may start right now (0 when `max_workers` is reached) | optional `big_task_id` filter |
 | `swarm_claim` | Atomically claim one task (`pending` → `claimed`) | `task_id` / `claimed_by` |
 | `swarm_start` | Start work (`claimed` → `running`), recording the heartbeat | `task_id` / `started_by` |
+| `swarm_heartbeat` | Renew the lease on a task you hold (`claimed`/`running`) | `task_id` / `agent_id` |
 | `swarm_complete` | Finish a task; `success=false` marks it failed and drives retry/block | `task_id` / `result` / `completed_by` / `success` |
 | `swarm_status` | Whole-pool status across all six states | optional `include_log` |
 | `swarm_release` | Return a stuck task to the pool (`claimed`/`running`/`failed` → `pending`) | `task_id` / `released_by` |
@@ -280,9 +304,11 @@ pending ──claim──▶ claimed ──start──▶ running ──complete
 
 `max_retries` defaults to 3 per task. `swarm_reap` reverts a stale **claimed** task to `pending` and
 turns a stale **running** task into `failed` (reason `heartbeat timeout`), which then follows the same
-retry path. `swarm_status` marks any claim/run older than `staleAssignmentSec` as `[STALE]`, reports
-`retry_count` and the last failure reason for failed/blocked tasks, and counts all six states in its
-summary line.
+retry path. Since v0.4.0 the lease age is not just the claim: a **claimed** task is stale only when
+both `claimed_at` and `heartbeat_at` are old (the later one wins), and a **running** task is judged by
+`heartbeat_at` alone. `swarm_status` marks any claim/run older than `staleAssignmentSec` as `[STALE]`,
+reports `retry_count` and the last failure reason for failed/blocked tasks, and counts all six states in
+its summary line.
 
 ### 6.2 Concurrency ceiling
 
@@ -317,6 +343,34 @@ pool. Set it in the profile's `cordis.patch.yml`:
 - `swarm_status` 对 `pending` 任务在行尾标出 `[blocked: missing X, Y]`，即使它在 DAG 语义上
   `ready` ——「ready 但领不了」是可见的，而不是等到 claim 才失败。
 
+**`required_hashes`（内容版本校验，v0.4.0）**
+
+- 可选的 `{ 文件路径: sha256 hex }`，在 `required_files` 的存在性检查**之后**执行：文件缺失仍先报
+  `missing_dependencies`；文件存在但内容 hash 不符，则拒绝并返回 `hash_mismatch`，消息给出
+  `声明值 vs 实际值`；
+- `swarm_status` 对 `pending` 任务追加 `[blocked: hash mismatch on X]`；
+- 这是**内容 hash**（对文件字节做 sha256），不是 git hash、不是版本号；只覆盖 `required_hashes` 里
+  声明的文件，未声明的文件变化不影响领取。
+
+### 6.4 心跳续约（v0.4.0）
+
+长任务在 `running` 状态下如果预计耗时超过 `staleAssignmentSec` 的一半，worker 应**定期调用**
+`swarm_heartbeat(task_id, agent_id)` 续约，否则 `swarm_reap` 会把仍然活着的 worker 当成死掉：
+
+| 状态 | `swarm_reap` 判定依据 |
+|---|---|
+| `claimed` | `claimed_at` 与 `heartbeat_at` 取**较晚者**，超时才算过期 |
+| `running` | 只看 `heartbeat_at`，超时标 `failed`（`heartbeat timeout`）并消耗一次重试 |
+
+`swarm_heartbeat` 只接受 `claimed` / `running` 的任务，且 `agent_id` 必须等于 `claimed_by`：
+状态不符返回 `invalid_state`，非持有者返回 `not_owner`。日志会追加一条 `heartbeat by <agent>`。
+
+```text
+worker: swarm_claim(t) → swarm_start(t)
+loop:   每 staleAssignmentSec/2 调一次 swarm_heartbeat(t, me)
+        swarm_complete(t, success=…)
+```
+
 ---
 
 ## 7. Two-layer validation on `swarm_set_deps`
@@ -338,7 +392,7 @@ prevent. Serialising the decision on a single writer is what makes the cycle che
 
 ## 8. Architecture: route B (the file pool is the source of truth)
 
-The pool lives on disk, and its nine tools are the **only** scheduling interface. The kernel's Team
+The pool lives on disk, and its ten tools are the **only** scheduling interface. The kernel's Team
 task board is used for nothing but waking workers.
 
 **Why route B.** The goal is "work finds the worker". The file pool's three primitives are exactly that

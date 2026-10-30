@@ -1,5 +1,5 @@
 /**
- * The file-driven tool surface: nine tools, all of them plain task-pool I/O.
+ * The file-driven tool surface: ten tools, all of them plain task-pool I/O.
  *
  * None of these touch a Cordis service beyond `ctx.fs` (through `TaskStore`),
  * because every richer service this plugin once relied on proved unreachable
@@ -19,10 +19,12 @@ import {
   releaseTask,
   setDependencies,
   startTask,
+  heartbeatTask,
   reapTask,
   readLog,
   computeReady,
   missingRequiredFiles,
+  hashMismatches,
   viewsOf,
   type TaskRecord,
   type TaskView,
@@ -98,7 +100,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       + 'repeated call cannot silently reset finished work. blocked_by names other task_ids in the same call '
       + 'or already on disk; a task is ready only once every blocker is completed. Each task may also set '
       + '`priority` (larger claims first; ties are FIFO by creation time) and `required_files` '
-      + '(workspace-relative paths that must exist before the task may be claimed).',
+      + '(workspace-relative paths that must exist before the task may be claimed); `required_hashes` pins '
+      + 'each of those files to a sha256 digest, so a changed prerequisite refuses the claim with `hash_mismatch`.',
     parameters: {
       tasks: {
         type: 'array',
@@ -116,6 +119,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
             write_scopes: { type: 'array', description: 'Files or directory prefixes this task will modify', items: { type: 'string' } },
             priority: { type: 'number', description: 'Claim priority: larger wins; ties are FIFO by creation time. Default 0.' },
             required_files: { type: 'array', description: 'Workspace-relative files that must exist before the task can be claimed', items: { type: 'string' } },
+            required_hashes: {
+              type: 'object',
+              description: 'Map of workspace-relative file path -> expected sha256 hex digest; a mismatch refuses the claim',
+              additionalProperties: true,
+            },
           },
         },
       },
@@ -165,6 +173,16 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         if (taskId.length === 0) { errors.push('a task arrived with an empty task_id'); continue }
         if (seen.has(taskId)) { conflicts.push(taskId); continue }
         seen.add(taskId)
+        // The schema cannot express "string -> string" (additionalProperties is
+        // boolean-only here), so non-string digest values are dropped instead of
+        // being trusted.
+        const requiredHashes: Record<string, string> = {}
+        const rawHashes = spec.required_hashes
+        if (typeof rawHashes === 'object' && rawHashes !== null && !Array.isArray(rawHashes)) {
+          for (const [file, digest] of Object.entries(rawHashes)) {
+            if (typeof digest === 'string') requiredHashes[file] = digest
+          }
+        }
         // Directory-level scopes block parallelism at directory granularity.
         for (const scope of spec.write_scopes ?? []) {
           if (scope.trim().endsWith('/')) {
@@ -179,6 +197,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           write_scopes: spec.write_scopes ?? [],
           priority: spec.priority ?? 0,
           required_files: spec.required_files ?? [],
+          required_hashes: requiredHashes,
         })
         const written = await store.createExclusive(record)
         if (written.ok) created.push(taskId)
@@ -301,7 +320,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -452,10 +471,13 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         }
         line += ` — ${view.title}`
         // Context-integrity marker: a pending task whose declared prerequisites
-        // are absent cannot be claimed, even though DAG-wise it is ready.
+        // are absent (or whose pinned content digest no longer matches) cannot be
+        // claimed, even though DAG-wise it is ready.
         if (view.status === 'pending') {
           const missing = missingRequiredFiles(store, view)
           if (missing.length > 0) line += ` [blocked: missing ${missing.join(', ')}]`
+          const mismatch = hashMismatches(store, view)
+          if (mismatch.length > 0) line += ` [blocked: hash mismatch on ${mismatch.map(m => m.file).join(', ')}]`
         }
         return line
       })
@@ -562,6 +584,45 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         ok: outcome.ok,
         code: outcome.code,
         message: outcome.message,
+        degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // -------------------------------------------------------- swarm_heartbeat ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_heartbeat',
+    description:
+      'Renew the lease on a task you hold: update heartbeat_at to now. Only a claimed or running task can '
+      + 'heartbeat, and only the agent recorded in claimed_by may renew it (otherwise not_owner). Long-running '
+      + 'workers should call this well inside staleAssignmentSec so swarm_reap does not reclaim live work.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Task you hold' },
+      agent_id: { type: 'string', required: true, description: 'Agent id that claimed the task' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['heartbeat', 'not_found', 'invalid_state', 'not_owner', 'io_error'] },
+          message: { type: 'string' },
+          heartbeat_at: { type: 'string' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.heartbeat_at !== undefined && value.heartbeat_at !== '' ? `\n  heartbeat_at: ${value.heartbeat_at}` : '')
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      const outcome = await heartbeatTask(store, args.task_id, args.agent_id)
+      return {
+        ok: outcome.ok,
+        code: outcome.code,
+        message: outcome.message,
+        heartbeat_at: outcome.heartbeat_at ?? '',
         degraded: outcome.degraded ?? store.degraded ?? '',
       }
     },

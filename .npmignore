@@ -1,0 +1,11 @@
+# `files` in package.json is the allow-list; this file is belt-and-braces for
+# tools that consult .npmignore first.
+src/
+test/
+DESIGN.md
+*.tgz
+.removed-src-backup/
+.github/
+.git/
+tsconfig.json
+tsup.config.ts

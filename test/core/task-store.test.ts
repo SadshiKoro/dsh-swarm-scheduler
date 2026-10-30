@@ -19,6 +19,7 @@
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -30,6 +31,7 @@ import {
   releaseTask,
   setDependencies,
   startTask,
+  heartbeatTask,
   reapTask,
   viewsOf,
   findScopeConflict,
@@ -428,9 +430,11 @@ test('reapTask marks stale running task as failed/blocked', async () => {
   await store.createExclusive(blankTask('t1', { max_retries: 3 }))
   await claimTask(store, 't1', 'worker-a')
   await startTask(store, 't1', 'worker-a')
-  // Backdate claimed_at
+  // Since v0.4.0 a running lease is judged by its heartbeat, so both the claim
+  // and the heartbeat must look stale for this to be a dead worker.
   const raw = readRaw('t1')
   raw.claimed_at = new Date(Date.now() - 20 * 60 * 1000).toISOString()
+  raw.heartbeat_at = new Date(Date.now() - 20 * 60 * 1000).toISOString()
   writeFileSync(join(dir, TASKS_DIR, 't1.json'), `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
   const outcome = await reapTask(store, 600)
   assert.equal(outcome.ok, true)
@@ -526,4 +530,89 @@ test('a priority task with missing required_files is ready by DAG but unclaimabl
   assert.match(outcome.message, /ghost\.txt/)
   assert.equal(readRaw('t1').status, 'pending')
   assert.equal(readRaw('t1').priority, 7)
+})
+
+// -------------------------------------------------------------- heartbeat ---
+
+function sha256(content: string): string {
+  return createHash('sha256').update(content).digest('hex')
+}
+
+test('heartbeat renewal keeps a stale-looking claim alive', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  // The claim alone looks 20 minutes old...
+  const raw = readRaw('t1')
+  raw.claimed_at = new Date(Date.now() - 20 * 60 * 1000).toISOString()
+  writeFileSync(join(dir, TASKS_DIR, 't1.json'), `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
+  // ...but the holder renews the lease.
+  const beat = await heartbeatTask(store, 't1', 'worker-a')
+  assert.equal(beat.ok, true)
+  assert.equal(beat.code, 'heartbeat')
+  const reaped = await reapTask(store, 600)
+  assert.deepEqual(reaped.reaped, [])
+  assert.equal(readRaw('t1').status, 'claimed')
+})
+
+test('heartbeat renewal keeps a running task from being marked failed', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+  const raw = readRaw('t1')
+  raw.claimed_at = new Date(Date.now() - 20 * 60 * 1000).toISOString()
+  raw.heartbeat_at = new Date(Date.now() - 20 * 60 * 1000).toISOString()
+  writeFileSync(join(dir, TASKS_DIR, 't1.json'), `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
+  const beat = await heartbeatTask(store, 't1', 'worker-a')
+  assert.equal(beat.ok, true)
+  const reaped = await reapTask(store, 600)
+  assert.deepEqual(reaped.reaped, [])
+  assert.equal(readRaw('t1').status, 'running')
+})
+
+test('heartbeat on a non-claimed/running task returns invalid_state', async () => {
+  await store.createExclusive(blankTask('t1'))
+  const outcome = await heartbeatTask(store, 't1', 'worker-a')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'invalid_state')
+})
+
+test('heartbeat from a non-owner returns not_owner', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  const outcome = await heartbeatTask(store, 't1', 'worker-b')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'not_owner')
+  assert.match(outcome.message, /worker-a/)
+  assert.equal(readRaw('t1').claimed_by, 'worker-a')
+})
+
+// ---------------------------------------------------------- required_hashes ---
+
+test('claimTask admits a task whose required_hashes match', async () => {
+  writeFileSync(join(dir, 'schema.json'), '{"v":1}\n', 'utf8')
+  await store.createExclusive(blankTask('t1', { required_hashes: { 'schema.json': sha256('{"v":1}\n') } }))
+  const outcome = await claimTask(store, 't1', 'worker-a')
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})
+
+test('claimTask refuses a task whose required_hashes mismatch', async () => {
+  writeFileSync(join(dir, 'schema.json'), '{"v":2}\n', 'utf8')
+  await store.createExclusive(blankTask('t1', { required_hashes: { 'schema.json': sha256('{"v":1}\n') } }))
+  const outcome = await claimTask(store, 't1', 'worker-a')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'hash_mismatch')
+  assert.match(outcome.message, /schema\.json/)
+  // The message names both sides so the caller can see what changed.
+  assert.match(outcome.message, /declared/)
+  assert.match(outcome.message, /actual/)
+  assert.equal(readRaw('t1').status, 'pending')
+})
+
+test('a required_hashes entry for a missing file is missing_dependencies', async () => {
+  await store.createExclusive(blankTask('t1', { required_hashes: { 'ghost.txt': sha256('x') } }))
+  const outcome = await claimTask(store, 't1', 'worker-a')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'missing_dependencies')
+  assert.match(outcome.message, /ghost\.txt/)
 })

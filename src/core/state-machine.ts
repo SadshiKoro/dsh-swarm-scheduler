@@ -44,6 +44,14 @@ export interface TaskRecord {
   priority: number
   /** Workspace-relative files that must exist before the task may be claimed. */
   required_files: string[]
+  /**
+   * Content contract for prerequisites: path → expected sha256 hex digest.
+   *
+   * Checked after existence: a missing file is `missing_dependencies`, an
+   * existing file whose content differs is `hash_mismatch`. This is a content
+   * hash, not a git object id and not a version string.
+   */
+  required_hashes: Record<string, string>
 }
 
 /** A task plus the derived facts callers actually schedule on. */
@@ -99,6 +107,7 @@ export function blankTask(taskId: string, fields: Partial<TaskRecord> = {}): Tas
     created_at: fields.created_at ?? '',
     priority: fields.priority ?? 0,
     required_files: fields.required_files ?? [],
+    required_hashes: fields.required_hashes ?? {},
   }
 }
 
@@ -119,6 +128,14 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
   const strings = (input: unknown): string[] =>
     Array.isArray(input) ? input.filter((item): item is string => typeof item === 'string') : []
   const num = (input: unknown): number => typeof input === 'number' && Number.isFinite(input) ? input : 0
+  const hashMap = (input: unknown): Record<string, string> => {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) return {}
+    const out: Record<string, string> = {}
+    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+      if (typeof value === 'string') out[key] = value
+    }
+    return out
+  }
   return blankTask(taskId, {
     big_task_id: typeof raw.big_task_id === 'string' ? raw.big_task_id : '',
     title: typeof raw.title === 'string' ? raw.title : '',
@@ -138,6 +155,7 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
     created_at: typeof raw.created_at === 'string' ? raw.created_at : '',
     priority: num(raw.priority),
     required_files: strings(raw.required_files),
+    required_hashes: hashMap(raw.required_hashes),
   })
 }
 

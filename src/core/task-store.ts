@@ -16,6 +16,7 @@
  *     malformed file are all ordinary states this layer reports.
  */
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join, isAbsolute } from 'node:path'
 import {
   TASKS_DIR,
@@ -324,13 +325,12 @@ export class TaskStore {
   }
 
   /**
-   * Whether one declared `required_files` entry exists.
+   * Whether one declared prerequisite path exists.
    *
-   * Existence only: no content, size or version check. Relative paths resolve
-   * against the pool root (the workspace being scheduled), not `process.cwd()`.
-   * A path that cannot be probed is reported as missing — the safe reading,
-   * because admitting a claim on an unverifiable prerequisite is exactly the
-   * failure this check exists to prevent.
+   * Relative paths resolve against the pool root (the workspace being
+   * scheduled), not `process.cwd()`. A path that cannot be probed is reported as
+   * missing — the safe reading, because admitting a claim on an unverifiable
+   * prerequisite is exactly the failure this check exists to prevent.
    */
   fileExists(declaredPath: string): boolean {
     const target = isAbsolute(declaredPath) ? declaredPath : join(this.#cwd, declaredPath)
@@ -340,16 +340,69 @@ export class TaskStore {
       return false
     }
   }
+
+  /**
+   * sha256 hex digest of one prerequisite file's content, or `undefined` when it
+   * cannot be read.
+   *
+   * Content hash only: no git object id, no version string, no normalisation
+   * (line endings included as-is). Callers compare digests, never file mtimes.
+   */
+  hashOf(declaredPath: string): string | undefined {
+    const target = isAbsolute(declaredPath) ? declaredPath : join(this.#cwd, declaredPath)
+    try {
+      return createHash('sha256').update(readFileSync(target)).digest('hex')
+    } catch {
+      return undefined
+    }
+  }
 }
 
 /**
- * The subset of `required_files` missing under the pool root.
+ * The subset of declared prerequisites missing under the pool root.
  *
- * Shared by `claimTask` (refuse) and `swarm_status` (mark), so the two can never
- * disagree about what "missing" means.
+ * Covers both `required_files` and the keys of `required_hashes`: a hash can only
+ * be verified against a file that exists, so a missing hashed file is a missing
+ * dependency, not a hash mismatch. Shared by `claimTask` (refuse) and
+ * `swarm_status` (mark), so the two can never disagree about what "missing"
+ * means.
  */
 export function missingRequiredFiles(store: TaskStore, task: TaskRecord): string[] {
-  return task.required_files.filter(file => !store.fileExists(file))
+  const declared = [...task.required_files, ...Object.keys(task.required_hashes)]
+  const out: string[] = []
+  for (const file of declared) {
+    if (out.includes(file)) continue
+    if (!store.fileExists(file)) out.push(file)
+  }
+  return out
+}
+
+/** One `required_hashes` entry whose file exists but whose content differs. */
+export interface HashMismatch {
+  file: string
+  expected: string
+  actual: string
+}
+
+/**
+ * `required_hashes` entries whose content digest differs from the declaration.
+ *
+ * Missing files are skipped on purpose: they are reported as
+ * `missing_dependencies` first, so the caller never sees a mismatch message for
+ * a file that is simply absent. A file that exists but cannot be read is
+ * reported as a mismatch with `actual: '(unreadable)'` — accepting an
+ * unverifiable content contract would defeat the check.
+ */
+export function hashMismatches(store: TaskStore, task: TaskRecord): HashMismatch[] {
+  const out: HashMismatch[] = []
+  for (const [file, expected] of Object.entries(task.required_hashes)) {
+    if (!store.fileExists(file)) continue
+    const actual = store.hashOf(file) ?? '(unreadable)'
+    if (actual.toLowerCase() !== expected.trim().toLowerCase()) {
+      out.push({ file, expected: expected.trim(), actual })
+    }
+  }
+  return out
 }
 
 /** Locks held by this process, used only when the filesystem lock is denied. */
@@ -420,7 +473,7 @@ export async function claimTask(
   taskId: string,
   claimedBy: string,
   clock: Clock = defaultClock,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -448,6 +501,17 @@ export async function claimTask(
       ok: false,
       code: 'missing_dependencies',
       message: `${taskId} refused: missing required file(s): ${missingEarly.join(', ')}`,
+    }
+  }
+
+  // Content contract: existence alone is not enough when the task pins digests.
+  const mismatchEarly = hashMismatches(store, found.task)
+  if (mismatchEarly.length > 0) {
+    return {
+      ok: false,
+      code: 'hash_mismatch',
+      message: `${taskId} refused: hash mismatch on `
+        + mismatchEarly.map(m => `${m.file} (declared ${m.expected}, actual ${m.actual})`).join('; '),
     }
   }
 
@@ -496,6 +560,19 @@ export async function claimTask(
           ok: false,
           code: 'missing_dependencies',
           message: `${taskId} refused: missing required file(s): ${missingNow.join(', ')}`,
+          degraded: lock.degraded,
+        }
+      }
+
+      // ...and the content could have changed. Pinned digests are re-verified
+      // under the same lock, so a claim never admits a stale prerequisite.
+      const mismatchNow = hashMismatches(store, current.task)
+      if (mismatchNow.length > 0) {
+        return {
+          ok: false,
+          code: 'hash_mismatch',
+          message: `${taskId} refused: hash mismatch on `
+            + mismatchNow.map(m => `${m.file} (declared ${m.expected}, actual ${m.actual})`).join('; '),
           degraded: lock.degraded,
         }
       }
@@ -722,6 +799,51 @@ export async function startTask(
 }
 
 /**
+ * Lease renewal: record that the current holder is still alive.
+ *
+ * Without this, a worker doing a legitimately long task is indistinguishable
+ * from a dead one at `staleAssignmentSec`, and `swarm_reap` would reclaim work
+ * that is still progressing. The renewal is deliberately owner-checked: a
+ * heartbeat from anyone else would let one worker extend another's claim.
+ */
+export async function heartbeatTask(
+  store: TaskStore,
+  taskId: string,
+  agentId: string,
+  clock: Clock = defaultClock,
+): Promise<{ ok: boolean; code: 'heartbeat' | 'not_found' | 'invalid_state' | 'not_owner' | 'io_error'; message: string; heartbeat_at?: string; degraded?: string }> {
+  const found = await store.readOne(taskId)
+  if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
+  if (found.task.status !== 'claimed' && found.task.status !== 'running') {
+    return {
+      ok: false,
+      code: 'invalid_state',
+      message: `${taskId} is ${found.task.status}; only a claimed or running task can heartbeat`,
+    }
+  }
+  if (found.task.claimed_by !== agentId) {
+    return {
+      ok: false,
+      code: 'not_owner',
+      message: `${taskId} is held by ${found.task.claimed_by || 'another agent'}, not ${agentId}`,
+    }
+  }
+  const stamp = clock().toISOString()
+  const written = await store.writeExisting({ ...found.task, heartbeat_at: stamp })
+  if (!written.ok) {
+    return { ok: false, code: 'io_error', message: `heartbeat not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
+  }
+  await logTransition(store, taskId, 'heartbeat', agentId)
+  return {
+    ok: true,
+    code: 'heartbeat',
+    message: `${taskId} heartbeat from ${agentId}`,
+    heartbeat_at: stamp,
+    degraded: written.degraded,
+  }
+}
+
+/**
  * Mark a task completed or failed, with retry logic.
  *
  * `success=true` (default): claimed/running -> completed
@@ -810,8 +932,17 @@ export async function reapTask(
   for (const task of all.tasks) {
     if (task.status !== 'claimed' && task.status !== 'running') continue
     const claimedMs = Date.parse(task.claimed_at)
-    if (Number.isNaN(claimedMs)) continue
-    const ageSec = Math.floor((clock().getTime() - claimedMs) / 1000)
+    const heartbeatMs = Date.parse(task.heartbeat_at)
+    const claimedOk = !Number.isNaN(claimedMs)
+    const heartbeatOk = !Number.isNaN(heartbeatMs)
+    // claimed: the lease is alive while EITHER the claim or the last heartbeat
+    // is recent, so taking the later of the two is the correct reference.
+    // running: the heartbeat is the lease (start writes one immediately).
+    const referenceMs = task.status === 'claimed'
+      ? Math.max(claimedOk ? claimedMs : 0, heartbeatOk ? heartbeatMs : 0)
+      : (heartbeatOk ? heartbeatMs : claimedMs)
+    if (Number.isNaN(referenceMs) || referenceMs === 0) continue
+    const ageSec = Math.floor((clock().getTime() - referenceMs) / 1000)
     if (ageSec <= staleAfterSec) continue
 
     if (task.status === 'claimed') {

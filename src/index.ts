@@ -136,7 +136,7 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
    没有空闲的 → 用 spawn_teammate 创建 2-3 个。
 
 3. 给每个 worker 发一条 send_message，消息里只说：
-   "去 swarm_ready 查就绪任务，swarm_claim 自领，swarm_start 开工，做完用 swarm_complete 回报（失败时 success=false），然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。"
+   "去 swarm_ready 查就绪任务，swarm_claim 自领，swarm_start 开工，做完用 swarm_complete 回报（失败时 success=false），然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。预计耗时超过 staleAssignmentSec 一半的任务，running 期间每隔一段时间调一次 swarm_heartbeat 续约。"
 
 4. 不要指定具体任务给 worker。谁领到哪一个是原子竞争的结果。
 
@@ -146,7 +146,7 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
 
 7. 看到 failed 的任务时，判断是否重试：可以再发一条 send_message 让 worker 重新 swarm_start 该任务（failed 任务可直接 start），或用 swarm_release 把它放回 pending 让别人重领。retry_count 达到 max_retries 后会变成 blocked，此时需要人工介入或调整拆解。
 
-8. 定期用 swarm_status 查看进度。如果某个任务被标为 STALE（claimed/running 超过阈值，可能 worker 卡死或消失），用 swarm_reap 自动回收（claimed 回 pending、running 标 failed 走重试），或按需用 swarm_release 释放个别任务。
+8. 定期用 swarm_status 查看进度。如果某个任务被标为 STALE（claimed/running 超过阈值，可能 worker 卡死或消失），先确认 worker 是否还能续约；确实无响应再用 swarm_reap 自动回收（claimed 回 pending、running 标 failed 走重试），或按需用 swarm_release 释放个别任务。正在跑长任务的 worker 应主动调 swarm_heartbeat，避免被误回收。
 
 9. 并发上限由 max_workers 控制（默认 3）。swarm_ready 在 claimed+running 达到上限时返回 0，这是正常现象，等已有任务完成后再拉。
 
