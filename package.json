@@ -1,7 +1,7 @@
 {
   "name": "dsh-swarm-scheduler-beta",
   "version": "0.4.1",
-  "description": "Parallel coding scheduler for DSH with six-state task lifecycle, retry/blocking, scope conflict prevention, concurrency ceiling, watchdog, and a DSH-independent core.",
+  "description": "Parallel coding scheduler for DSH with six-state lifecycle, priority scheduling, dependency/file/hash pre-checks, scope conflict prevention, concurrency ceiling, heartbeat lease renewal, watchdog, and a DSH-independent core.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -44,7 +44,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/SadshiKoro/dsh-swarm-scheduler-beta.git"
+    "url": "https://github.com/SadshiKoro/dsh-swarm-scheduler.git"
   },
   "author": "SadshiKoro",
   "license": "MIT",
