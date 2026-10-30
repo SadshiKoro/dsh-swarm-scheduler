@@ -1338,10 +1338,41 @@ The interval check is done once at the end from the persisted timestamps rather 
 
 ### 12.6.3 Two real defects the harness found (and v0.5.0 fixed)
 
-1. **The in-process claim guard was keyed by task id and deleted unconditionally.** With ten workers, losing claimants deleted the *winner's* entry; a third claim then saw "no claim in progress", cleared the winner's live lock file, and both wrote `claimed` for the same task. This was the duplicate-claim seen in the harness (60 successful claims for 50 tasks, followed by `complete` failing with `already completed`). Fixed by a **ref-counted** `Map<string, number>`: a stale lock may only be cleared when the count is zero, and only the last exit deletes the key.
-2. **`readOne` scanned the whole pool** (`readAll().find`), and `claimTask` did two further full scans (a pre-lock scope check and the authoritative under-lock one). At 50 tasks that was ~238ms per claim — enough to blow any concurrency budget. Fixed by reading a single file for `readOne`, and by dropping the advisory pre-lock scope scan; the under-lock check remains the authority. Behaviour is unchanged; the constant is.
+压测发现的两个并发缺陷，详见 §12.6.4。
 
-The first defect is the reason this section exists: it was invisible to single-task concurrency tests and only appeared when many workers raced across many scopes.
+### 12.6.4 压测发现的两个并发缺陷
+
+**压测场景**：`test/core/stress.test.ts` 生成 50 个任务、随机落在 10 个 scope 上，10 个 Worker 用
+`Promise.all` 同时循环 claim，并在领取后立即 complete 以释放 scope。断言两件事：
+
+1. 50 个任务**每个恰好被成功领取一次**（总成功领取数 = 50）；
+2. 任意两个 scope 重叠的任务，其 `[claimed_at, completed_at]` 区间**从不重叠**（同 scope 同一时刻最多一个）。
+
+这套压测抓出了两个单任务测试永远看不到的缺陷。
+
+**缺陷一：同一任务被多次成功 claim（最危险）**
+
+- **现象**：50 个任务出现 60 次成功 claim，随后 `swarm_complete` 报 `already completed`。同一任务被两个
+  Worker 同时持有，锁形同虚设。
+- **根因**：进程内 claim 守卫用的是 `Set<taskId>`，且**失败的 claim 退出时无条件 `delete(taskId)`**。
+  并发下，失败者删掉的是**胜者**的标记；第三个 claim 于是认为「没有并发 claim 在进行」，把胜者仍在
+  持有的 `.lock` 当作残留锁清掉，两个 claim 都通过了锁内重读并各自写入 `claimed`。
+- **修复**：改为**引用计数** `Map<string, number>`——只有计数为 0 时才允许清残留锁，且由最后一个退出者
+  删除 key。失败者只递减计数，不再拥有删除权。
+- **为什么最危险**：这是一个**随并发度放大**的 bug。并发越高、失败者越多，胜者标记被误删的概率越大；
+  而单 Worker 或低频测试下它完全不出现，所以此前的并发用例一直是绿的。它同时也是「锁」这个抽象在
+  进程内层被悄悄削弱的过程——文件锁仍然正确，是进程内的辅助判定先失效了。
+
+**缺陷二：claim 每次全量扫描池子两遍（性能）**
+
+- **现象**：50 任务池下实测 **238ms/claim**，任何并发预算都撑不住（3 秒跑完 50 次领取不可能）。
+- **根因**：`readOne` 实现为 `readAll().find(...)`（整池读一遍），加上 claim 的锁外 advisory scope
+  扫描（再读一遍），单次 claim 固定成本 O(池大小)。
+- **修复**：`readOne` 改为**单文件读取**；去掉锁外那次 advisory scope 扫描，锁内检查仍是权威判定。
+  实测降到 **约 45ms/claim**，语义不变（scope 冲突仍在取锁后拦截）。
+
+两个缺陷合起来说明了压测存在的意义：一个考正确性（并发层），一个考成本（固定开销）。前者只在
+「多 Worker × 多 scope」下暴露，后者只在「池子够大」时暴露，二者都不会在单任务测试里出现。
 
 ## Appendix A. Engineering caveat: the line-count unit for UTF-8 files
 
