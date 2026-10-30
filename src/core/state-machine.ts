@@ -167,6 +167,14 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
  *
  * `staleAfterSec` defaults to `0`, which means "do not judge staleness".
  *
+ * Staleness follows the **lease**, not the claim timestamp — the same rule
+ * `swarm_reap` uses (v0.4.0), so "status says STALE" and "reap reclaims it"
+ * cannot disagree:
+ *   - `running`: `heartbeat_at`, falling back to `claimed_at` when absent;
+ *   - `claimed`: `max(claimed_at, heartbeat_at)`.
+ * `claimed_age_sec` stays "how long ago the claim happened" — informational,
+ * not the staleness input.
+ *
  * @param now - injectable clock, so a caller (or a test) can reason about the
  *   age without waiting for real time to pass.
  */
@@ -190,7 +198,9 @@ export function viewOf(
   const hasHeartbeatTime = task.status === 'running' && task.heartbeat_at.length > 0 && !Number.isNaN(heartbeatMs)
   const heartbeatAgeSec = hasHeartbeatTime ? Math.max(0, Math.floor((now - heartbeatMs) / 1000)) : 0
 
-  const stale = hasClaimTime && staleAfterSec > 0 && ageSec > staleAfterSec
+  const leaseMs = leaseReferenceMs(task)
+  const leaseAgeSec = leaseMs === undefined ? 0 : Math.max(0, Math.floor((now - leaseMs) / 1000))
+  const stale = leaseMs !== undefined && staleAfterSec > 0 && leaseAgeSec > staleAfterSec
   const ready = task.status === 'pending' && open.length === 0
 
   return {
@@ -202,6 +212,28 @@ export function viewOf(
     ...hasHeartbeatTime ? { heartbeat_age_sec: heartbeatAgeSec } : {},
     stale,
   }
+}
+
+/**
+ * The timestamp the lease is judged by, mirroring `swarm_reap`.
+ *
+ * Returns `undefined` when nothing parseable exists, which means "cannot judge"
+ * rather than "stale" — never call a task abandoned on a guess.
+ */
+function leaseReferenceMs(task: TaskRecord): number | undefined {
+  const claimedMs = Date.parse(task.claimed_at)
+  const heartbeatMs = Date.parse(task.heartbeat_at)
+  const claimedOk = task.claimed_at.length > 0 && !Number.isNaN(claimedMs)
+  const heartbeatOk = task.heartbeat_at.length > 0 && !Number.isNaN(heartbeatMs)
+  if (task.status === 'claimed') {
+    const latest = Math.max(claimedOk ? claimedMs : 0, heartbeatOk ? heartbeatMs : 0)
+    return latest === 0 ? undefined : latest
+  }
+  if (task.status === 'running') {
+    if (heartbeatOk) return heartbeatMs
+    return claimedOk ? claimedMs : undefined
+  }
+  return undefined
 }
 
 export function viewsOf(

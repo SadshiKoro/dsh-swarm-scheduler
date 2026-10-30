@@ -1202,7 +1202,7 @@ The rule is mechanical: **no `@deepseek-ai/*` import under `src/core/`** (verifi
 
 Cost, stated plainly: a `.js`-extension import graph inside `src/` had to become `.ts` inside `src/core/` so Node's native type stripping can resolve it from source. `tsconfig` sets `allowImportingTsExtensions`, and because `tsc` runs with `--noEmit` (tsup does the emitting), no `.ts` specifier ever reaches `lib/` — the bundled output stays a normal ESM/CJS pair.
 
-The tests under `test/core/` import nothing from DSH (72 cases as of v0.4.0). The one host-coupled test file that remains (`test/config.test.ts`) imports Schemastery, which is exactly the adapter boundary it belongs to.
+The tests under `test/core/` import nothing from DSH (75 cases as of v0.4.1). The one host-coupled test file that remains (`test/config.test.ts`) imports Schemastery, which is exactly the adapter boundary it belongs to.
 
 ## 12.4 v0.3.2: claim priority and the context-integrity pre-check
 
@@ -1269,6 +1269,7 @@ Two gaps left by v0.3.x, both at the same boundary: the pool could not tell a *s
 - `swarm_reap`'s reference time changed accordingly:
   - **claimed**: `max(claimed_at, heartbeat_at)` — the lease is alive if *either* half is recent. A worker may heartbeat before `swarm_start` (the tool accepts claimed), so the later timestamp is the honest one.
   - **running**: `heartbeat_at` alone; `swarm_start` writes the first one, so a running task always has a lease to measure.
+- **`swarm_status` mirrors the same reference (v0.4.1).** `viewOf` derives `stale` from the lease (and the `(N stale)` count filters the same field), so a fresh heartbeat clears `[STALE]` in the report exactly when it stops `swarm_reap` from reclaiming. v0.4.0 shipped the reap half only, and the two disagreed in the field: `reap: nothing to reap` next to `[STALE, …]` on the same task.
 
 **Boundaries, stated plainly.**
 
@@ -1298,7 +1299,7 @@ Two gaps left by v0.3.x, both at the same boundary: the pool could not tell a *s
 
 ### 12.5.3 Tests
 
-Seven new cases, plus one existing reap test updated for the new reference time (72 total):
+Seven new cases in v0.4.0, plus one existing reap test updated for the new reference time; v0.4.1 adds three lease-display cases (running old-claim/fresh-heartbeat, running old-heartbeat, claimed old-claim/fresh-heartbeat) — 75 total:
 
 | Case | Pinned behaviour |
 |---|---|

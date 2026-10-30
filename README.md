@@ -306,7 +306,8 @@ pending ──claim──▶ claimed ──start──▶ running ──complete
 turns a stale **running** task into `failed` (reason `heartbeat timeout`), which then follows the same
 retry path. Since v0.4.0 the lease age is not just the claim: a **claimed** task is stale only when
 both `claimed_at` and `heartbeat_at` are old (the later one wins), and a **running** task is judged by
-`heartbeat_at` alone. `swarm_status` marks any claim/run older than `staleAssignmentSec` as `[STALE]`,
+`heartbeat_at` alone. `swarm_status` uses the **same lease reference** for its `[STALE]` marker and the
+`(N stale)` count (v0.4.1), so "status says STALE" and "reap reclaims it" cannot disagree. It also
 reports `retry_count` and the last failure reason for failed/blocked tasks, and counts all six states in
 its summary line.
 
@@ -357,10 +358,13 @@ pool. Set it in the profile's `cordis.patch.yml`:
 长任务在 `running` 状态下如果预计耗时超过 `staleAssignmentSec` 的一半，worker 应**定期调用**
 `swarm_heartbeat(task_id, agent_id)` 续约，否则 `swarm_reap` 会把仍然活着的 worker 当成死掉：
 
-| 状态 | `swarm_reap` 判定依据 |
+| 状态 | `swarm_reap` / `swarm_status` 判定依据 |
 |---|---|
 | `claimed` | `claimed_at` 与 `heartbeat_at` 取**较晚者**，超时才算过期 |
 | `running` | 只看 `heartbeat_at`，超时标 `failed`（`heartbeat timeout`）并消耗一次重试 |
+
+`swarm_status` 的 `[STALE]` 与 `(N stale)` 使用**同一 lease 基准**（v0.4.1 起），不会再出现
+「reap 不回收、status 却标 STALE」的矛盾。
 
 `swarm_heartbeat` 只接受 `claimed` / `running` 的任务，且 `agent_id` 必须等于 `claimed_by`：
 状态不符返回 `invalid_state`，非持有者返回 `not_owner`。日志会追加一条 `heartbeat by <agent>`。

@@ -142,3 +142,43 @@ test('compareReadyOrder keeps priority above FIFO', () => {
   const newer = blankTask('newer', { priority: 5, created_at: '2026-03-01T00:00:00.000Z' })
   assert.ok(compareReadyOrder(newer, older) < 0)
 })
+
+// ------------------------------------------------- lease-based staleness ---
+
+test('a running task with a fresh heartbeat is not stale despite an old claim', () => {
+  const now = Date.now()
+  const task = blankTask('r', {
+    status: 'running',
+    claimed_at: new Date(now - 20 * 60_000).toISOString(),
+    started_at: new Date(now - 20 * 60_000).toISOString(),
+    heartbeat_at: new Date(now - 1_000).toISOString(),
+  })
+  const view = viewOf(task, byId([task]), now, 600)
+  assert.equal(view.stale, false)
+  assert.equal(view.claimed_age_sec, 1200)
+  assert.equal(view.heartbeat_age_sec, 1)
+})
+
+test('a running task with an old heartbeat is stale', () => {
+  const now = Date.now()
+  const task = blankTask('r', {
+    status: 'running',
+    claimed_at: new Date(now - 20 * 60_000).toISOString(),
+    started_at: new Date(now - 20 * 60_000).toISOString(),
+    heartbeat_at: new Date(now - 20 * 60_000).toISOString(),
+  })
+  const view = viewOf(task, byId([task]), now, 600)
+  assert.equal(view.stale, true)
+})
+
+test('a claimed task with a fresh heartbeat is not stale despite an old claim', () => {
+  const now = Date.now()
+  const task = blankTask('c', {
+    status: 'claimed',
+    claimed_by: 'worker-a',
+    claimed_at: new Date(now - 20 * 60_000).toISOString(),
+    heartbeat_at: new Date(now - 2_000).toISOString(),
+  })
+  const view = viewOf(task, byId([task]), now, 600)
+  assert.equal(view.stale, false)
+})
