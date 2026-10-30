@@ -1,7 +1,7 @@
 {
   "name": "dsh-swarm-scheduler-beta",
   "version": "0.3.1",
-  "description": "(beta) Experimental parallel coding scheduler for DSH — a Lead that only schedules, teammates that only execute, and a file-backed ready pool with atomic claiming. Requires the manually mounted experimental Agent Teams bundle.",
+  "description": "Parallel coding scheduler for DSH with six-state task lifecycle, retry/blocking, scope conflict prevention, concurrency ceiling, watchdog, and a DSH-independent core.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

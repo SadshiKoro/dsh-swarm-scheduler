@@ -21,6 +21,15 @@ A multi-session parallel coding scheduler plugin for **DeepSeek Harness**. Its c
 **"work finds the worker"** (活找人): the Lead only decomposes and wakes; workers pull work out of a
 shared on-disk pool by atomic claim.
 
+**0.3.0 起**，任务生命周期从两态扩展为六态（pending / claimed / running / completed / failed /
+blocked），支持失败重试、并发上限（`max_workers`）、scope 冲突硬拒绝、看门狗自动回收（`swarm_reap`）
+和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 56 个单元测试覆盖。
+
+版本脉络：**v0.2.6** 把 `write_scopes` 从提示升级为 claim 时的硬拒绝 → **v0.2.7** 空 `tasksRoot`
+在激活时直接拒绝（不再静默落到 `process.cwd()`）→ **v0.3.0** 六态生命周期、`max_workers` 上限、
+`swarm_reap` watchdog、任务日志、core/adapter 分离 → **v0.3.1** 上限命中时在 `swarm_ready` 里显示
+`degraded: max_workers limit (N) reached`。
+
 ---
 
 ## 1. What problem it solves
