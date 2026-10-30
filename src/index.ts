@@ -132,11 +132,14 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
    - 拆解的最小粒度：一个函数、一个文件、一个独立配置项、一个可独立验证的行为。
    - **评估复杂度**：给每个小块标 complexity（low / medium / high）；标 high 的块要说明理由（跨模块、需要设计判断、易错）。
    - **决定 Worker 等级**：高复杂或高风险的块设 required_worker_tier: 'premium'，其余可留 'any'。这是抽象等级，不要写具体模型名。
+   - **评估能力需求**：如果块需要特定技能（test / docs / sql / 前端等），在 required_capabilities 里列出；Worker 必须声明拥有**全部**这些标签才能领取，缺一个即被拒（worker_lacks_capability）。
+   - **估算上下文**：复杂或大输入块给出粗略 estimated_tokens；超过 Worker 的 max_context_tokens 会被拒（worker_context_too_small）。0 表示不评估。
+   - **成本是软参考**：cost_per_1k_tokens 只用于「把便宜的任务交给便宜的 Worker」，不做硬拦截。
 
 2. 用 list_agents 查看有没有空闲的 teammate（status 为 inactive 的）。
    有空闲的 → 直接 send_message 唤醒它们，不要新建。
    没有空闲的 → 用 spawn_teammate 创建 2-3 个。
-   需要 premium 级 Worker 时，创建/复用一个能力更强的 teammate，并在部署的 worker_tiers 配置里标成 premium（provider/model 由你按可用性分配，调度层不认识具体模型名）。
+   需要 premium 级 Worker 时，创建/复用一个能力更强的 teammate，并在部署的 worker_tiers 或 worker_profiles 配置里标成 premium（provider/model 由你按可用性分配，调度层不认识具体模型名）。
 
 3. 给每个 worker 发一条 send_message，消息里只说：
    "去 swarm_ready 查就绪任务，swarm_claim 自领，swarm_start 开工，做完用 swarm_complete 回报（失败时 success=false），然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。预计耗时超过 staleAssignmentSec 一半的任务，running 期间每隔一段时间调一次 swarm_heartbeat 续约。"
@@ -192,6 +195,7 @@ export function apply(ctx: Context, config: SwarmConfig) {
       staleAssignmentSec,
       max_workers: config.max_workers,
       worker_tiers: config.worker_tiers ?? {},
+      worker_profiles: config.worker_profiles ?? {},
       disposers,
     })
 

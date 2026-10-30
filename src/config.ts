@@ -43,14 +43,32 @@ export interface Config {
    */
   max_workers: number
   /**
-   * Worker capability map: agent id → `standard` | `premium`.
+   * Legacy capability map: agent id → `standard` | `premium`.
    *
-   * Routing is expressed in tiers, never in concrete model names, so the
-   * scheduler stays provider-agnostic: the Lead decides which model backs a
-   * teammate, the pool only decides whether that teammate is strong enough for
-   * a block. An unlisted worker is `standard`.
+   * Kept for backward compatibility. `worker_profiles` takes precedence when
+   * both name the same agent; an id present only here gets the default profile
+   * with the tier from this map.
    */
   worker_tiers: Record<string, string>
+  /**
+   * Multidimensional worker profiles: agent id → capability picture.
+   *
+   * - `tier` keeps the v0.5.0 routing rule (premium required by a task);
+   * - `capabilities` are tags the worker declares (code / test / docs / sql …)
+   *   and the task may require all of them;
+   * - `max_context_tokens` bounds `estimated_tokens`;
+   * - `cost_per_1k_tokens` is a **soft** scheduling reference only — it is never
+   *   a refusal condition, because "cheap" is a preference, not a capability.
+   *
+   * An unlisted worker gets `{ tier: 'standard', capabilities: [],
+   * max_context_tokens: 32000, cost_per_1k_tokens: 0.01 }`.
+   */
+  worker_profiles: Record<string, {
+    tier?: string
+    capabilities: string[]
+    max_context_tokens: number
+    cost_per_1k_tokens: number
+  }>
 }
 
 /**
@@ -78,6 +96,12 @@ export const Config: Schema<Config> = Schema.object({
   staleAssignmentSec: Schema.number().default(600),
   max_workers: Schema.number().default(3),
   worker_tiers: Schema.dict(Schema.string()).default({}),
+  worker_profiles: Schema.dict(Schema.object({
+    tier: Schema.string().default('standard'),
+    capabilities: Schema.array(Schema.string()).default([]),
+    max_context_tokens: Schema.number().default(32000),
+    cost_per_1k_tokens: Schema.number().default(0.01),
+  })).default({}),
 })
 
 /**

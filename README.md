@@ -25,12 +25,16 @@ shared on-disk pool by atomic claim.
 
 **0.3.0 起**，任务生命周期从两态扩展为六态（pending / claimed / running / completed / failed /
 blocked），支持失败重试、并发上限（`max_workers`）、scope 冲突硬拒绝、看门狗自动回收（`swarm_reap`）
-和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 56 个单元测试覆盖。
+和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 86 个测试覆盖（含 10-Worker 并发压测）。
 
 版本脉络：**v0.2.6** 把 `write_scopes` 从提示升级为 claim 时的硬拒绝 → **v0.2.7** 空 `tasksRoot`
 在激活时直接拒绝（不再静默落到 `process.cwd()`）→ **v0.3.0** 六态生命周期、`max_workers` 上限、
 `swarm_reap` watchdog、任务日志、core/adapter 分离 → **v0.3.1** 上限命中时在 `swarm_ready` 里显示
-`degraded: max_workers limit (N) reached`。
+`degraded: max_workers limit (N) reached` → **v0.3.2** 认领优先级、`required_files` / `required_hashes`
+预检 → **v0.4.0** 心跳续约 `swarm_heartbeat`、内容 hash 版本校验、npm 打包与 CI → **v0.4.1** STALE
+标记与 lease 语义一致 → **v0.5.0** 异构路由（`complexity` / `required_worker_tier` / `worker_tiers`）
+与 50 任务 / 10 scope / 10 Worker 压测 → **v0.6.0** 多维 Worker 画像
+（`worker_profiles`：capabilities / 上下文 / 成本）与能力、上下文硬路由。
 
 ---
 
@@ -268,7 +272,7 @@ Use the swarm scheduler for this:
 
 | Tool | Purpose | Main parameters |
 |---|---|---|
-| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`, `required_hashes`, `complexity`, `required_worker_tier`) |
+| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`, `required_hashes`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`) |
 | `swarm_ready` | List the tasks a worker may start right now (0 when `max_workers` is reached) | optional `big_task_id` filter |
 | `swarm_claim` | Atomically claim one task (`pending` → `claimed`) | `task_id` / `claimed_by` |
 | `swarm_start` | Start work (`claimed` → `running`), recording the heartbeat | `task_id` / `started_by` |
@@ -321,13 +325,28 @@ pool. Set it in the profile's `cordis.patch.yml`:
 - id: swarm-scheduler
   config:
     max_workers: 3
+    # legacy tier map (still supported)
     worker_tiers:
       worker-cheap: standard
       worker-strong: premium
+    # multidimensional profile (takes precedence over worker_tiers)
+    worker_profiles:
+      worker-strong:
+        tier: premium
+        capabilities: [code, test, sql]
+        max_context_tokens: 128000
+        cost_per_1k_tokens: 0.01
+      worker-docs:
+        tier: standard
+        capabilities: [docs]
+        max_context_tokens: 32000
+        cost_per_1k_tokens: 0.002
 ```
 
-`worker_tiers` is the capability map used by intelligent routing (§6.5). Unlisted workers are
-`standard`; the scheduler never knows model names, only tiers.
+`worker_tiers` is the legacy strength map used by routing (§6.5). `worker_profiles` is the
+multidimensional picture (§6.6) and wins when both name the same agent. Unlisted workers are
+`standard` with no extra capabilities, a 32k context window and a 0.01 cost reference; the scheduler
+never knows model names, only these declarations.
 
 ### 6.3 调度智能化（v0.3.2）
 
@@ -403,6 +422,28 @@ complexity，并对高风险块标 `premium`；具体用哪个 provider/model �
 **压力测试**：`test/core/stress.test.ts` 模拟 10 个 Worker 对 50 个任务（10 个 scope）并发抢占，并模拟
 5 个 Worker 领取后消失、由 `swarm_reap` 一轮回收。它曾在 v0.5.0 开发中抓到一个真实并发缺陷：失败的
 claim 会删掉成功 claim 的进程内互斥标记，导致第三次 claim 清掉活锁并双双写入；修复为按任务引用计数。
+
+### 6.6 多维能力调度：capabilities 与 estimated_tokens（v0.6.0）
+
+v0.5.0 的 tier 只回答“够不够强”；v0.6.0 增加两个更精确的硬路由条件：
+
+| 任务字段 | 默认 | 含义 |
+|---|---|---|
+| `required_capabilities` | `[]` | Worker 必须**声明拥有全部**这些标签（如 `code` / `test` / `docs` / `sql`）；缺任一即拒 |
+| `estimated_tokens` | `0` | 任务输入规模估计；`> 0` 时若超过 Worker 的 `max_context_tokens` 即拒；`0` 表示不评估 |
+
+Worker 画像来自 profile 的 `worker_profiles`（§6.2 示例）；未配置的 Worker 使用默认画像
+`{ tier: 'standard', capabilities: [], max_context_tokens: 32000, cost_per_1k_tokens: 0.01 }`。
+`worker_profiles` 与旧 `worker_tiers` 同时配置时，**profile 优先**。
+
+`swarm_claim` 的硬路由顺序（都在取锁前，失败不改任务状态）：
+
+1. tier：`worker_too_weak`（§6.5 的既有规则）；
+2. 能力：缺标签 → `worker_lacks_capability`，消息列出缺失标签与 Worker 已声明标签；
+3. 上下文：`estimated_tokens > max_context_tokens` → `worker_context_too_small`，消息列出两边数值。
+
+**`cost_per_1k_tokens` 不是拦截条件**，只作为 Lead 调度的软参考（把便宜的任务交给便宜的 Worker）；
+它不会出现在任何拒绝码里。`swarm_status` 会展示 `[caps: code,test]` 与 `[est: 50k tokens]`。
 
 ---
 
@@ -505,7 +546,7 @@ without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
      here;
    - if DSH promotes that package into a default bundle, or removes it, **the installation steps in
      §4 will change** and this README may be out of date.
-9. **Concurrency correctness has both unit and stress coverage — 80 automated tests.** The suite
+9. **Concurrency correctness has both unit and stress coverage — 86 automated tests.** The suite
    covers the six-state lifecycle (`claim`/`start`/`complete`/`release`/`reap`/`set_dependencies`),
    retry and blocked transitions, the `write_scopes` admission check, residual-lock cleanup,
    readiness/staleness, the `max_workers` ceiling, routing refusals, and concurrent races (same-task

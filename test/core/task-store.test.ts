@@ -645,3 +645,57 @@ test('a default any/medium task is claimable by any worker', async () => {
   assert.equal(outcome.ok, true)
   assert.equal(outcome.code, 'claimed')
 })
+
+// ------------------------------------------------- multidimensional routing ---
+
+test('a worker whose capabilities cover the requirement can claim', async () => {
+  await store.createExclusive(blankTask('t1', { required_capabilities: ['code'] }))
+  const profiles = { 'worker-code': { capabilities: ['code', 'test'] } }
+  const outcome = await claimTask(store, 't1', 'worker-code', undefined, undefined, profiles)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})
+
+test('a worker missing a required capability is refused with the missing tags named', async () => {
+  await store.createExclusive(blankTask('t1', { required_capabilities: ['code', 'test'] }))
+  const profiles = { 'worker-docs': { capabilities: ['docs'] } }
+  const outcome = await claimTask(store, 't1', 'worker-docs', undefined, undefined, profiles)
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'worker_lacks_capability')
+  assert.match(outcome.message, /code/)
+  assert.match(outcome.message, /test/)
+  assert.equal(readRaw('t1').status, 'pending')
+})
+
+test('a worker with too small a context window is refused', async () => {
+  await store.createExclusive(blankTask('t1', { estimated_tokens: 50000 }))
+  const profiles = { 'worker-small': { max_context_tokens: 32000 } }
+  const outcome = await claimTask(store, 't1', 'worker-small', undefined, undefined, profiles)
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'worker_context_too_small')
+  assert.match(outcome.message, /50000/)
+  assert.match(outcome.message, /32000/)
+})
+
+test('a worker with a large enough context window can claim', async () => {
+  await store.createExclusive(blankTask('t1', { estimated_tokens: 50000 }))
+  const profiles = { 'worker-big': { max_context_tokens: 128000 } }
+  const outcome = await claimTask(store, 't1', 'worker-big', undefined, undefined, profiles)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})
+
+test('with no requirements and no estimate, any worker can claim', async () => {
+  await store.createExclusive(blankTask('t1'))
+  const outcome = await claimTask(store, 't1', 'worker-unknown', undefined, undefined, {})
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})
+
+test('a profile overrides a legacy tier entry for the same agent', async () => {
+  await store.createExclusive(blankTask('t1', { required_worker_tier: 'premium' }))
+  // Legacy map says premium, profile says standard: the profile wins.
+  const outcome = await claimTask(store, 't1', 'worker-both', undefined, { 'worker-both': 'premium' }, { 'worker-both': { tier: 'standard' } })
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'worker_too_weak')
+})

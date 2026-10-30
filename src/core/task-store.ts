@@ -496,17 +496,78 @@ function lockExists(dirPath: string, taskId: string): boolean {
  *     so a likely collision is visible while planning, before anyone claims;
  *   - **missing `required_files`** are refused as `missing_dependencies`, naming
  *     every absent path; the task keeps its `pending` state;
- *   - a **routing mismatch** is refused as `worker_too_weak` (see
- *     `routingRefusal`), before any lock churn;
+ *   - a **routing mismatch** is refused before any lock churn: `worker_too_weak`
+ *     for tier/complexity, `worker_lacks_capability` for missing tags,
+ *     `worker_context_too_small` for an underestimated window;
  *   - the usual state checks (missing / completed / already claimed).
  */
 export type WorkerTier = 'standard' | 'premium'
 
 /**
+ * A worker's capability picture, as declared by the deployment.
+ *
+ * Tiers stay the coarse strength gate; capabilities and context are the precise
+ * ones. Cost lives here only so the Lead can *prefer* cheaper workers — it is
+ * never a refusal condition.
+ */
+export interface WorkerProfile {
+  tier: WorkerTier
+  capabilities: string[]
+  max_context_tokens: number
+  cost_per_1k_tokens: number
+}
+
+export const DEFAULT_WORKER_PROFILE: WorkerProfile = {
+  tier: 'standard',
+  capabilities: [],
+  max_context_tokens: 32000,
+  cost_per_1k_tokens: 0.01,
+}
+
+/** Loose input shape: config is human-edited, so tier arrives as a string. */
+export interface WorkerProfileInput {
+  tier?: string
+  capabilities?: string[]
+  max_context_tokens?: number
+  cost_per_1k_tokens?: number
+}
+
+/**
+ * Resolve one worker's profile: `worker_profiles` first, legacy `worker_tiers`
+ * second, defaults last.
+ *
+ * A profile that names the agent wins even when it is partial; a tier is only
+ * taken from the legacy map when no profile exists, so the two surfaces cannot
+ * disagree for the same id. Unknown ids degrade to the default profile — a
+ * capability declaration that cannot be read must not become a capability.
+ */
+export function resolveWorkerProfile(
+  agentId: string,
+  profiles?: Readonly<Record<string, WorkerProfileInput>>,
+  tiers?: Readonly<Record<string, string>>,
+): WorkerProfile {
+  const raw = profiles?.[agentId]
+  if (raw !== undefined) {
+    return {
+      tier: raw.tier === 'premium' ? 'premium' : 'standard',
+      capabilities: raw.capabilities?.filter(capability => typeof capability === 'string') ?? [],
+      max_context_tokens: typeof raw.max_context_tokens === 'number' && raw.max_context_tokens > 0
+        ? raw.max_context_tokens
+        : DEFAULT_WORKER_PROFILE.max_context_tokens,
+      cost_per_1k_tokens: typeof raw.cost_per_1k_tokens === 'number' && raw.cost_per_1k_tokens >= 0
+        ? raw.cost_per_1k_tokens
+        : DEFAULT_WORKER_PROFILE.cost_per_1k_tokens,
+    }
+  }
+  if (tiers?.[agentId] === 'premium') return { ...DEFAULT_WORKER_PROFILE, tier: 'premium' }
+  return { ...DEFAULT_WORKER_PROFILE }
+}
+
+/**
  * The tier a worker claims to be, from the deployment's `worker_tiers` map.
  *
- * Unknown ids and unknown tier strings degrade to `standard`: a capability
- * declaration that cannot be read must not silently become "premium".
+ * Kept for callers that only have the legacy surface; `resolveWorkerProfile`
+ * is the authoritative composition.
  */
 export function workerTierOf(agentId: string, tiers?: Readonly<Record<string, string>>): WorkerTier {
   return tiers?.[agentId] === 'premium' ? 'premium' : 'standard'
@@ -533,13 +594,47 @@ export function routingRefusal(task: TaskRecord, agentId: string, tier: WorkerTi
   return undefined
 }
 
+/**
+ * Capability and context gates, in that order.
+ *
+ * Both are hard refusals and both run before the lock. Cost is deliberately
+ * absent: a cheap worker is a preference, not an eligibility rule.
+ */
+export function profileRefusal(
+  task: TaskRecord,
+  agentId: string,
+  profile: WorkerProfile,
+): { code: 'worker_lacks_capability' | 'worker_context_too_small'; message: string } | undefined {
+  if (task.required_capabilities.length > 0) {
+    const have = new Set(profile.capabilities)
+    const missing = task.required_capabilities.filter(capability => !have.has(capability))
+    if (missing.length > 0) {
+      return {
+        code: 'worker_lacks_capability',
+        message: `${task.task_id} requires capabilities [${task.required_capabilities.join(', ')}]; `
+          + `${agentId} is missing [${missing.join(', ')}] `
+          + `(declared: [${profile.capabilities.join(', ')}])`,
+      }
+    }
+  }
+  if (task.estimated_tokens > 0 && task.estimated_tokens > profile.max_context_tokens) {
+    return {
+      code: 'worker_context_too_small',
+      message: `${task.task_id} estimates ${task.estimated_tokens} tokens, above ${agentId}'s `
+        + `max_context_tokens (${profile.max_context_tokens})`,
+    }
+  }
+  return undefined
+}
+
 export async function claimTask(
   store: TaskStore,
   taskId: string,
   claimedBy: string,
   clock: Clock = defaultClock,
   workerTiers?: Readonly<Record<string, string>>,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
+  workerProfiles?: Readonly<Record<string, WorkerProfileInput>>,
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -559,12 +654,17 @@ export async function claimTask(
     }
   }
 
-  // Capability routing: refuse before any file or lock work when this worker is
-  // below the tier the task declares.
-  const tier = workerTierOf(claimedBy, workerTiers)
-  const refusal = routingRefusal(found.task, claimedBy, tier)
+  // Capability routing: tier, then capability tags, then context size — all
+  // hard gates, all before the lock. Cost is deliberately absent from this
+  // list: it is a scheduling preference, not an eligibility rule.
+  const profile = resolveWorkerProfile(claimedBy, workerProfiles, workerTiers)
+  const refusal = routingRefusal(found.task, claimedBy, profile.tier)
   if (refusal !== undefined) {
     return { ok: false, code: 'worker_too_weak', message: refusal }
+  }
+  const profileMiss = profileRefusal(found.task, claimedBy, profile)
+  if (profileMiss !== undefined) {
+    return { ok: false, code: profileMiss.code, message: profileMiss.message }
   }
 
   // Context-integrity pre-check: a task that names prerequisite files must not

@@ -61,6 +61,10 @@ export interface TaskRecord {
   complexity: Complexity
   /** Minimum worker tier; `any` means no routing restriction. */
   required_worker_tier: WorkerTierRequirement
+  /** Capability tags the worker must declare; empty means no requirement. */
+  required_capabilities: string[]
+  /** Rough input size; 0 means "not estimated", which disables the context gate. */
+  estimated_tokens: number
 }
 
 /** A task plus the derived facts callers actually schedule on. */
@@ -119,6 +123,8 @@ export function blankTask(taskId: string, fields: Partial<TaskRecord> = {}): Tas
     required_hashes: fields.required_hashes ?? {},
     complexity: fields.complexity ?? 'medium',
     required_worker_tier: fields.required_worker_tier ?? 'any',
+    required_capabilities: fields.required_capabilities ?? [],
+    estimated_tokens: fields.estimated_tokens ?? 0,
   }
 }
 
@@ -171,6 +177,8 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
     required_worker_tier: raw.required_worker_tier === 'standard' || raw.required_worker_tier === 'premium'
       ? raw.required_worker_tier
       : 'any',
+    required_capabilities: strings(raw.required_capabilities),
+    estimated_tokens: Math.max(0, num(raw.estimated_tokens)),
   })
 }
 

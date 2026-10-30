@@ -28,6 +28,7 @@ import {
   viewsOf,
   type TaskRecord,
   type TaskView,
+  type WorkerProfileInput,
 } from './core/task-store.js'
 
 const text = (value: string) => [{ type: 'text' as const, text: value }]
@@ -36,6 +37,12 @@ const text = (value: string) => [{ type: 'text' as const, text: value }]
 const MAX_PLAN_TASKS = 200
 /** Longest accepted compressed result; detail belongs in a handoff file. */
 const MAX_RESULT_CHARS = 4_000
+
+/** Compact token count for the status line: 50000 -> "50k". */
+function formatTokens(tokens: number): string {
+  if (tokens < 1000) return `${tokens}`
+  return `${Math.round(tokens / 1000)}k`
+}
 
 /**
  * Render an age in seconds as a short human interval: `45s`, `15m`, `2h3m`.
@@ -69,6 +76,8 @@ export interface FileToolDeps {
   max_workers: number
   /** agent id → 'standard' | 'premium'; unlisted workers are standard. */
   worker_tiers: Record<string, string>
+  /** agent id → capability picture (tier, capabilities, context, cost). */
+  worker_profiles: Record<string, WorkerProfileInput>
   /** Collects every disposer from this registration, in one ownership list. */
   disposers: Array<() => void>
 }
@@ -92,7 +101,7 @@ function viewRow(view: TaskView): Record<string, unknown> {
   }
 }
 
-export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, worker_tiers, disposers }: FileToolDeps): void {
+export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, worker_tiers, worker_profiles, disposers }: FileToolDeps): void {
   // ------------------------------------------------------------- swarm_plan ---
   disposers.push(ctx.tools.register(defineTool({
     name: 'swarm_plan',
@@ -103,7 +112,9 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       + 'or already on disk; a task is ready only once every blocker is completed. Each task may also set '
       + '`priority` (larger claims first; ties are FIFO by creation time) and `required_files` '
       + '(workspace-relative paths that must exist before the task may be claimed); `required_hashes` pins '
-      + 'each of those files to a sha256 digest, so a changed prerequisite refuses the claim with `hash_mismatch`.',
+      + 'each of those files to a sha256 digest, so a changed prerequisite refuses the claim with `hash_mismatch`. '
+      + 'Routing fields: `complexity`, `required_worker_tier`, `required_capabilities` (worker must declare every '
+      + 'tag) and `estimated_tokens` (must fit the worker context window).',
     parameters: {
       tasks: {
         type: 'array',
@@ -128,6 +139,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
             },
             complexity: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Estimated difficulty, used for worker routing. Default medium.' },
             required_worker_tier: { type: 'string', enum: ['any', 'standard', 'premium'], description: 'Minimum worker tier allowed to claim. Default any.' },
+            required_capabilities: { type: 'array', description: 'Capability tags the worker must declare (all of them). Default empty.', items: { type: 'string' } },
+            estimated_tokens: { type: 'number', description: 'Rough input size in tokens; must fit the worker context window. 0 means not estimated.' },
           },
         },
       },
@@ -204,6 +217,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           required_hashes: requiredHashes,
           complexity: spec.complexity ?? 'medium',
           required_worker_tier: spec.required_worker_tier ?? 'any',
+          required_capabilities: spec.required_capabilities ?? [],
+          estimated_tokens: Math.max(0, spec.estimated_tokens ?? 0),
         })
         const written = await store.createExclusive(record)
         if (written.ok) created.push(taskId)
@@ -326,7 +341,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -339,7 +354,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
     },
     async execute(args) {
-      const outcome = await claimTask(store, args.task_id, args.claimed_by, undefined, worker_tiers)
+      const outcome = await claimTask(store, args.task_id, args.claimed_by, undefined, worker_tiers, worker_profiles)
       const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
       return {
         ok: outcome.ok,
@@ -480,6 +495,12 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         // so ordinary lines stay readable.
         if (view.complexity !== 'medium' || view.required_worker_tier !== 'any') {
           line += ` [complexity: ${view.complexity}, req: ${view.required_worker_tier}]`
+        }
+        if (view.required_capabilities.length > 0) {
+          line += ` [caps: ${view.required_capabilities.join(',')}]`
+        }
+        if (view.estimated_tokens > 0) {
+          line += ` [est: ${formatTokens(view.estimated_tokens)} tokens]`
         }
         // Context-integrity marker: a pending task whose declared prerequisites
         // are absent (or whose pinned content digest no longer matches) cannot be
