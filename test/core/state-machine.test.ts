@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import {
   blankTask,
   computeReady,
+  compareReadyOrder,
   viewOf,
   viewsOf,
   type TaskRecord,
@@ -104,4 +105,40 @@ test('computeReady honours the big_task_id filter', () => {
   const tasks = [blankTask('a', { big_task_id: 'T1' }), blankTask('b', { big_task_id: 'T2' })]
   const result = computeReady(tasks, 3, 'T2')
   assert.deepEqual(result.tasks.map(task => task.task_id), ['b'])
+})
+
+// ------------------------------------------------------- priority ordering ---
+
+test('computeReady orders by priority descending', () => {
+  const tasks = [
+    blankTask('low', { priority: 0, created_at: '2026-01-01T00:00:00.000Z' }),
+    blankTask('high', { priority: 10, created_at: '2026-01-03T00:00:00.000Z' }),
+    blankTask('mid', { priority: 5, created_at: '2026-01-02T00:00:00.000Z' }),
+  ]
+  const result = computeReady(tasks, 3)
+  assert.deepEqual(result.tasks.map(task => task.task_id), ['high', 'mid', 'low'])
+})
+
+test('computeReady orders equal priorities by created_at ascending (FIFO)', () => {
+  const tasks = [
+    blankTask('later', { priority: 3, created_at: '2026-02-01T12:00:00.000Z' }),
+    blankTask('earlier', { priority: 3, created_at: '2026-02-01T08:00:00.000Z' }),
+  ]
+  const result = computeReady(tasks, 3)
+  assert.deepEqual(result.tasks.map(task => task.task_id), ['earlier', 'later'])
+})
+
+test('computeReady falls back to task_id when created_at is missing', () => {
+  const tasks = [
+    blankTask('zeta', { priority: 1, created_at: '' }),
+    blankTask('alpha', { priority: 1, created_at: '' }),
+  ]
+  const result = computeReady(tasks, 3)
+  assert.deepEqual(result.tasks.map(task => task.task_id), ['alpha', 'zeta'])
+})
+
+test('compareReadyOrder keeps priority above FIFO', () => {
+  const older = blankTask('older', { priority: 0, created_at: '2026-01-01T00:00:00.000Z' })
+  const newer = blankTask('newer', { priority: 5, created_at: '2026-03-01T00:00:00.000Z' })
+  assert.ok(compareReadyOrder(newer, older) < 0)
 })

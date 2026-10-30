@@ -1,5 +1,5 @@
 /**
- * The file-driven tool surface: seven tools, all of them plain task-pool I/O.
+ * The file-driven tool surface: nine tools, all of them plain task-pool I/O.
  *
  * None of these touch a Cordis service beyond `ctx.fs` (through `TaskStore`),
  * because every richer service this plugin once relied on proved unreachable
@@ -22,6 +22,7 @@ import {
   reapTask,
   readLog,
   computeReady,
+  missingRequiredFiles,
   viewsOf,
   type TaskRecord,
   type TaskView,
@@ -95,7 +96,9 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       'Create the task pool on disk: one JSON file per task under .dsh-tasks/. Call this first, with the '
       + 'whole decomposition. An existing task_id is never overwritten — it is reported as a conflict so a '
       + 'repeated call cannot silently reset finished work. blocked_by names other task_ids in the same call '
-      + 'or already on disk; a task is ready only once every blocker is completed.',
+      + 'or already on disk; a task is ready only once every blocker is completed. Each task may also set '
+      + '`priority` (larger claims first; ties are FIFO by creation time) and `required_files` '
+      + '(workspace-relative paths that must exist before the task may be claimed).',
     parameters: {
       tasks: {
         type: 'array',
@@ -111,6 +114,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
             description: { type: 'string', required: true, description: 'Inputs, outputs and acceptance criteria' },
             blocked_by: { type: 'array', description: 'Task ids that must complete first', items: { type: 'string' } },
             write_scopes: { type: 'array', description: 'Files or directory prefixes this task will modify', items: { type: 'string' } },
+            priority: { type: 'number', description: 'Claim priority: larger wins; ties are FIFO by creation time. Default 0.' },
+            required_files: { type: 'array', description: 'Workspace-relative files that must exist before the task can be claimed', items: { type: 'string' } },
           },
         },
       },
@@ -172,6 +177,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           description: spec.description,
           blocked_by: spec.blocked_by ?? [],
           write_scopes: spec.write_scopes ?? [],
+          priority: spec.priority ?? 0,
+          required_files: spec.required_files ?? [],
         })
         const written = await store.createExclusive(record)
         if (written.ok) created.push(taskId)
@@ -294,7 +301,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -444,6 +451,12 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           line += ')'
         }
         line += ` — ${view.title}`
+        // Context-integrity marker: a pending task whose declared prerequisites
+        // are absent cannot be claimed, even though DAG-wise it is ready.
+        if (view.status === 'pending') {
+          const missing = missingRequiredFiles(store, view)
+          if (missing.length > 0) line += ` [blocked: missing ${missing.join(', ')}]`
+        }
         return line
       })
       let degraded = all.io.degraded ?? store.degraded ?? ''

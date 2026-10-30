@@ -38,6 +38,12 @@ export interface TaskRecord {
   retry_count: number
   max_retries: number
   failure_reason: string
+  /** ISO timestamp written when the task file is created; drives FIFO ordering. */
+  created_at: string
+  /** Larger wins a claim race: `computeReady` sorts by this descending. */
+  priority: number
+  /** Workspace-relative files that must exist before the task may be claimed. */
+  required_files: string[]
 }
 
 /** A task plus the derived facts callers actually schedule on. */
@@ -90,6 +96,9 @@ export function blankTask(taskId: string, fields: Partial<TaskRecord> = {}): Tas
     retry_count: fields.retry_count ?? 0,
     max_retries: fields.max_retries ?? 3,
     failure_reason: fields.failure_reason ?? '',
+    created_at: fields.created_at ?? '',
+    priority: fields.priority ?? 0,
+    required_files: fields.required_files ?? [],
   }
 }
 
@@ -126,6 +135,9 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
     retry_count: num(raw.retry_count),
     max_retries: num(raw.max_retries) || 3,
     failure_reason: typeof raw.failure_reason === 'string' ? raw.failure_reason : '',
+    created_at: typeof raw.created_at === 'string' ? raw.created_at : '',
+    priority: num(raw.priority),
+    required_files: strings(raw.required_files),
   })
 }
 
@@ -200,12 +212,33 @@ export interface ReadyResult {
 }
 
 /**
+ * Claim order: priority descending, then oldest `created_at` first, then id.
+ *
+ * The third key is not decoration: two tasks written in the same millisecond (or
+ * both missing `created_at`) must still come out in a stable order, otherwise
+ * "ready" would reshuffle between calls and a worker could starve a block by
+ * re-reading a different permutation each round.
+ */
+export function compareReadyOrder(a: TaskRecord, b: TaskRecord): number {
+  if (b.priority !== a.priority) return b.priority - a.priority
+  const at = Date.parse(a.created_at)
+  const bt = Date.parse(b.created_at)
+  const aHas = a.created_at.length > 0 && !Number.isNaN(at)
+  const bHas = b.created_at.length > 0 && !Number.isNaN(bt)
+  if (aHas && bHas && at !== bt) return at - bt
+  return a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0
+}
+
+/**
  * The ready pool, capped by the `max_workers` ceiling.
  *
  * The ceiling counts **claimed + running** tasks: those are the workers that are
  * actually consuming capacity. Reaching it is not an error and not an empty
  * pool — the caller is told it was the limit (`limited: true`) so the
  * distinction is observable instead of looking like "nothing to do".
+ *
+ * Below the ceiling the result is ordered by {@link compareReadyOrder}, so the
+ * caller does not have to re-sort and file-traversal order never leaks out.
  */
 export function computeReady(
   tasks: readonly TaskRecord[],
@@ -222,5 +255,6 @@ export function computeReady(
     .filter(view => view.ready)
     .filter(view => filter === undefined || view.big_task_id === filter)
     .map(view => tasks.find(task => task.task_id === view.task_id) as TaskRecord)
+    .sort(compareReadyOrder)
   return { total: ready.length, tasks: ready, limited: false }
 }

@@ -245,7 +245,7 @@ Use the swarm scheduler for this:
 
 | Tool | Purpose | Main parameters |
 |---|---|---|
-| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`) |
+| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`) |
 | `swarm_ready` | List the tasks a worker may start right now (0 when `max_workers` is reached) | optional `big_task_id` filter |
 | `swarm_claim` | Atomically claim one task (`pending` → `claimed`) | `task_id` / `claimed_by` |
 | `swarm_start` | Start work (`claimed` → `running`), recording the heartbeat | `task_id` / `started_by` |
@@ -295,6 +295,27 @@ pool. Set it in the profile's `cordis.patch.yml`:
   config:
     max_workers: 3
 ```
+
+### 6.3 调度智能化（v0.3.2）
+
+**`priority`（越大越优先领）**
+
+- `swarm_plan` 的每个任务可带 `priority`（number，默认 `0`）；
+- `swarm_ready` 返回的列表**已经排好序**，不再按文件遍历顺序：
+  1. `priority` 降序；
+  2. 同优先级内，`created_at` 升序（等得越久越优先，FIFO）；
+  3. 二者都无法区分时（`created_at` 缺失或同毫秒），按 `task_id` 字母序兜底，保证每轮返回稳定。
+- `created_at` 由 `createExclusive` 在任务文件写入时打戳，所有创建路径一致。
+
+**`required_files`（领取前上下文完整性预检）**
+
+- `swarm_plan` 的每个任务可带 `required_files`（string[]，默认空），路径相对 **workspace 根**
+  （即 `tasksRoot`），也接受绝对路径；
+- `swarm_claim` 在真正置为 `claimed` 之前检查这些文件是否存在；缺任何一个就拒绝，返回
+  `missing_dependencies`，消息里列出**每一个**缺失路径（例如
+  `missing required file(s): src/a.ts, package.json`），任务保持 `pending`；
+- `swarm_status` 对 `pending` 任务在行尾标出 `[blocked: missing X, Y]`，即使它在 DAG 语义上
+  `ready` ——「ready 但领不了」是可见的，而不是等到 claim 才失败。
 
 ---
 

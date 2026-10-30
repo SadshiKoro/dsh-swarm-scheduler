@@ -34,6 +34,7 @@ import {
   viewsOf,
   findScopeConflict,
   scopesOverlap,
+  missingRequiredFiles,
   type TaskRecord,
 } from '../../src/core/task-store.ts'
 
@@ -475,4 +476,54 @@ test('viewsOf includes retry_count and failure_reason for failed/blocked tasks',
   assert.equal(view!.status, 'failed')
   assert.equal(view!.retry_count, 1)
   assert.equal(view!.failure_reason, 'failed')
+})
+
+// --------------------------------------------------------- required_files ---
+
+test('createExclusive stamps created_at for FIFO ordering', async () => {
+  await store.createExclusive(blankTask('t1'))
+  const raw = readRaw('t1')
+  assert.notEqual(raw.created_at, '')
+  assert.ok(!Number.isNaN(Date.parse(raw.created_at)))
+})
+
+test('claimTask refuses a task whose required_files are missing', async () => {
+  await store.createExclusive(blankTask('t1', { required_files: ['nonexistent.txt'] }))
+  const outcome = await claimTask(store, 't1', 'worker-a')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'missing_dependencies')
+  // The message must name the exact path, not just say "missing".
+  assert.match(outcome.message, /nonexistent\.txt/)
+  // A refusal must not move the task out of pending.
+  assert.equal(readRaw('t1').status, 'pending')
+  assert.equal(readRaw('t1').claimed_by, '')
+})
+
+test('claimTask admits a task whose required_files exist', async () => {
+  writeFileSync(join(dir, 'package.json'), '{}\n', 'utf8')
+  await store.createExclusive(blankTask('t1', { required_files: ['package.json'] }))
+  const outcome = await claimTask(store, 't1', 'worker-a')
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+  assert.equal(readRaw('t1').status, 'claimed')
+})
+
+test('missingRequiredFiles lists only the absent paths', async () => {
+  writeFileSync(join(dir, 'present.txt'), 'x\n', 'utf8')
+  const task = blankTask('t1', { required_files: ['present.txt', 'absent-a.txt', 'absent-b.txt'] })
+  assert.deepEqual(missingRequiredFiles(store, task), ['absent-a.txt', 'absent-b.txt'])
+})
+
+test('a priority task with missing required_files is ready by DAG but unclaimable', async () => {
+  await store.createExclusive(blankTask('t1', { priority: 7, required_files: ['ghost.txt'], created_at: '2026-01-01T00:00:00.000Z' }))
+  const all = (await store.readAll()).tasks
+  // DAG-wise it is ready: pending with no blockers.
+  const views = viewsOf(all)
+  assert.equal(views[0]?.ready, true)
+  // Context-wise it is not: the claim is refused and the task stays pending.
+  const outcome = await claimTask(store, 't1', 'worker-a')
+  assert.equal(outcome.code, 'missing_dependencies')
+  assert.match(outcome.message, /ghost\.txt/)
+  assert.equal(readRaw('t1').status, 'pending')
+  assert.equal(readRaw('t1').priority, 7)
 })

@@ -16,7 +16,7 @@
  *     malformed file are all ordinary states this layer reports.
  */
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, isAbsolute } from 'node:path'
 import {
   TASKS_DIR,
   blankTask,
@@ -270,7 +270,12 @@ export class TaskStore {
    * same task id.
    */
   async createExclusive(task: TaskRecord): Promise<IoOutcome> {
-    const body = `${JSON.stringify(task, null, 2)}\n`
+    // Stamp creation time here, not in the plan handler: every path that creates
+    // a task must get the same FIFO clock, including tests and future callers.
+    const record: TaskRecord = task.created_at.length > 0
+      ? task
+      : { ...task, created_at: this.#clock().toISOString() }
+    const body = `${JSON.stringify(record, null, 2)}\n`
     if (this.#backend === 'service' && this.#fs !== undefined) {
       const fs = this.#fs
       try {
@@ -298,8 +303,7 @@ export class TaskStore {
   }
 
   /** Replace one existing task file (used for claim/complete transitions). */
-  async writeExisting(task: TaskRecord): Promise<IoOutcome> {
-    const body = `${JSON.stringify(task, null, 2)}\n`
+  async writeExisting(task: TaskRecord): Promise<IoOutcome> {    const body = `${JSON.stringify(task, null, 2)}\n`
     if (this.#backend === 'service' && this.#fs !== undefined) {
       try {
         const target = await this.#fs.resolve(`${TASKS_DIR}/${taskFileName(task.task_id)}`, { cwd: this.#cwd })
@@ -318,6 +322,34 @@ export class TaskStore {
       return { ok: false, error: messageOf(error), degraded: this.#fallbackNote }
     }
   }
+
+  /**
+   * Whether one declared `required_files` entry exists.
+   *
+   * Existence only: no content, size or version check. Relative paths resolve
+   * against the pool root (the workspace being scheduled), not `process.cwd()`.
+   * A path that cannot be probed is reported as missing — the safe reading,
+   * because admitting a claim on an unverifiable prerequisite is exactly the
+   * failure this check exists to prevent.
+   */
+  fileExists(declaredPath: string): boolean {
+    const target = isAbsolute(declaredPath) ? declaredPath : join(this.#cwd, declaredPath)
+    try {
+      return existsSync(target)
+    } catch {
+      return false
+    }
+  }
+}
+
+/**
+ * The subset of `required_files` missing under the pool root.
+ *
+ * Shared by `claimTask` (refuse) and `swarm_status` (mark), so the two can never
+ * disagree about what "missing" means.
+ */
+export function missingRequiredFiles(store: TaskStore, task: TaskRecord): string[] {
+  return task.required_files.filter(file => !store.fileExists(file))
 }
 
 /** Locks held by this process, used only when the filesystem lock is denied. */
@@ -379,6 +411,8 @@ function lockExists(dirPath: string, taskId: string): boolean {
  *     `scope_conflict`. This is the enforcing half of `write_scopes`; the soft
  *     half is informational — `swarm_ready` lists each task's declared scopes,
  *     so a likely collision is visible while planning, before anyone claims;
+ *   - **missing `required_files`** are refused as `missing_dependencies`, naming
+ *     every absent path; the task keeps its `pending` state;
  *   - the usual state checks (missing / completed / already claimed).
  */
 export async function claimTask(
@@ -386,7 +420,7 @@ export async function claimTask(
   taskId: string,
   claimedBy: string,
   clock: Clock = defaultClock,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -403,6 +437,17 @@ export async function claimTask(
       ok: false,
       code: 'invalid_state',
       message: `${taskId} is ${found.task.status}; retry it with swarm_start or release it back to pending`,
+    }
+  }
+
+  // Context-integrity pre-check: a task that names prerequisite files must not
+  // be handed to a worker while any of them is absent. The task stays pending.
+  const missingEarly = missingRequiredFiles(store, found.task)
+  if (missingEarly.length > 0) {
+    return {
+      ok: false,
+      code: 'missing_dependencies',
+      message: `${taskId} refused: missing required file(s): ${missingEarly.join(', ')}`,
     }
   }
 
@@ -441,6 +486,18 @@ export async function claimTask(
       if (current.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
       if (current.task.status !== 'pending') {
         return { ok: false, code: 'already_claimed', message: `${taskId} is ${current.task.status}` }
+      }
+
+      // Re-check under the lock: a prerequisite could have been deleted between
+      // the pre-flight probe and this point. Same rule, same code.
+      const missingNow = missingRequiredFiles(store, current.task)
+      if (missingNow.length > 0) {
+        return {
+          ok: false,
+          code: 'missing_dependencies',
+          message: `${taskId} refused: missing required file(s): ${missingNow.join(', ')}`,
+          degraded: lock.degraded,
+        }
       }
 
       // Second scope conflict check: another concurrent claim may have claimed
