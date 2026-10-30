@@ -1,5 +1,5 @@
 /**
- * The file-driven tool surface: five tools, all of them plain task-pool I/O.
+ * The file-driven tool surface: seven tools, all of them plain task-pool I/O.
  *
  * None of these touch a Cordis service beyond `ctx.fs` (through `TaskStore`),
  * because every richer service this plugin once relied on proved unreachable
@@ -18,10 +18,14 @@ import {
   completeTask,
   releaseTask,
   setDependencies,
+  startTask,
+  reapTask,
+  readLog,
+  computeReady,
   viewsOf,
   type TaskRecord,
   type TaskView,
-} from './task-store.js'
+} from './core/task-store.js'
 
 const text = (value: string) => [{ type: 'text' as const, text: value }]
 
@@ -55,6 +59,11 @@ export interface FileToolDeps {
    * the Lead can decide whether to release it. Nothing here acts on the value.
    */
   staleAssignmentSec: number
+  /**
+   * Maximum concurrent workers (claimed + running). When reached, `swarm_ready`
+   * returns 0 ready tasks.
+   */
+  max_workers: number
   /** Collects every disposer from this registration, in one ownership list. */
   disposers: Array<() => void>
 }
@@ -70,10 +79,15 @@ function viewRow(view: TaskView): Record<string, unknown> {
     blocked_by: view.blocked_by,
     blocked_by_open: view.blocked_by_open,
     write_scopes: view.write_scopes,
+    retry_count: view.retry_count,
+    max_retries: view.max_retries,
+    failure_reason: view.failure_reason,
+    running_age_sec: view.running_age_sec,
+    heartbeat_age_sec: view.heartbeat_age_sec,
   }
 }
 
-export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }: FileToolDeps): void {
+export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, disposers }: FileToolDeps): void {
   // ------------------------------------------------------------- swarm_plan ---
   disposers.push(ctx.tools.register(defineTool({
     name: 'swarm_plan',
@@ -109,6 +123,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
           created: { type: 'array', items: { type: 'string' } },
           conflicts: { type: 'array', items: { type: 'string' } },
           errors: { type: 'array', items: { type: 'string' } },
+          warnings: { type: 'array', items: { type: 'string' } },
           dir: { type: 'string' },
           degraded: { type: 'string' },
         },
@@ -117,9 +132,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         const created = value.created ?? []
         const conflicts = value.conflicts ?? []
         const errors = value.errors ?? []
+        const warnings = value.warnings ?? []
         const lines = [`pool: ${created.length} created, ${conflicts.length} conflict(s), ${errors.length} error(s)`]
         if (created.length > 0) lines.push(`  created: ${created.join(', ')}`)
         if (conflicts.length > 0) lines.push(`  already present (not overwritten): ${conflicts.join(', ')}`)
+        if (warnings.length > 0) lines.push(...warnings.map(line => `  ⚠ ${line}`))
         if (errors.length > 0) lines.push(...errors.map(line => `  ! ${line}`))
         if (value.degraded !== undefined && value.degraded !== '') lines.push(`  degraded: ${value.degraded}`)
         return text(lines.join('\n'))
@@ -129,9 +146,10 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
       const created: string[] = []
       const conflicts: string[] = []
       const errors: string[] = []
+      const warnings: string[] = []
       const incoming = args.tasks ?? []
       if (incoming.length > MAX_PLAN_TASKS) {
-        return { created, conflicts, errors: [`${incoming.length} tasks exceeds the ${MAX_PLAN_TASKS} limit for one call`], dir: TASKS_DIR, degraded: '' }
+        return { created, conflicts, errors: [`${incoming.length} tasks exceeds the ${MAX_PLAN_TASKS} limit for one call`], warnings, dir: TASKS_DIR, degraded: '' }
       }
       const ensured = await store.ensureDir()
       if (!ensured.ok) errors.push(`pool directory unavailable: ${ensured.error ?? 'unknown'}`)
@@ -142,6 +160,12 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         if (taskId.length === 0) { errors.push('a task arrived with an empty task_id'); continue }
         if (seen.has(taskId)) { conflicts.push(taskId); continue }
         seen.add(taskId)
+        // Directory-level scopes block parallelism at directory granularity.
+        for (const scope of spec.write_scopes ?? []) {
+          if (scope.trim().endsWith('/')) {
+            warnings.push(`任务 ${taskId} 声明了目录级 scope ${scope}，可能阻塞并行，建议细化到文件`)
+          }
+        }
         const record: TaskRecord = blankTask(taskId, {
           big_task_id: spec.big_task_id,
           title: spec.title,
@@ -158,6 +182,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         created,
         conflicts,
         errors,
+        warnings,
         dir: TASKS_DIR,
         degraded: ensured.degraded ?? store.degraded ?? '',
       }
@@ -209,14 +234,19 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
     },
     async execute(args) {
       const all = await store.readAll()
-      const filter = args.big_task_id
-      const ready = viewsOf(all.tasks)
-        .filter(view => view.ready)
-        .filter(view => filter === undefined || view.big_task_id === filter)
+      const result = computeReady(all.tasks, max_workers, args.big_task_id)
+      if (result.limited) {
+        return {
+          total: 0,
+          dir: TASKS_DIR,
+          tasks: [],
+          degraded: all.io.degraded ?? store.degraded ?? `max_workers limit (${max_workers}) reached`,
+        }
+      }
       return {
-        total: ready.length,
+        total: result.total,
         dir: TASKS_DIR,
-        tasks: ready.map(view => ({
+        tasks: result.tasks.map(view => ({
           task_id: view.task_id,
           big_task_id: view.big_task_id,
           title: view.title,
@@ -286,11 +316,13 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
     description:
       'Record that one task finished, with its outcome. Call it yourself when you did the work, or on a '
       + 'worker\'s behalf when it reported back. The result is the compressed outcome — paths, decisions, '
-      + 'evidence — and a second completion of the same task is refused rather than silently accepted.',
+      + 'evidence. Use success=false to mark a failure (will retry up to max_retries, then become blocked). '
+      + 'A second completion of the same task is refused rather than silently accepted.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'Task that finished' },
       result: { type: 'string', required: true, description: 'Compressed outcome: files, decisions, evidence' },
       completed_by: { type: 'string', required: true, description: 'Agent id that did the work' },
+      success: { type: 'boolean', description: 'Whether the task succeeded (default true). False triggers retry logic.' },
     },
     output: {
       schema: {
@@ -298,7 +330,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['completed', 'not_found', 'invalid_state', 'io_error', 'result_too_long'] },
+          code: { type: 'string', enum: ['completed', 'failed', 'blocked', 'not_found', 'invalid_state', 'io_error', 'result_too_long'] },
           message: { type: 'string' },
           completed_at: { type: 'string' },
           degraded: { type: 'string' },
@@ -315,7 +347,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
           completed_at: '', degraded: '',
         }
       }
-      const outcome = await completeTask(store, args.task_id, args.result, args.completed_by)
+      const outcome = await completeTask(store, args.task_id, args.result, args.completed_by, undefined, args.success ?? true)
       const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
       return {
         ok: outcome.ok,
@@ -331,13 +363,15 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
   disposers.push(ctx.tools.register(defineTool({
     name: 'swarm_status',
     description:
-      'Report the whole pool in one call: how many tasks exist, how many are pending, claimed or completed, '
-      + 'how many are ready to start, how many are still blocked, and a compact line per task. A claim older '
-      + 'than `staleAssignmentSec` is marked STALE — a suspicion that its worker died mid-task, because a claim '
-      + 'never expires on its own. Release such a task with swarm_release if you agree it is abandoned; this '
-      + 'report only makes it visible and never reclaims anything by itself. Use it to decide whether to plan '
-      + 'more, assign more, or stop.',
-    parameters: {},
+      'Report the whole pool in one call: how many tasks exist in each of the six states (pending, claimed, '
+      + 'running, completed, failed, blocked), how many are ready to start, how many are still blocked, and a '
+      + 'compact line per task. A claim/running older than `staleAssignmentSec` is marked STALE — a suspicion '
+      + 'that its worker died mid-task. Release such a task with swarm_release if you agree it is abandoned; '
+      + 'or use swarm_reap to automatically recover stale tasks. Use this to decide whether to plan more, '
+      + 'assign more, or stop. Pass include_log=true to see the last 5 log lines per task.',
+    parameters: {
+      include_log: { type: 'boolean', description: 'Include last 5 log lines per task' },
+    },
     output: {
       schema: {
         type: 'object',
@@ -347,9 +381,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
           total: { type: 'integer' },
           pending: { type: 'integer' },
           claimed: { type: 'integer' },
+          running: { type: 'integer' },
           completed: { type: 'integer' },
-          ready: { type: 'integer' },
+          failed: { type: 'integer' },
           blocked: { type: 'integer' },
+          ready: { type: 'integer' },
           stale: { type: 'integer' },
           stale_after_sec: { type: 'integer' },
           big_tasks: { type: 'array', items: { type: 'string' } },
@@ -361,42 +397,69 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         const tasks = value.tasks ?? []
         const stale = value.stale ?? 0
         const head = `pool ${value.dir ?? TASKS_DIR}: total ${value.total ?? 0} · pending ${value.pending ?? 0}`
-          + ` · claimed ${value.claimed ?? 0}${stale > 0 ? ` (${stale} stale)` : ''} · completed ${value.completed ?? 0}`
-          + ` · ready ${value.ready ?? 0} · blocked ${value.blocked ?? 0}`
+          + ` · claimed ${value.claimed ?? 0} · running ${value.running ?? 0} · completed ${value.completed ?? 0}`
+          + ` · failed ${value.failed ?? 0} · blocked ${value.blocked ?? 0}${stale > 0 ? ` (${stale} stale)` : ''}`
+          + ` · ready ${value.ready ?? 0}`
         const hint = stale > 0
-          ? [`  ⚠ ${stale} claim(s) older than ${value.stale_after_sec ?? 0}s — release with swarm_release if abandoned`]
+          ? [`  ⚠ ${stale} task(s) older than ${value.stale_after_sec ?? 0}s — release with swarm_release or reap with swarm_reap if abandoned`]
           : []
         return text([head, ...hint, ...tasks.map(line => `  ${line}`),
           ...(value.degraded !== undefined && value.degraded !== '' ? [`  degraded: ${value.degraded}`] : [])].join('\n'))
       },
     },
-    async execute() {
+    async execute(args) {
       const all = await store.readAll()
       const views = viewsOf(all.tasks, Date.now(), staleAssignmentSec)
       const pending = views.filter(view => view.status === 'pending').length
       const claimed = views.filter(view => view.status === 'claimed').length
+      const running = views.filter(view => view.status === 'running').length
       const completed = views.filter(view => view.status === 'completed').length
+      const failed = views.filter(view => view.status === 'failed').length
+      const blocked = views.filter(view => view.status === 'blocked').length
       const ready = views.filter(view => view.ready).length
-      const blocked = views.filter(view => view.status === 'pending' && !view.ready).length
       const stale = views.filter(view => view.stale).length
       const bigTasks = [...new Set(views.map(view => view.big_task_id).filter(id => id.length > 0))].sort()
+      const taskLines = views.map(view => {
+        let line = `${view.task_id} [${view.status}${view.ready ? ', ready' : ''}]`
+        if (view.claimed_by.length > 0) line += ` by ${view.claimed_by}`
+        if (view.stale) {
+          if (view.status === 'running') line += ` [STALE, running ${formatAge(view.running_age_sec ?? 0)} ago, heartbeat ${formatAge(view.heartbeat_age_sec ?? 0)} ago]`
+          else line += ` [STALE, claimed ${formatAge(view.claimed_age_sec ?? 0)} ago]`
+        }
+        if (view.blocked_by_open.length > 0) line += ` waiting on ${view.blocked_by_open.join(',')}`
+        if (view.status === 'failed' || view.status === 'blocked') {
+          line += ` (retry ${view.retry_count}/${view.max_retries}`
+          if (view.failure_reason) line += `, reason: ${view.failure_reason}`
+          line += ')'
+        }
+        line += ` — ${view.title}`
+        return line
+      })
+      let degraded = all.io.degraded ?? store.degraded ?? ''
+      let logOutput = ''
+      if (args.include_log) {
+        for (const view of views) {
+          const log = await readLog(store, view.task_id)
+          if (log.length > 0) {
+            logOutput += `\n  ${view.task_id} log:\n    ${log.join('\n    ')}`
+          }
+        }
+      }
       return {
         dir: TASKS_DIR,
         total: views.length,
         pending,
         claimed,
+        running,
         completed,
-        ready,
+        failed,
         blocked,
+        ready,
         stale,
         stale_after_sec: staleAssignmentSec,
         big_tasks: bigTasks,
-        tasks: views.map(view => `${view.task_id} [${view.status}${view.ready ? ', ready' : ''}]`
-          + (view.claimed_by.length > 0 ? ` by ${view.claimed_by}` : '')
-          + (view.stale ? ` [STALE, claimed ${formatAge(view.claimed_age_sec ?? 0)} ago]` : '')
-          + (view.blocked_by_open.length > 0 ? ` waiting on ${view.blocked_by_open.join(',')}` : '')
-          + ` — ${view.title}`),
-        degraded: all.io.degraded ?? store.degraded ?? '',
+        tasks: taskLines,
+        degraded: (degraded + logOutput).trim(),
       }
     },
   })))
@@ -440,6 +503,89 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, disposers }:
         released_by: outcome.released_by,
         released_at: outcome.released_at,
         lock_removed: outcome.lock_removed,
+        degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ------------------------------------------------------------ swarm_start ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_start',
+    description:
+      'Start a claimed task: claimed -> running. Records the start time and initial heartbeat. '
+      + 'Only a claimed task can be started. The worker must call this after claiming and before executing.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Task to start' },
+      started_by: { type: 'string', required: true, description: 'Agent id starting the task' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['started', 'not_found', 'invalid_state', 'io_error'] },
+          message: { type: 'string' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      const outcome = await startTask(store, args.task_id, args.started_by)
+      return {
+        ok: outcome.ok,
+        code: outcome.code,
+        message: outcome.message,
+        degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ------------------------------------------------------------ swarm_reap ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_reap',
+    description:
+      'Watchdog: scan claimed/running tasks and recover those past the staleAssignmentSec threshold. '
+      + '- claimed (not running) past threshold: revert to pending, delete lock. '
+      + '- running past threshold: mark failed (heartbeat timeout), increment retry_count; if retry_count >= max_retries, mark blocked. '
+      + 'Returns list of reaped tasks and their outcomes. Call periodically from the Lead.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          reaped: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                task_id: { type: 'string' },
+                action: { type: 'string', enum: ['released', 'failed', 'blocked'] },
+                message: { type: 'string' },
+              },
+            },
+          },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const reaped = value.reaped ?? []
+        if (reaped.length === 0) return text('reap: nothing to reap')
+        return text('reap: ' + reaped.length + ' task(s)\n'
+          + reaped.map(r => `  ${r.task_id}: ${r.action} — ${r.message}`).join('\n')
+          + (value.degraded ? `\n  degraded: ${value.degraded}` : ''))
+      },
+    },
+    async execute() {
+      const outcome = await reapTask(store, staleAssignmentSec)
+      return {
+        ok: outcome.ok,
+        reaped: outcome.reaped,
         degraded: outcome.degraded ?? store.degraded ?? '',
       }
     },

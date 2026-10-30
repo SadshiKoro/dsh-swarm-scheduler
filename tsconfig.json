@@ -10,8 +10,9 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": false,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/index.ts", "src/config.ts", "src/task-store.ts", "src/tools-file.ts", "src/client/index.ts"]
+  "include": ["src"]
 }

@@ -86,12 +86,14 @@ Lead receives a large coding request
   └─ swarm_status                        ← watch progress, report to the user
 
 Worker (each, independently, in parallel)
-  ├─ swarm_ready        → what is ready right now
+  ├─ swarm_ready        → what is ready right now (0 when max_workers is reached)
   ├─ swarm_claim        → atomic claim (exclusive file creation)
   │     └─ lost the race? `already_claimed` is a NORMAL result — take another block
+  ├─ swarm_start        → claimed → running, heartbeat recorded
   ├─ execute the task
-  └─ swarm_complete     → report the compressed outcome
-        └─ back to swarm_ready for another round, until it returns 0
+  ├─ swarm_complete     → report the compressed outcome (`success:false` on failure)
+  │     └─ failed: retry via swarm_start until max_retries, then blocked
+  └─ back to swarm_ready for another round, until it returns 0
 
 Lead, on a conflict report from a worker
   └─ swarm_set_deps     → serialise the conflicting blocks after the fact
@@ -211,7 +213,7 @@ band just before the kernel's own Team policy). When you ask the Agent for somet
 files, several modules, several steps — it **switches to scheduling mode by itself**: it calls
 `swarm_plan`, wakes or creates workers, and then reports progress instead of writing the code itself.
 
-The seven tools remain directly callable for explicit control.
+The nine tools remain directly callable for explicit control.
 
 ### Explicit instruction example
 
@@ -220,8 +222,9 @@ Use the swarm scheduler for this:
 1. swarm_plan — decompose the request into swimlanes and small blocks, with blocked_by and write_scopes.
 2. list_agents — if there are idle teammates, wake them with send_message; otherwise spawn 2-3.
 3. Wake message (method only, no task ids):
-   "Check swarm_ready for ready tasks, claim one with swarm_claim, execute it, report with
-    swarm_complete, then loop back to swarm_ready until it returns 0."
+   "Check swarm_ready for ready tasks, claim one with swarm_claim, start it with swarm_start,
+    execute it, report with swarm_complete (success=false on failure), then loop back to
+    swarm_ready until it returns 0."
 4. Never assign a specific task to a specific worker — which worker gets which block is the result
    of an atomic race.
 5. Report progress with swarm_status.
@@ -229,20 +232,60 @@ Use the swarm scheduler for this:
 
 ---
 
-## 6. The seven tools
+## 6. The nine tools
 
 | Tool | Purpose | Main parameters |
 |---|---|---|
 | `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`) |
-| `swarm_ready` | List the tasks a worker may start right now | optional `big_task_id` filter |
-| `swarm_claim` | Atomically claim one task | `task_id` / `claimed_by` |
-| `swarm_complete` | Mark a task finished and store its outcome | `task_id` / `result` / `completed_by` |
-| `swarm_status` | Whole-pool status in one call | none |
-| `swarm_release` | Return a stuck task to the pool (`claimed` → `pending`) | `task_id` / `released_by` |
+| `swarm_ready` | List the tasks a worker may start right now (0 when `max_workers` is reached) | optional `big_task_id` filter |
+| `swarm_claim` | Atomically claim one task (`pending` → `claimed`) | `task_id` / `claimed_by` |
+| `swarm_start` | Start work (`claimed` → `running`), recording the heartbeat | `task_id` / `started_by` |
+| `swarm_complete` | Finish a task; `success=false` marks it failed and drives retry/block | `task_id` / `result` / `completed_by` / `success` |
+| `swarm_status` | Whole-pool status across all six states | optional `include_log` |
+| `swarm_release` | Return a stuck task to the pool (`claimed`/`running`/`failed` → `pending`) | `task_id` / `released_by` |
+| `swarm_reap` | Watchdog: recover claims/runs older than `staleAssignmentSec` | none |
 | `swarm_set_deps` | Replace a task's `blocked_by` list (**Lead only**) | `task_id` / `blocked_by` / `updated_by` |
 
-All scheduling state lives in `<workspace>/.dsh-tasks/<task_id>.json`. There is no database and no
-background daemon.
+All scheduling state lives in `<workspace>/.dsh-tasks/<task_id>.json`, and each task's transitions are
+appended to `<task_id>.log`. There is no database and no background daemon.
+
+### 6.1 The six-state machine
+
+```
+pending ──claim──▶ claimed ──start──▶ running ──complete(success=true)──▶ completed
+   ▲                  │                   │
+   │                  │                   └──complete(success=false)──▶ failed ──retry▶ (start again)
+   │                  │                                                   │
+   └──release─────────┴───────────────────────────────────────────────────┤
+                                                                           └─retry_count >= max_retries──▶ blocked
+```
+
+| State | Meaning | Left by |
+|---|---|---|
+| `pending` | Ready or blocked, nobody holds it | `swarm_plan`, `swarm_release`, `swarm_reap` (stale claim) |
+| `claimed` | Taken by a worker, not yet started | `swarm_claim` |
+| `running` | Worker reported it started; `heartbeat_at` recorded | `swarm_start` |
+| `completed` | Finished successfully | `swarm_complete(success=true)` |
+| `failed` | Attempt failed; `retry_count` incremented; can be started again | `swarm_complete(success=false)`, `swarm_reap` (heartbeat timeout) |
+| `blocked` | Retry budget exhausted (`retry_count >= max_retries`) | `swarm_complete(success=false)`, `swarm_reap` |
+
+`max_retries` defaults to 3 per task. `swarm_reap` reverts a stale **claimed** task to `pending` and
+turns a stale **running** task into `failed` (reason `heartbeat timeout`), which then follows the same
+retry path. `swarm_status` marks any claim/run older than `staleAssignmentSec` as `[STALE]`, reports
+`retry_count` and the last failure reason for failed/blocked tasks, and counts all six states in its
+summary line.
+
+### 6.2 Concurrency ceiling
+
+`max_workers` (default **3**) counts `claimed` + `running` tasks. At the ceiling, `swarm_ready` returns
+`ready: 0` instead of handing out more work — that is a normal "wait for a slot" answer, not an empty
+pool. Set it in the profile's `cordis.patch.yml`:
+
+```yaml
+- id: swarm-scheduler
+  config:
+    max_workers: 3
+```
 
 ---
 
@@ -265,7 +308,7 @@ prevent. Serialising the decision on a single writer is what makes the cycle che
 
 ## 8. Architecture: route B (the file pool is the source of truth)
 
-The pool lives on disk, and its seven tools are the **only** scheduling interface. The kernel's Team
+The pool lives on disk, and its nine tools are the **only** scheduling interface. The kernel's Team
 task board is used for nothing but waking workers.
 
 **Why route B.** The goal is "work finds the worker". The file pool's three primitives are exactly that
@@ -290,6 +333,12 @@ finds the worker", which contradicts the goal.
 chain that is the whole point, and would tie the plugin to the experimental `agentTeams` service for
 *scheduling* rather than merely for waking.
 
+**Core vs adapter (v0.3.0).** The scheduling rules live in `src/core/` — state machine, scopes, store —
+and import **nothing** from `@deepseek-ai/*`; they are tested with plain Node (55 cases). The DSH-facing
+shell is `src/index.ts` (activation, config) and `src/tools-file.ts` (tool schemas, argument mapping,
+rendered output). That split is what lets the state machine be reasoned about and regression-tested
+without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
+
 ---
 
 ## 9. Known limitations
@@ -308,12 +357,13 @@ chain that is the whole point, and would tie the plugin to the experimental `age
    `dismiss`, `release` or `evict`. `interrupt` only stops the current turn. The roster only grows and
    is cleared when the Lead session ends. The protocol therefore prefers **reusing idle workers** over
    creating new ones.
-5. **Claims had no reclamation** — *fixed*: a worker that disappears leaves its task `claimed`
-   forever, and everything blocked by it becomes unreachable. `swarm_release` (v0.1.9) returns such a
-   task to the pool, and as of v0.2.6 it also **deletes the task's `.lock` file**. `swarm_claim`
-   clears a **residual lock** (one present while the task still reads `pending`, i.e. left by a holder
-   that died mid-claim) before claiming. So neither a dead worker's task nor its stale lock blocks the
-   pool permanently.
+5. **Dead workers are recoverable, and since v0.3.0 also reaped.** A worker that disappears would
+   otherwise leave its task `claimed`/`running` forever, and everything blocked by it unreachable.
+   `swarm_release` returns such a task to the pool (deleting its `.lock`), and `swarm_claim` clears a
+   **residual lock** left mid-claim. New in v0.3.0: **`swarm_reap`** scans `claimed`/`running` tasks,
+   reverts stale claims to `pending`, and turns stale runs into `failed` with reason
+   `heartbeat timeout` — which then follows the retry path. Reaping is still **manual** (the Lead calls
+   the tool); the plugin runs no background timer.
 6. **`swarm_set_deps` cannot be enforced at runtime.** It is Lead-only by description and protocol,
    not by a permission check — checking would require `agentTeams.membership`, i.e. reintroducing the
    service route B deliberately removed.
@@ -324,7 +374,7 @@ chain that is the whole point, and would tie the plugin to the experimental `age
    never emitted an overlap warning of its own.** The soft, early view is `swarm_ready`, which lists
    each task's declared `scope:`; the hard view is the refusal, at the moment of admission.
    (`writeScopeWarnings` is the *kernel*'s rule for the team board — see the appendix in DESIGN.md —
-   not one of these seven tools.) **Be aware of the
+   not one of these tools.) **Be aware of the
    granularity**: two tasks that both declare `src/` are refused even when they would edit different
    files in it. When you need finer resolution, declare narrower scopes — `src/api/routes.ts` rather
    than `src/`.
@@ -338,19 +388,26 @@ chain that is the whole point, and would tie the plugin to the experimental `age
      here;
    - if DSH promotes that package into a default bundle, or removes it, **the installation steps in
      §4 will change** and this README may be out of date.
-9. **Concurrency correctness is verified by hand; the core logic now has regression tests.** Unit
-   tests cover `task-store.ts` — `claim` / `release` / `complete` / `setDependencies`, the
-   `write_scopes` admission check, residual-lock cleanup, and readiness/staleness — run them with
-   `npm test` (Node's built-in runner, no extra dependency; it runs the `.ts` sources directly, which
-   needs Node 22.18+, or 22.6+ with `--experimental-strip-types`). If your shell forbids a child process
-   from capturing piped stdio — a sandboxed DSH session is the case this was measured in — the test
-   runner cannot spawn its per-file worker and fails with `spawn EPERM`; run
-   `npm run test:sandbox` instead, which runs the same cases in a single process
-   (`--test-isolation=none`). What is still measured manually is the
-   *concurrent* behaviour: the single-task closed loop, a 3-worker run with atomic claiming, and the
-   route-B closed loop. So the logic has regression protection; the claim that it is safe under real
-   concurrency still rests on those manual runs. If you intend to use this in production, repeat them
-   in your own scenario.
+9. **Concurrency correctness is verified by hand; the core logic now has 55 automated tests.** The
+   suite covers the six-state lifecycle (`claim`/`start`/`complete`/`release`/`reap`/`set_dependencies`),
+   retry and blocked transitions, the `write_scopes` admission check, residual-lock cleanup,
+   readiness/staleness, the `max_workers` ceiling, and concurrent races (same-task double claim,
+   overlapping-scope claim, stale-lock claim). Run them with `npm test` (Node's built-in runner, no
+   extra dependency; it runs the `.ts` sources directly, which needs Node 22.18+, or 22.6+ with
+   `--experimental-strip-types`). If your shell forbids a child process from capturing piped stdio — a
+   sandboxed DSH session is the case this was measured in — the runner cannot spawn its per-file worker
+   and fails with `spawn EPERM`; run `npm run test:sandbox` instead, which runs the same cases in a
+   single process (`--test-isolation=none`). What is still measured manually is the *concurrent*
+   behaviour in a real DSH host (multiple live teammates). So the logic has regression protection; the
+   claim that it is safe under real concurrency still rests on those manual runs. If you intend to use
+   this in production, repeat them in your own scenario.
+10. **Symbol-level parallelism is still unsolved.** `write_scopes` is enforced at **directory**
+    granularity: two tasks that both declare `src/` are refused at claim time even if one edits
+    `src/a.ts` and the other `src/b.ts`. There is no AST-level analysis and no write interception —
+    deliberately not attempted, because a false admission silently overwrites a file. v0.3.0 adds
+    **heartbeat timeout recovery** (`swarm_reap`) so a hung worker no longer pins a slot forever, but
+    it does not make file-level concurrency safe. Declare narrower scopes (`src/api/routes.ts`) when
+    you need finer resolution.
 
 ---
 

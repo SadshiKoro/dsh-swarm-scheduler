@@ -1,84 +1,50 @@
 /**
- * File-driven task pool — the whole scheduling state layer.
+ * File-driven task pool — storage, locking and the lifecycle transitions.
  *
- * Every service this plugin used to delegate to (`agentTeams`, `subagents`,
- * `webServer`) turned out to be unreachable from this fiber, so the pool moved
- * to the one substrate that is always reachable: the workspace filesystem. One
- * JSON file per task under `.dsh-tasks/`, and atomic claiming done by exclusive
- * file creation.
+ * Depends on **Node built-ins only** (plus the two pure core modules): no
+ * `@deepseek-ai/*` import. The host adapter passes the `ctx.fs` slice in, so
+ * this layer knows nothing about Cordis.
  *
  * Design constraints this module honours:
- *   - All I/O goes through `ctx.fs` when present, so the sandbox, observation
- *     and write-intent policies all apply. A direct `node:fs` path exists only
- *     as a labelled fallback, and every caller is told when it was used.
+ *   - When a filesystem service is provided, all I/O goes through it, so the
+ *     sandbox, observation and write-intent policies all apply. A direct
+ *     `node:fs` path exists only as a labelled fallback, and every caller is
+ *     told when it was used.
  *   - A read-only deployment degrades to "no state persisted, but the answer is
  *     still returned" — losing a write must never lose a result.
- *   - No service beyond `fs` is consulted, and nothing here throws on missing
- *     state: absent directory, absent lock and malformed file are all ordinary
- *     states this layer reports.
+ *   - Nothing here throws on missing state: absent directory, absent lock and
+ *     malformed file are all ordinary states this layer reports.
  */
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { Context } from '@deepseek-ai/cordis'
+import {
+  TASKS_DIR,
+  blankTask,
+  coerceTask,
+  computeReady,
+  defaultClock,
+  taskFileName,
+  viewOf,
+  viewsOf,
+  type Clock,
+  type IoOutcome,
+  type TaskRecord,
+  type TaskStatus,
+  type TaskView,
+} from './state-machine.ts'
+import { findScopeConflict, normalizeScope, scopesOverlap } from './scope.ts'
 
-/** Workspace-relative directory holding one JSON file per task. */
-export const TASKS_DIR = '.dsh-tasks'
-/** Suffix of the per-task claim lock (see `claimTask`). */
-const LOCK_SUFFIX = '.lock'
-/** Sentinel file guaranteeing the directory exists without needing mkdir. */
-const KEEP_FILE = '.keep'
-
-export type TaskStatus = 'pending' | 'claimed' | 'completed'
-
-export interface TaskRecord {
-  task_id: string
-  big_task_id: string
-  title: string
-  description: string
-  status: TaskStatus
-  claimed_by: string
-  claimed_at: string
-  completed_at: string
-  result: string
-  blocked_by: string[]
-  write_scopes: string[]
+// Re-exported so callers keep one import site for the pool surface.
+export {
+  TASKS_DIR, blankTask, coerceTask, computeReady, defaultClock, taskFileName, viewOf, viewsOf,
+  findScopeConflict, normalizeScope, scopesOverlap,
 }
-
-/** A task plus the derived facts callers actually schedule on. */
-export interface TaskView extends TaskRecord {
-  ready: boolean
-  blocked_by_open: string[]
-  /**
-   * Seconds since the claim, or `undefined` when nothing is claimed.
-   *
-   * Reported so a caller can see how long a block has been held; it is not a
-   * decision on its own.
-   */
-  claimed_age_sec?: number
-  /**
-   * True when the claim is older than the configured threshold.
-   *
-   * A *suspicion* that the holder died mid-task, not a verdict: the plugin has
-   * no way to distinguish "stuck" from "slow", so nothing is released
-   * automatically. Callers surface it and a human/Lead decides.
-   */
-  stale: boolean
-}
-
-export interface IoOutcome {
-  ok: boolean
-  /** Set when the write could not go through `ctx.fs`; names the fallback used. */
-  degraded?: string
-  /** Human-readable reason for a failed read/write. */
-  error?: string
-}
+export type { Clock, IoOutcome, TaskRecord, TaskStatus, TaskView }
 
 /**
- * The slice of `ctx.fs` this plugin uses, declared structurally.
- *
- * The authoritative `FileSystem` types live in a package whose exact version is
- * not obtainable here, so the shape is stated explicitly instead of reached for
- * loosely — the same trade-off as `host-route.ts`'s `WebServerLike`.
+ * The slice of the host filesystem service this plugin uses, declared
+ * structurally — the authoritative FileSystem types come from a package whose
+ * exact version is not obtainable here.
  */
 export interface FsLike {
   resolve(path: string, opts?: { readonly cwd?: string; readonly signal?: AbortSignal }): Promise<unknown>
@@ -87,61 +53,12 @@ export interface FsLike {
   stat?(target: unknown, signal?: AbortSignal): Promise<unknown>
 }
 
-/** Injectable clock so tests and callers can reason about timestamps. */
-export type Clock = () => Date
-
-const defaultClock: Clock = () => new Date()
-
-export function taskFileName(taskId: string): string {
-  return `${taskId}.json`
-}
-
-/** Empty record for one task id — the single place defaults are defined. */
-export function blankTask(taskId: string, fields: Partial<TaskRecord> = {}): TaskRecord {
-  return {
-    task_id: taskId,
-    big_task_id: fields.big_task_id ?? '',
-    title: fields.title ?? '',
-    description: fields.description ?? '',
-    status: fields.status ?? 'pending',
-    claimed_by: fields.claimed_by ?? '',
-    claimed_at: fields.claimed_at ?? '',
-    completed_at: fields.completed_at ?? '',
-    result: fields.result ?? '',
-    blocked_by: fields.blocked_by ?? [],
-    write_scopes: fields.write_scopes ?? [],
-  }
-}
-
-/**
- * Normalize one parsed JSON value into a TaskRecord.
- *
- * A hand-edited or partially written file must not crash a scheduling round, so
- * every field is coerced rather than trusted. Returns `undefined` only when the
- * value cannot name a task at all.
- */
-export function coerceTask(value: unknown, fallbackId: string): TaskRecord | undefined {
-  if (typeof value !== 'object' || value === null) return undefined
-  const raw = value as Record<string, unknown>
-  const taskId = typeof raw.task_id === 'string' && raw.task_id.length > 0 ? raw.task_id : fallbackId
-  if (taskId.length === 0) return undefined
-  const status = raw.status === 'claimed' || raw.status === 'completed' ? raw.status : 'pending'
-  const strings = (input: unknown): string[] =>
-    Array.isArray(input) ? input.filter((item): item is string => typeof item === 'string') : []
-  return blankTask(taskId, {
-    big_task_id: typeof raw.big_task_id === 'string' ? raw.big_task_id : '',
-    title: typeof raw.title === 'string' ? raw.title : '',
-    description: typeof raw.description === 'string' ? raw.description : '',
-    status,
-    claimed_by: typeof raw.claimed_by === 'string' ? raw.claimed_by : '',
-    claimed_at: typeof raw.claimed_at === 'string' ? raw.claimed_at : '',
-    completed_at: typeof raw.completed_at === 'string' ? raw.completed_at : '',
-    result: typeof raw.result === 'string' ? raw.result : '',
-    blocked_by: strings(raw.blocked_by),
-    write_scopes: strings(raw.write_scopes),
-  })
-}
-
+/** Suffix of the per-task claim lock (see `claimTask`). */
+const LOCK_SUFFIX = '.lock'
+/** Sentinel file guaranteeing the directory exists without needing mkdir. */
+const KEEP_FILE = '.keep'
+/** Suffix for per-task log files. */
+const LOG_SUFFIX = '.log'
 /**
  * Task storage over `ctx.fs`, with an explicitly-labelled filesystem fallback.
  *
@@ -174,7 +91,6 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
  * and writes must not disagree about which backend holds the data.
  */
 export class TaskStore {
-  readonly #ctx: Context
   readonly #cwd: string
   readonly #clock: Clock
   readonly #fs: FsLike | undefined
@@ -183,11 +99,15 @@ export class TaskStore {
   /** Latched backend. `'node'` means the service refused and must not be retried. */
   #backend: 'service' | 'node'
 
-  constructor(ctx: Context, cwd: string, clock: Clock = defaultClock) {
-    this.#ctx = ctx
+  /**
+   * @param fs - the host filesystem service slice, or `undefined` to use
+   *   `node:fs` directly. Injected rather than reached for on a Cordis context:
+   *   that is what keeps this module free of `@deepseek-ai/*`.
+   */
+  constructor(fs: FsLike | undefined, cwd: string, clock: Clock = defaultClock) {
     this.#cwd = cwd
     this.#clock = clock
-    this.#fs = ctx.get('fs') as FsLike | undefined
+    this.#fs = fs
     this.#backend = this.#fs === undefined ? 'node' : 'service'
   }
 
@@ -403,6 +323,9 @@ export class TaskStore {
 /** Locks held by this process, used only when the filesystem lock is denied. */
 const heldLocks = new Set<string>()
 
+/** Tasks currently being claimed in this process — prevents races on stale-lock clearing. */
+const claimInProgress = new Set<string>()
+
 /** Path of one task's claim lock. */
 function lockPath(dirPath: string, taskId: string): string {
   return join(dirPath, `${taskId}${LOCK_SUFFIX}`)
@@ -432,66 +355,6 @@ function lockExists(dirPath: string, taskId: string): boolean {
   } catch {
     return false
   }
-}
-
-/**
- * Normalize one write scope for comparison.
- *
- * Mirrors the kernel's rule (`writeScope()` in the agent-team package): forward
- * slashes, no leading `./`, no trailing slash, no empty segments. Keeping the
- * same normalization matters — the two are compared against each other, and
- * `src/api` vs `./src/api/` is the same scope written two ways.
- */
-function normalizeScope(raw: string): string {
-  return raw
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '')
-    .replace(/\/+$/, '')
-    .trim()
-}
-
-/**
- * Whether two scopes overlap, meaning a single-file write could land in both.
- *
- * Equal scopes overlap, and so do ancestor/descendant pairs: a task owning
- * `src` and a task owning `src/api` can edit the same file. The comparison is
- * therefore **directory-granular, not file-granular** — two tasks that both
- * declare `src/` are refused even when they would touch different files in it.
- * That is the intended trade: a false refusal costs one serialisation step,
- * while a false admission costs a silently overwritten file.
- */
-export function scopesOverlap(a: string, b: string): boolean {
-  const left = normalizeScope(a)
-  const right = normalizeScope(b)
-  if (left.length === 0 || right.length === 0) return false
-  if (left === right) return true
-  return left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
-}
-
-/**
- * Find the first claimed task whose write scopes collide with `task`'s.
- *
- * Returns the conflicting task and the exact scope pair, so the refusal can name
- * both — "scope_conflict" alone would leave the caller guessing which of its
- * scopes is the problem.
- */
-export function findScopeConflict(
-  task: TaskRecord,
-  others: readonly TaskRecord[],
-): { task_id: string; claimed_by: string; scope: string; other_scope: string } | undefined {
-  if (task.write_scopes.length === 0) return undefined
-  for (const other of others) {
-    if (other.task_id === task.task_id) continue
-    if (other.status !== 'claimed') continue
-    for (const mine of task.write_scopes) {
-      for (const theirs of other.write_scopes) {
-        if (scopesOverlap(mine, theirs)) {
-          return { task_id: other.task_id, claimed_by: other.claimed_by, scope: mine, other_scope: theirs }
-        }
-      }
-    }
-  }
-  return undefined
 }
 
 /**
@@ -531,9 +394,16 @@ export async function claimTask(
   if (found.task.status === 'completed') {
     return { ok: false, code: 'invalid_state', message: `${taskId} is already completed` }
   }
-  if (found.task.status === 'claimed') {
-    // The lock being present is expected in this state; the holder is named.
+  if (found.task.status === 'claimed' || found.task.status === 'running') {
+    // The lock being present is expected in these states; the holder is named.
     return { ok: false, code: 'already_claimed', message: `${taskId} is held by ${found.task.claimed_by || 'another agent'}` }
+  }
+  if (found.task.status === 'failed' || found.task.status === 'blocked') {
+    return {
+      ok: false,
+      code: 'invalid_state',
+      message: `${taskId} is ${found.task.status}; retry it with swarm_start or release it back to pending`,
+    }
   }
 
   const all = await store.readAll()
@@ -545,93 +415,102 @@ export async function claimTask(
       ok: false,
       code: 'scope_conflict',
       message: `${taskId} refused: write scope "${conflict.scope}" overlaps "${conflict.other_scope}" `
-        + `of ${conflict.task_id} (held by ${holder}). Serialise them with swarm_set_deps, or make the scopes narrower.`,
+        + `of ${conflict.task_id} (held by ${holder}). Serialise them with swarm_set_deps, or make the scopes narrower. `
+        + `建议将 write_scopes 缩小到具体文件，或用 swarm_set_deps 串行化。`,
     }
   }
 
   // The state says pending, so any lock still on disk belongs to a dead holder.
+  // But only clear it if no other claim for this task is in progress in this process.
   let staleLockCleared = false
-  if (lockExists(store.dirPath, taskId)) {
-    removeLock(store.dirPath, taskId)
-    staleLockCleared = true
-  }
-
-  const lock = await acquireLock(store, taskId)
-  if (!lock.ok) {
-    return { ok: false, code: 'already_claimed', message: `${taskId} was claimed concurrently`, degraded: lock.degraded }
-  }
+  const alreadyClaiming = claimInProgress.has(taskId)
+  claimInProgress.add(taskId)
   try {
-    // Re-read under the lock: the state observed before it may be stale.
-    const current = await store.readOne(taskId)
-    if (current.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
-    if (current.task.status !== 'pending') {
-      return { ok: false, code: 'already_claimed', message: `${taskId} is ${current.task.status}` }
+    if (!alreadyClaiming && lockExists(store.dirPath, taskId)) {
+      removeLock(store.dirPath, taskId)
+      staleLockCleared = true
     }
-    const next: TaskRecord = {
-      ...current.task,
-      status: 'claimed',
-      claimed_by: claimedBy,
-      claimed_at: clock().toISOString(),
+
+    const lock = await acquireLock(store, taskId)
+    if (!lock.ok) {
+      return { ok: false, code: 'already_claimed', message: `${taskId} was claimed concurrently`, degraded: lock.degraded }
     }
-    const written = await store.writeExisting(next)
-    if (!written.ok) {
-      return { ok: false, code: 'io_error', message: `claim not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
-    }
-    return {
-      ok: true,
-      code: 'claimed',
-      message: `${taskId} claimed by ${claimedBy}`,
-      degraded: written.degraded ?? lock.degraded,
-      ...staleLockCleared ? { stale_lock_cleared: true } : {},
+    try {
+      // Re-read under the lock: the state observed before it may be stale.
+      const current = await store.readOne(taskId)
+      if (current.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
+      if (current.task.status !== 'pending') {
+        return { ok: false, code: 'already_claimed', message: `${taskId} is ${current.task.status}` }
+      }
+
+      // Second scope conflict check: another concurrent claim may have claimed
+      // an overlapping task between our initial check and now. Re-read all tasks
+      // and check again under the lock. Also check for in-progress claims
+      // (lock files) on overlapping tasks.
+      const allNow = await store.readAll()
+      const conflictNow = findScopeConflict(current.task, allNow.tasks)
+      if (conflictNow !== undefined) {
+        const holder = conflictNow.claimed_by.length > 0 ? conflictNow.claimed_by : 'another agent'
+        return {
+          ok: false,
+          code: 'scope_conflict',
+          message: `${taskId} refused: write scope "${conflictNow.scope}" overlaps "${conflictNow.other_scope}" `
+            + `of ${conflictNow.task_id} (held by ${holder}). Serialise them with swarm_set_deps, or make the scopes narrower. `
+            + `建议将 write_scopes 缩小到具体文件，或用 swarm_set_deps 串行化。`,
+          degraded: lock.degraded,
+        }
+      }
+      // Also check for in-progress claims (lock files) on overlapping scopes.
+      // This catches the race where another claim acquired its lock but hasn't
+      // written its claimed status yet.
+      if (current.task.write_scopes.length > 0) {
+        for (const other of allNow.tasks) {
+          if (other.task_id === taskId) continue
+          if (other.write_scopes.length === 0) continue
+          for (const mine of current.task.write_scopes) {
+            for (const theirs of other.write_scopes) {
+              if (scopesOverlap(mine, theirs)) {
+                // Check if the other task has a lock file (claim in progress)
+                if (lockExists(store.dirPath, other.task_id)) {
+                  return {
+                    ok: false,
+                    code: 'scope_conflict',
+                    message: `${taskId} refused: scope_conflict — write scope "${mine}" overlaps "${theirs}" `
+                      + `of ${other.task_id} (claim in progress). Serialise them with swarm_set_deps, or make the scopes narrower. `
+                      + `建议将 write_scopes 缩小到具体文件，或用 swarm_set_deps 串行化。`,
+                    degraded: lock.degraded,
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      const next: TaskRecord = {
+        ...current.task,
+        status: 'claimed',
+        claimed_by: claimedBy,
+        claimed_at: clock().toISOString(),
+      }
+      const written = await store.writeExisting(next)
+      if (!written.ok) {
+        return { ok: false, code: 'io_error', message: `claim not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
+      }
+      await logTransition(store, taskId, 'claim', claimedBy)
+      return {
+        ok: true,
+        code: 'claimed',
+        message: `${taskId} claimed by ${claimedBy}`,
+        degraded: written.degraded ?? lock.degraded,
+        ...staleLockCleared ? { stale_lock_cleared: true } : {},
+      }
+    } finally {
+      releaseLock(store.dirPath, taskId, lock.mode)
     }
   } finally {
-    releaseLock(store.dirPath, taskId, lock.mode)
+    claimInProgress.delete(taskId)
   }
-}
-
-/**
- * Mark a task completed and store its outcome.
- *
- * Only a `claimed` task can be completed. An earlier version accepted a
- * `pending` one as well, to let a caller close work without claiming it first —
- * but that made the state machine wrong: it allowed a task nobody holds to
- * become `completed`, which reads as "someone did this" when nobody did. The
- * claim is what records *who* did the work, so requiring it keeps `claimed_by`
- * meaningful. Callers that want to close unclaimed work should claim it first.
- */
-export async function completeTask(
-  store: TaskStore,
-  taskId: string,
-  result: string,
-  completedBy: string,
-  clock: Clock = defaultClock,
-): Promise<{ ok: boolean; code: 'completed' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string }> {
-  const found = await store.readOne(taskId)
-  if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
-  if (found.task.status === 'completed') {
-    return { ok: false, code: 'invalid_state', message: `${taskId} is already completed` }
-  }
-  if (found.task.status !== 'claimed') {
-    return {
-      ok: false,
-      code: 'invalid_state',
-      message: `${taskId} is ${found.task.status}; only a claimed task can be completed`,
-    }
-  }
-  const stamp = clock().toISOString()
-  const next: TaskRecord = {
-    ...found.task,
-    status: 'completed',
-    completed_at: stamp,
-    result,
-    // `claimed_by` already names the holder; the status guard above guarantees
-    // it is non-empty, so `completedBy` is informational rather than a fallback.
-  }
-  const written = await store.writeExisting(next)
-  if (!written.ok) {
-    return { ok: false, code: 'io_error', message: `completion not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
-  }
-  return { ok: true, code: 'completed', message: `${taskId} completed`, degraded: written.degraded }
 }
 
 /**
@@ -663,11 +542,11 @@ export async function releaseTask(
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}`, released_by: '', released_at: '', lock_removed: false }
   }
-  if (found.task.status !== 'claimed') {
+  if (found.task.status !== 'claimed' && found.task.status !== 'running' && found.task.status !== 'failed') {
     return {
       ok: false,
       code: 'invalid_state',
-      message: `${taskId} is ${found.task.status}; only a claimed task can be released`,
+      message: `${taskId} is ${found.task.status}; only a claimed, running or failed task can be released`,
       released_by: '',
       released_at: '',
       lock_removed: false,
@@ -694,6 +573,7 @@ export async function releaseTask(
   // is the normal case, and an undeletable one is cleared on the next claim.
   const hadLock = lockExists(store.dirPath, taskId)
   removeLock(store.dirPath, taskId)
+  await logTransition(store, taskId, 'release', releasedBy)
   const holder = previousHolder.length > 0 ? previousHolder : 'an unknown holder'
   return {
     ok: true,
@@ -705,6 +585,233 @@ export async function releaseTask(
     lock_removed: hadLock,
     degraded: written.degraded,
   }
+}
+
+/**
+ * Append a line to a task's log file.
+ */
+async function appendLog(store: TaskStore, taskId: string, line: string): Promise<void> {
+  const logPath = join(store.dirPath, `${taskId}${LOG_SUFFIX}`)
+  try {
+    if (store.backend === 'service' && store.serviceFs !== undefined) {
+      const target = await store.serviceFs.resolve(`${TASKS_DIR}/${taskId}${LOG_SUFFIX}`, { cwd: store.rootPath })
+      await store.serviceFs.writeText(target, line + '\n', { create: true, append: true })
+      return
+    }
+  } catch {
+    // Fall through to node:fs
+  }
+  try {
+    mkdirSync(store.dirPath, { recursive: true })
+    const fd = openSync(logPath, 'a')
+    writeFileSync(fd, line + '\n', 'utf8')
+    closeSync(fd)
+  } catch {
+    // Log failures must not affect the main operation
+  }
+}
+
+/**
+ * Read the last N lines of a task's log file.
+ */
+export async function readLog(store: TaskStore, taskId: string, maxLines: number = 5): Promise<string[]> {
+  const logPath = join(store.dirPath, `${taskId}${LOG_SUFFIX}`)
+  try {
+    if (!existsSync(logPath)) return []
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.trim().split('\n').filter(l => l.length > 0)
+    return lines.slice(-maxLines)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Record a state transition in the task log.
+ */
+async function logTransition(store: TaskStore, taskId: string, event: string, actor: string): Promise<void> {
+  const stamp = new Date().toISOString()
+  await appendLog(store, taskId, `${stamp} ${event} by ${actor}`)
+}
+
+/**
+ * Start a claimed or failed task: claimed/failed -> running. Records the start time and
+ * initial heartbeat, and logs the transition.
+ */
+export async function startTask(
+  store: TaskStore,
+  taskId: string,
+  startedBy: string,
+  clock: Clock = defaultClock,
+): Promise<{ ok: boolean; code: 'started' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string }> {
+  const found = await store.readOne(taskId)
+  if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
+  if (found.task.status !== 'claimed' && found.task.status !== 'failed') {
+    return { ok: false, code: 'invalid_state', message: `${taskId} is ${found.task.status}; only a claimed or failed task can be started` }
+  }
+  const stamp = clock().toISOString()
+  const next: TaskRecord = {
+    ...found.task,
+    status: 'running',
+    started_at: stamp,
+    heartbeat_at: stamp,
+  }
+  const written = await store.writeExisting(next)
+  if (!written.ok) {
+    return { ok: false, code: 'io_error', message: `start not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
+  }
+  await logTransition(store, taskId, 'start', startedBy)
+  return { ok: true, code: 'started', message: `${taskId} started by ${startedBy}`, degraded: written.degraded }
+}
+
+/**
+ * Mark a task completed or failed, with retry logic.
+ *
+ * `success=true` (default): claimed/running -> completed
+ * `success=false`: claimed/running -> failed, retry_count + 1; if retry_count >= max_retries -> blocked
+ */
+export async function completeTask(
+  store: TaskStore,
+  taskId: string,
+  result: string,
+  completedBy: string,
+  clock: Clock = defaultClock,
+  success: boolean = true,
+): Promise<{ ok: boolean; code: 'completed' | 'failed' | 'blocked' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string }> {
+  const found = await store.readOne(taskId)
+  if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
+  if (found.task.status === 'completed') {
+    return { ok: false, code: 'invalid_state', message: `${taskId} is already completed` }
+  }
+  if (found.task.status !== 'claimed' && found.task.status !== 'running') {
+    return {
+      ok: false,
+      code: 'invalid_state',
+      message: `${taskId} is ${found.task.status}; only a claimed or running task can be completed`,
+    }
+  }
+  const stamp = clock().toISOString()
+  let next: TaskRecord
+  let code: 'completed' | 'failed' | 'blocked'
+  if (success) {
+    next = {
+      ...found.task,
+      status: 'completed',
+      completed_at: stamp,
+      result,
+    }
+    code = 'completed'
+  } else {
+    const newRetryCount = found.task.retry_count + 1
+    if (newRetryCount >= found.task.max_retries) {
+      next = {
+        ...found.task,
+        status: 'blocked',
+        completed_at: stamp,
+        result,
+        retry_count: newRetryCount,
+        failure_reason: result || 'failed without reason',
+      }
+      code = 'blocked'
+    } else {
+      next = {
+        ...found.task,
+        status: 'failed',
+        completed_at: stamp,
+        result,
+        retry_count: newRetryCount,
+        failure_reason: result || 'failed without reason',
+      }
+      code = 'failed'
+    }
+  }
+  const written = await store.writeExisting(next)
+  if (!written.ok) {
+    return { ok: false, code: 'io_error', message: `${code} not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
+  }
+  await logTransition(store, taskId, code, completedBy)
+  return { ok: true, code, message: `${taskId} ${code}`, degraded: written.degraded }
+}
+
+/**
+ * Reap stale tasks: scan claimed/running tasks and recover those past the threshold.
+ *
+ * - claimed (not running) past threshold: revert to pending, delete lock
+ * - running past threshold: mark failed (heartbeat timeout), increment retry_count, retry or block
+ *
+ * Returns list of reaped task ids and their outcomes.
+ */
+export async function reapTask(
+  store: TaskStore,
+  staleAfterSec: number,
+  clock: Clock = defaultClock,
+): Promise<{ ok: boolean; reaped: Array<{ task_id: string; action: 'released' | 'failed' | 'blocked'; message: string }>; degraded?: string }> {
+  const all = await store.readAll()
+  const reaped: Array<{ task_id: string; action: 'released' | 'failed' | 'blocked'; message: string }> = []
+  let degraded: string | undefined
+
+  for (const task of all.tasks) {
+    if (task.status !== 'claimed' && task.status !== 'running') continue
+    const claimedMs = Date.parse(task.claimed_at)
+    if (Number.isNaN(claimedMs)) continue
+    const ageSec = Math.floor((clock().getTime() - claimedMs) / 1000)
+    if (ageSec <= staleAfterSec) continue
+
+    if (task.status === 'claimed') {
+      // Revert claimed -> pending, delete lock
+      const stamp = clock().toISOString()
+      const next: TaskRecord = {
+        ...task,
+        status: 'pending',
+        claimed_by: '',
+        claimed_at: '',
+      }
+      const written = await store.writeExisting(next)
+      if (!written.ok) {
+        degraded = written.degraded
+        continue
+      }
+      removeLock(store.dirPath, task.task_id)
+      await logTransition(store, task.task_id, 'reap:released', 'reaper')
+      reaped.push({ task_id: task.task_id, action: 'released', message: `${task.task_id} reverted to pending (stale claim)` })
+    } else if (task.status === 'running') {
+      // Mark failed (heartbeat timeout), increment retry
+      const newRetryCount = task.retry_count + 1
+      const stamp = clock().toISOString()
+      let action: 'failed' | 'blocked'
+      let next: TaskRecord
+      if (newRetryCount >= task.max_retries) {
+        next = {
+          ...task,
+          status: 'blocked',
+          completed_at: stamp,
+          result: task.result,
+          retry_count: newRetryCount,
+          failure_reason: 'heartbeat timeout',
+        }
+        action = 'blocked'
+      } else {
+        next = {
+          ...task,
+          status: 'failed',
+          completed_at: stamp,
+          result: task.result,
+          retry_count: newRetryCount,
+          failure_reason: 'heartbeat timeout',
+        }
+        action = 'failed'
+      }
+      const written = await store.writeExisting(next)
+      if (!written.ok) {
+        degraded = written.degraded
+        continue
+      }
+      await logTransition(store, task.task_id, `reap:${action}`, 'reaper')
+      reaped.push({ task_id: task.task_id, action, message: `${task.task_id} marked ${action} (heartbeat timeout, retry ${newRetryCount}/${task.max_retries})` })
+    }
+  }
+
+  return { ok: true, reaped, degraded }
 }
 
 /**
@@ -800,50 +907,6 @@ export async function setDependencies(
     updated_by: updatedBy,
     degraded: written.degraded,
   }
-}
-
-/**
- * Derive readiness, and whether a claim looks abandoned.
- *
- * A blocker that does not exist counts as *not* completed, so a task can never
- * become ready because its dependency was deleted.
- *
- * `staleAfterSec` defaults to `0`, which means "do not judge staleness" — that
- * keeps this function's result stable for callers that pass nothing, rather than
- * making every view time-dependent by default.
- *
- * @param now - injectable clock, so a caller (or a test) can reason about the
- *   age without waiting for real time to pass.
- */
-export function viewOf(
-  task: TaskRecord,
-  byId: ReadonlyMap<string, TaskRecord>,
-  now: number = Date.now(),
-  staleAfterSec: number = 0,
-): TaskView {
-  const open = task.blocked_by.filter(id => byId.get(id)?.status !== 'completed')
-  const claimedMs = Date.parse(task.claimed_at)
-  const hasClaimTime = task.status === 'claimed' && task.claimed_at.length > 0 && !Number.isNaN(claimedMs)
-  // A claim with no parseable timestamp cannot be judged; report age 0 rather
-  // than inventing one, and never call it stale on a guess.
-  const ageSec = hasClaimTime ? Math.max(0, Math.floor((now - claimedMs) / 1000)) : 0
-  const stale = hasClaimTime && staleAfterSec > 0 && ageSec > staleAfterSec
-  return {
-    ...task,
-    ready: task.status === 'pending' && open.length === 0,
-    blocked_by_open: open,
-    ...hasClaimTime ? { claimed_age_sec: ageSec } : {},
-    stale,
-  }
-}
-
-export function viewsOf(
-  tasks: readonly TaskRecord[],
-  now: number = Date.now(),
-  staleAfterSec: number = 0,
-): TaskView[] {
-  const byId = new Map(tasks.map(task => [task.task_id, task]))
-  return tasks.map(task => viewOf(task, byId, now, staleAfterSec))
 }
 
 /**

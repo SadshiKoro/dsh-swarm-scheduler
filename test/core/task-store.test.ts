@@ -6,13 +6,11 @@
  *
  * Two deliberate design choices:
  *
- *   1. **No DSH runtime.** `TaskStore` takes a Cordis `Context`, but every call
- *      this file makes goes through `ctx.get('fs')`. The stub below returns
- *      `undefined` for that, which sends the store down its documented
- *      `node:fs` fallback path — the same path the real deployment uses after
- *      the sandbox refuses `ctx.fs`. So the tests exercise real behaviour
- *      without booting a host, and the labelled degradation is expected output
- *      rather than a workaround.
+ *   1. **No DSH runtime.** `src/core/` takes the filesystem slice as a
+ *      constructor argument, not a Cordis context, so `new TaskStore(undefined,
+ *      dir)` exercises the documented `node:fs` path directly. That is the same
+ *      path the real deployment uses after the sandbox refuses `ctx.fs`, and it
+ *      means this file imports nothing from `@deepseek-ai/*`.
  *
  *   2. **A fresh temp directory per test.** Every test gets its own pool, so
  *      ordering cannot leak state between them, and `afterEach` removes it. The
@@ -23,7 +21,6 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import type { Context } from '@deepseek-ai/cordis'
 import {
   TASKS_DIR,
   TaskStore,
@@ -32,27 +29,13 @@ import {
   completeTask,
   releaseTask,
   setDependencies,
+  startTask,
+  reapTask,
   viewsOf,
   findScopeConflict,
   scopesOverlap,
   type TaskRecord,
-} from '../src/task-store.ts'
-
-/**
- * Minimal Context stub: `get('fs')` answers `undefined`, everything else throws.
- *
- * Throwing on any other member is intentional — if a future change starts
- * consulting another service, these tests should fail loudly rather than
- * silently exercise a path the deployment does not have.
- */
-function stubContext(): Context {
-  return {
-    get(name: string): undefined {
-      assert.equal(name, 'fs', `unexpected service lookup: ${name}`)
-      return undefined
-    },
-  } as unknown as Context
-}
+} from '../../src/core/task-store.ts'
 
 let dir: string
 let store: TaskStore
@@ -60,7 +43,7 @@ let store: TaskStore
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'swarm-store-test-'))
   mkdirSync(join(dir, TASKS_DIR), { recursive: true })
-  store = new TaskStore(stubContext(), dir)
+  store = new TaskStore(undefined, dir)
 })
 
 afterEach(() => {
@@ -352,4 +335,144 @@ test('a claim is marked stale only past the threshold', async () => {
   // Threshold 0 means "do not judge", even for an ancient claim.
   const unjudged = viewsOf(tasks, Date.now() + 10_000_000, 0)[0] as { stale: boolean }
   assert.equal(unjudged.stale, false)
+})
+
+// ---------------------------------------------------------------- startTask ---
+
+test('startTask transitions claimed -> running and records heartbeat', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  const outcome = await startTask(store, 't1', 'worker-a')
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'started')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'running')
+  assert.notEqual(raw.started_at, '')
+  assert.notEqual(raw.heartbeat_at, '')
+})
+
+test('startTask on non-claimed task returns invalid_state', async () => {
+  await store.createExclusive(blankTask('t1'))
+  const outcome = await startTask(store, 't1', 'worker-a')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'invalid_state')
+})
+
+test('startTask on missing task returns not_found', async () => {
+  const outcome = await startTask(store, 'missing', 'worker-a')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'not_found')
+})
+
+// ----------------------------------------------------------- completeTask (failed/blocked) ---
+
+test('completeTask with success=false marks failed and increments retry_count', async () => {
+  await store.createExclusive(blankTask('t1', { max_retries: 3 }))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+  const outcome = await completeTask(store, 't1', 'error occurred', 'worker-a', undefined, false)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'failed')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'failed')
+  assert.equal(raw.retry_count, 1)
+  assert.equal(raw.failure_reason, 'error occurred')
+})
+
+test('completeTask with success=false and max retries reached marks blocked', async () => {
+  await store.createExclusive(blankTask('t1', { max_retries: 2 }))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+  // First failure
+  await completeTask(store, 't1', 'first error', 'worker-a', undefined, false)
+  // Second failure (retry_count = 2 >= max_retries = 2) -> blocked
+  await startTask(store, 't1', 'worker-a') // re-start for retry
+  const outcome = await completeTask(store, 't1', 'second error', 'worker-a', undefined, false)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'blocked')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'blocked')
+  assert.equal(raw.retry_count, 2)
+})
+
+test('completeTask with success=true marks completed', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+  const outcome = await completeTask(store, 't1', 'all done', 'worker-a', undefined, true)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'completed')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'completed')
+})
+
+// ---------------------------------------------------------------- reapTask ---
+
+test('reapTask reverts stale claimed task to pending', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  // Backdate claimed_at
+  const raw = readRaw('t1')
+  raw.claimed_at = new Date(Date.now() - 20 * 60 * 1000).toISOString()
+  writeFileSync(join(dir, TASKS_DIR, 't1.json'), `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
+  const outcome = await reapTask(store, 600) // 10 min threshold
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.reaped.length, 1)
+  assert.equal(outcome.reaped[0].action, 'released')
+  assert.equal(readRaw('t1').status, 'pending')
+  assert.equal(readRaw('t1').claimed_by, '')
+})
+
+test('reapTask marks stale running task as failed/blocked', async () => {
+  await store.createExclusive(blankTask('t1', { max_retries: 3 }))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+  // Backdate claimed_at
+  const raw = readRaw('t1')
+  raw.claimed_at = new Date(Date.now() - 20 * 60 * 1000).toISOString()
+  writeFileSync(join(dir, TASKS_DIR, 't1.json'), `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
+  const outcome = await reapTask(store, 600)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.reaped.length, 1)
+  assert.equal(outcome.reaped[0].action, 'failed')
+  assert.equal(readRaw('t1').status, 'failed')
+  assert.equal(readRaw('t1').retry_count, 1)
+})
+
+test('reapTask does not reap tasks within threshold', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  const outcome = await reapTask(store, 600)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.reaped.length, 0)
+  assert.equal(readRaw('t1').status, 'claimed')
+})
+
+// -------------------------------------------------------------- TaskView new fields ---
+
+test('viewsOf includes running_age_sec and heartbeat_age_sec for running tasks', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+  const views = viewsOf((await store.readAll()).tasks, Date.now(), 600)
+  const view = views.find(v => v.task_id === 't1')
+  assert.notEqual(view, undefined)
+  assert.equal(view!.status, 'running')
+  assert.ok(typeof view!.running_age_sec === 'number')
+  assert.ok(typeof view!.heartbeat_age_sec === 'number')
+  assert.ok(view!.running_age_sec >= 0)
+  assert.ok(view!.heartbeat_age_sec >= 0)
+})
+
+test('viewsOf includes retry_count and failure_reason for failed/blocked tasks', async () => {
+  await store.createExclusive(blankTask('t1', { max_retries: 3 }))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'failed', 'worker-a', undefined, false)
+  const views = viewsOf((await store.readAll()).tasks)
+  const view = views.find(v => v.task_id === 't1')
+  assert.notEqual(view, undefined)
+  assert.equal(view!.status, 'failed')
+  assert.equal(view!.retry_count, 1)
+  assert.equal(view!.failure_reason, 'failed')
 })

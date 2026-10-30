@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { appendFileSync } from 'node:fs'
 import { Config, resolveTasksRoot, type Config as SwarmConfig } from './config.js'
-import { TaskStore, TASKS_DIR } from './task-store.js'
+import { TaskStore, TASKS_DIR, type FsLike } from './core/task-store.js'
 import { registerFileTools } from './tools-file.js'
 
 export const name = 'dsh-swarm-scheduler-beta'
@@ -136,7 +136,7 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
    没有空闲的 → 用 spawn_teammate 创建 2-3 个。
 
 3. 给每个 worker 发一条 send_message，消息里只说：
-   "去 swarm_ready 查就绪任务，swarm_claim 自领，做完用 swarm_complete 回报，然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。"
+   "去 swarm_ready 查就绪任务，swarm_claim 自领，swarm_start 开工，做完用 swarm_complete 回报（失败时 success=false），然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。"
 
 4. 不要指定具体任务给 worker。谁领到哪一个是原子竞争的结果。
 
@@ -144,7 +144,11 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
 
 6. 如果 worker 在执行中撞到依赖冲突（比如两个任务要改同一个文件、或者串行链在规划期没声明），它会通过 send_message 报告你。你收到报告后，用 swarm_set_deps 调整任务的 blocked_by，把冲突的任务串行化。依赖调整只由你做，不要让 worker 自己改。
 
-7. 定期用 swarm_status 查看进度。如果某个任务被标为 STALE（claimed 时间超过阈值，可能 worker 卡死或消失），用 swarm_release 释放它，让其他 worker 能重新领取。
+7. 看到 failed 的任务时，判断是否重试：可以再发一条 send_message 让 worker 重新 swarm_start 该任务（failed 任务可直接 start），或用 swarm_release 把它放回 pending 让别人重领。retry_count 达到 max_retries 后会变成 blocked，此时需要人工介入或调整拆解。
+
+8. 定期用 swarm_status 查看进度。如果某个任务被标为 STALE（claimed/running 超过阈值，可能 worker 卡死或消失），用 swarm_reap 自动回收（claimed 回 pending、running 标 failed 走重试），或按需用 swarm_release 释放个别任务。
+
+9. 并发上限由 max_workers 控制（默认 3）。swarm_ready 在 claimed+running 达到上限时返回 0，这是正常现象，等已有任务完成后再拉。
 
 不要自己领任务、不要自己做具体编码。你的角色是调度者。`
 
@@ -169,7 +173,9 @@ export function apply(ctx: Context, config: SwarmConfig) {
      * omission surfaces at activation rather than at "where did my tasks go".
      */
     const cwd = resolveTasksRoot(config.tasksRoot)
-    const store = new TaskStore(ctx, cwd)
+    // The core layer takes the filesystem slice, not the Cordis context: that is
+    // what keeps `src/core/` free of `@deepseek-ai/*` imports.
+    const store = new TaskStore(ctx.get('fs') as FsLike | undefined, cwd)
     const disposers: Array<() => void> = []
 
     // A negative or non-finite threshold would make every claim look stale (or
@@ -177,7 +183,7 @@ export function apply(ctx: Context, config: SwarmConfig) {
     const staleAssignmentSec = Number.isFinite(config.staleAssignmentSec) && config.staleAssignmentSec > 0
       ? config.staleAssignmentSec
       : 0
-    registerFileTools({ ctx, store, staleAssignmentSec, disposers })
+    registerFileTools({ ctx, store, staleAssignmentSec, max_workers: config.max_workers, disposers })
 
     // Best-effort directory creation. `ctx.fs` has no mkdir in the slice this
     // plugin uses, so `ensureDir` writes a sentinel through the filesystem; a

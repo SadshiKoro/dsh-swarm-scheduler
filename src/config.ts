@@ -26,21 +26,22 @@ export interface Config {
    */
   debugLogPath: string
   /**
-   * A `claimed` task older than this many **seconds** is reported as `STALE` by
-   * `swarm_status`. Default 600 (ten minutes).
+   * A `claimed` or `running` task older than this many **seconds** is reported
+   * as `STALE` by `swarm_status`. Default 600 (ten minutes).
    *
    * This marks a suspicion, it does not act on one: a claim has no expiry, so a
-   * worker that dies mid-task leaves the task `claimed` forever and everything
-   * blocked by it unreachable. `swarm_status` makes that visible; releasing it is
-   * still the Lead's decision, via `swarm_release`. Automatic reclamation would
-   * need a watchdog that can tell "stuck" from "slow", which this plugin does not
-   * have — so the threshold is deliberately a reporting knob, not a reaper.
-   *
-   * Added back in v0.2.5 after being removed in v0.2.4 as dead configuration.
-   * It is read by `viewsOf` in the same change that declares it, which is the
-   * rule this interface states for itself.
+   * worker that dies mid-task leaves the task `claimed`/`running` forever and
+   * everything blocked by it unreachable. `swarm_status` makes that visible;
+   * releasing it is still the Lead's decision, via `swarm_release`. The `swarm_reap`
+   * tool can automatically reap stale tasks when invoked.
    */
   staleAssignmentSec: number
+  /**
+   * Maximum number of concurrent workers (claimed + running tasks). When this
+   * limit is reached, `swarm_ready` returns 0 ready tasks to prevent
+   * overscheduling. Default 3.
+   */
+  max_workers: number
 }
 
 /**
@@ -66,6 +67,7 @@ export const Config: Schema<Config> = Schema.object({
   tasksRoot: Schema.string().default(''),
   debugLogPath: Schema.string().default(''),
   staleAssignmentSec: Schema.number().default(600),
+  max_workers: Schema.number().default(3),
 })
 
 /**
