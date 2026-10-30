@@ -82,6 +82,15 @@ test('computeReady returns zero and limited when claimed+running reaches max_wor
   assert.equal(result.limited, true)
   assert.equal(result.total, 0)
   assert.equal(result.tasks.length, 0)
+  // The reason must be produced by the core, not improvised by the adapter:
+  // v0.3.0 shipped a second source that shadowed it.
+  assert.equal(result.notice, 'max_workers limit (2) reached')
+})
+
+test('computeReady carries no notice below the ceiling', () => {
+  const result = computeReady([blankTask('a')], 3)
+  assert.equal(result.limited, false)
+  assert.equal(result.notice, undefined)
 })
 
 test('computeReady still returns ready tasks when ceiling is disabled (0)', () => {

@@ -189,6 +189,14 @@ export interface ReadyResult {
   tasks: TaskRecord[]
   /** True when the concurrency ceiling suppressed an otherwise non-empty pool. */
   limited: boolean
+  /**
+   * Human-readable reason when `limited`, so the adapter has something to show.
+   *
+   * It lives here rather than in the tool handler so the wording is unit-tested
+   * and there is exactly one place that can produce it — the v0.3.0 defect was
+   * a second, overriding source in the adapter.
+   */
+  notice?: string
 }
 
 /**
@@ -206,7 +214,7 @@ export function computeReady(
 ): ReadyResult {
   const active = tasks.filter(task => task.status === 'claimed' || task.status === 'running').length
   if (maxWorkers > 0 && active >= maxWorkers) {
-    return { total: 0, tasks: [], limited: true }
+    return { total: 0, tasks: [], limited: true, notice: `max_workers limit (${maxWorkers}) reached` }
   }
   const byId = new Map(tasks.map(task => [task.task_id, task]))
   const ready = tasks

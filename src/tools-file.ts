@@ -226,21 +226,32 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       },
       render: (_args, value) => {
         const tasks = value.tasks ?? []
-        if (tasks.length === 0) return text(`ready: 0 (pool: ${value.dir ?? TASKS_DIR})`)
-        return text(`ready: ${value.total ?? tasks.length}\n`
-          + tasks.map(task => `  ${task.task_id} [${task.big_task_id ?? ''}] ${task.title ?? ''}`
-            + ((task.write_scopes ?? []).length > 0 ? `  scope: ${(task.write_scopes ?? []).join(', ')}` : '')).join('\n'))
+        const degraded = value.degraded !== undefined && value.degraded !== ''
+          ? [`  degraded: ${value.degraded}`]
+          : []
+        if (tasks.length === 0) {
+          // The empty list is exactly where the ceiling reason matters, so the
+          // degraded line must survive this branch (v0.3.1 defect fix).
+          return text([`ready: 0 (pool: ${value.dir ?? TASKS_DIR})`, ...degraded].join('\n'))
+        }
+        return text([`ready: ${value.total ?? tasks.length}`,
+          ...tasks.map(task => `  ${task.task_id} [${task.big_task_id ?? ''}] ${task.title ?? ''}`
+            + ((task.write_scopes ?? []).length > 0 ? `  scope: ${(task.write_scopes ?? []).join(', ')}` : '')),
+          ...degraded].join('\n'))
       },
     },
     async execute(args) {
       const all = await store.readAll()
       const result = computeReady(all.tasks, max_workers, args.big_task_id)
+      const fsNote = all.io.degraded ?? store.degraded ?? ''
       if (result.limited) {
+        // The ceiling notice is the reason the caller must see; the filesystem
+        // degradation is secondary and appended, never allowed to shadow it.
         return {
           total: 0,
           dir: TASKS_DIR,
           tasks: [],
-          degraded: all.io.degraded ?? store.degraded ?? `max_workers limit (${max_workers}) reached`,
+          degraded: [result.notice, fsNote].filter(note => note !== undefined && note !== '').join('; '),
         }
       }
       return {
@@ -397,8 +408,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         const tasks = value.tasks ?? []
         const stale = value.stale ?? 0
         const head = `pool ${value.dir ?? TASKS_DIR}: total ${value.total ?? 0} · pending ${value.pending ?? 0}`
-          + ` · claimed ${value.claimed ?? 0} · running ${value.running ?? 0} · completed ${value.completed ?? 0}`
-          + ` · failed ${value.failed ?? 0} · blocked ${value.blocked ?? 0}${stale > 0 ? ` (${stale} stale)` : ''}`
+          + ` · claimed ${value.claimed ?? 0} · running ${value.running ?? 0}${stale > 0 ? ` (${stale} stale)` : ''}`
+          + ` · completed ${value.completed ?? 0} · failed ${value.failed ?? 0} · blocked ${value.blocked ?? 0}`
           + ` · ready ${value.ready ?? 0}`
         const hint = stale > 0
           ? [`  ⚠ ${stale} task(s) older than ${value.stale_after_sec ?? 0}s — release with swarm_release or reap with swarm_reap if abandoned`]
