@@ -42,6 +42,15 @@ export interface Config {
    * overscheduling. Default 3.
    */
   max_workers: number
+  /**
+   * Worker capability map: agent id → `standard` | `premium`.
+   *
+   * Routing is expressed in tiers, never in concrete model names, so the
+   * scheduler stays provider-agnostic: the Lead decides which model backs a
+   * teammate, the pool only decides whether that teammate is strong enough for
+   * a block. An unlisted worker is `standard`.
+   */
+  worker_tiers: Record<string, string>
 }
 
 /**
@@ -68,6 +77,7 @@ export const Config: Schema<Config> = Schema.object({
   debugLogPath: Schema.string().default(''),
   staleAssignmentSec: Schema.number().default(600),
   max_workers: Schema.number().default(3),
+  worker_tiers: Schema.dict(Schema.string()).default({}),
 })
 
 /**

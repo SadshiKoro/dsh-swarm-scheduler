@@ -67,6 +67,8 @@ export interface FileToolDeps {
    * returns 0 ready tasks.
    */
   max_workers: number
+  /** agent id → 'standard' | 'premium'; unlisted workers are standard. */
+  worker_tiers: Record<string, string>
   /** Collects every disposer from this registration, in one ownership list. */
   disposers: Array<() => void>
 }
@@ -90,7 +92,7 @@ function viewRow(view: TaskView): Record<string, unknown> {
   }
 }
 
-export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, disposers }: FileToolDeps): void {
+export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, worker_tiers, disposers }: FileToolDeps): void {
   // ------------------------------------------------------------- swarm_plan ---
   disposers.push(ctx.tools.register(defineTool({
     name: 'swarm_plan',
@@ -124,6 +126,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
               description: 'Map of workspace-relative file path -> expected sha256 hex digest; a mismatch refuses the claim',
               additionalProperties: true,
             },
+            complexity: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Estimated difficulty, used for worker routing. Default medium.' },
+            required_worker_tier: { type: 'string', enum: ['any', 'standard', 'premium'], description: 'Minimum worker tier allowed to claim. Default any.' },
           },
         },
       },
@@ -198,6 +202,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           priority: spec.priority ?? 0,
           required_files: spec.required_files ?? [],
           required_hashes: requiredHashes,
+          complexity: spec.complexity ?? 'medium',
+          required_worker_tier: spec.required_worker_tier ?? 'any',
         })
         const written = await store.createExclusive(record)
         if (written.ok) created.push(taskId)
@@ -320,7 +326,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -333,7 +339,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
     },
     async execute(args) {
-      const outcome = await claimTask(store, args.task_id, args.claimed_by)
+      const outcome = await claimTask(store, args.task_id, args.claimed_by, undefined, worker_tiers)
       const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
       return {
         ok: outcome.ok,
@@ -470,6 +476,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           line += ')'
         }
         line += ` — ${view.title}`
+        // Routing profile, only when it differs from the defaults (medium/any),
+        // so ordinary lines stay readable.
+        if (view.complexity !== 'medium' || view.required_worker_tier !== 'any') {
+          line += ` [complexity: ${view.complexity}, req: ${view.required_worker_tier}]`
+        }
         // Context-integrity marker: a pending task whose declared prerequisites
         // are absent (or whose pinned content digest no longer matches) cannot be
         // claimed, even though DAG-wise it is ready.

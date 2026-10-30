@@ -21,6 +21,11 @@ export const TASKS_DIR = '.dsh-tasks'
 
 export type TaskStatus = 'pending' | 'claimed' | 'running' | 'completed' | 'failed' | 'blocked'
 
+/** How hard a block is, used only for worker routing. */
+export type Complexity = 'low' | 'medium' | 'high'
+/** Minimum worker class a task accepts; `any` opts out of routing. */
+export type WorkerTierRequirement = 'any' | 'standard' | 'premium'
+
 export interface TaskRecord {
   task_id: string
   big_task_id: string
@@ -52,6 +57,10 @@ export interface TaskRecord {
    * hash, not a git object id and not a version string.
    */
   required_hashes: Record<string, string>
+  /** Estimated difficulty, used for routing; never mapped to a concrete model. */
+  complexity: Complexity
+  /** Minimum worker tier; `any` means no routing restriction. */
+  required_worker_tier: WorkerTierRequirement
 }
 
 /** A task plus the derived facts callers actually schedule on. */
@@ -108,6 +117,8 @@ export function blankTask(taskId: string, fields: Partial<TaskRecord> = {}): Tas
     priority: fields.priority ?? 0,
     required_files: fields.required_files ?? [],
     required_hashes: fields.required_hashes ?? {},
+    complexity: fields.complexity ?? 'medium',
+    required_worker_tier: fields.required_worker_tier ?? 'any',
   }
 }
 
@@ -156,6 +167,10 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
     priority: num(raw.priority),
     required_files: strings(raw.required_files),
     required_hashes: hashMap(raw.required_hashes),
+    complexity: raw.complexity === 'low' || raw.complexity === 'high' ? raw.complexity : 'medium',
+    required_worker_tier: raw.required_worker_tier === 'standard' || raw.required_worker_tier === 'premium'
+      ? raw.required_worker_tier
+      : 'any',
   })
 }
 

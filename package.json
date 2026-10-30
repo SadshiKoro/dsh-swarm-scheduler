@@ -1,6 +1,6 @@
 {
   "name": "dsh-swarm-scheduler-beta",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Parallel coding scheduler for DSH with six-state lifecycle, priority scheduling, dependency/file/hash pre-checks, scope conflict prevention, concurrency ceiling, heartbeat lease renewal, watchdog, and a DSH-independent core.",
   "type": "module",
   "main": "lib/index.js",

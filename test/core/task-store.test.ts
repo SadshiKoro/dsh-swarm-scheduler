@@ -616,3 +616,32 @@ test('a required_hashes entry for a missing file is missing_dependencies', async
   assert.equal(outcome.code, 'missing_dependencies')
   assert.match(outcome.message, /ghost\.txt/)
 })
+
+// ---------------------------------------------------------- worker routing ---
+
+test('a standard worker cannot claim a premium-required high-complexity task', async () => {
+  await store.createExclusive(blankTask('t1', { complexity: 'high', required_worker_tier: 'premium' }))
+  const tiers = { 'worker-strong': 'premium' }
+  const weak = await claimTask(store, 't1', 'worker-cheap', undefined, tiers)
+  assert.equal(weak.ok, false)
+  assert.equal(weak.code, 'worker_too_weak')
+  assert.match(weak.message, /premium/)
+  assert.equal(readRaw('t1').status, 'pending')
+  const strong = await claimTask(store, 't1', 'worker-strong', undefined, tiers)
+  assert.equal(strong.ok, true)
+  assert.equal(strong.code, 'claimed')
+})
+
+test('a high-complexity task with an explicit tier is refused to a standard worker', async () => {
+  await store.createExclusive(blankTask('t1', { complexity: 'high', required_worker_tier: 'standard' }))
+  const outcome = await claimTask(store, 't1', 'worker-cheap', undefined, {})
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'worker_too_weak')
+})
+
+test('a default any/medium task is claimable by any worker', async () => {
+  await store.createExclusive(blankTask('t1'))
+  const outcome = await claimTask(store, 't1', 'worker-cheap', undefined, {})
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})

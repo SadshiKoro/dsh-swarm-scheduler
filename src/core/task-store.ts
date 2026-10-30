@@ -211,7 +211,6 @@ export class TaskStore {
       return { tasks: [], io: { ok: false, error: messageOf(error), degraded: this.#fallbackNote } }
     }
   }
-
   /** Service-path read. Throws so the caller can classify the failure. */
   async #readAllViaFs(): Promise<TaskRecord[]> {
     const fs = this.#fs as FsLike
@@ -233,7 +232,7 @@ export class TaskStore {
     return tasks
   }
 
-  #readAllViaNode(): { tasks: TaskRecord[]; io: IoOutcome } {
+  async #readAllViaNode(): Promise<{ tasks: TaskRecord[]; io: IoOutcome }> {
     const tasks: TaskRecord[] = []
     try {
       if (!existsSync(this.dirPath)) return { tasks, io: { ok: true, degraded: this.#fallbackNote } }
@@ -256,9 +255,40 @@ export class TaskStore {
     }
   }
 
+  /**
+   * Read exactly one task by id.
+   *
+   * Deliberately **not** `readAll().find(...)`: every claim reads the task before
+   * and after taking the lock, so scanning the whole pool here made claim cost
+   * O(pool) per call — measured at ~238ms for a 50-task pool before v0.5.0,
+   * which is what pushed the 10-worker stress case past its budget. Reading one
+   * file is the same answer at a fraction of the cost.
+   */
   async readOne(taskId: string): Promise<{ task?: TaskRecord; io: IoOutcome }> {
-    const all = await this.readAll()
-    return { task: all.tasks.find(candidate => candidate.task_id === taskId), io: all.io }
+    if (this.#backend === 'node' || this.#fs === undefined) return this.#readOneViaNode(taskId)
+    try {
+      const fs = this.#fs
+      const target = await fs.resolve(`${TASKS_DIR}/${taskFileName(taskId)}`, { cwd: this.#cwd })
+      const text = await readTextIfAvailable(fs, target)
+      if (text === undefined) return { task: undefined, io: { ok: true } }
+      return { task: parseTask(text, taskId), io: { ok: true } }
+    } catch (error) {
+      if (TaskStore.#isSandboxDenial(error)) {
+        this.#degradeTo('ctx.fs refused reads under the sandbox; using node:fs')
+        return this.#readOneViaNode(taskId)
+      }
+      return { task: undefined, io: { ok: false, error: messageOf(error), degraded: this.#fallbackNote } }
+    }
+  }
+
+  #readOneViaNode(taskId: string): { task?: TaskRecord; io: IoOutcome } {
+    try {
+      const text = readFileSync(join(this.dirPath, taskFileName(taskId)), 'utf8')
+      return { task: parseTask(text, taskId), io: { ok: true, degraded: this.#fallbackNote } }
+    } catch {
+      // Absent (or unreadable) is an ordinary answer: no such task.
+      return { task: undefined, io: { ok: true, degraded: this.#fallbackNote } }
+    }
   }
 
   /**
@@ -408,8 +438,8 @@ export function hashMismatches(store: TaskStore, task: TaskRecord): HashMismatch
 /** Locks held by this process, used only when the filesystem lock is denied. */
 const heldLocks = new Set<string>()
 
-/** Tasks currently being claimed in this process — prevents races on stale-lock clearing. */
-const claimInProgress = new Set<string>()
+/** Claims currently in progress in this process, counted per task. */
+const claimInProgress = new Map<string, number>()
 
 /** Path of one task's claim lock. */
 function lockPath(dirPath: string, taskId: string): string {
@@ -466,14 +496,50 @@ function lockExists(dirPath: string, taskId: string): boolean {
  *     so a likely collision is visible while planning, before anyone claims;
  *   - **missing `required_files`** are refused as `missing_dependencies`, naming
  *     every absent path; the task keeps its `pending` state;
+ *   - a **routing mismatch** is refused as `worker_too_weak` (see
+ *     `routingRefusal`), before any lock churn;
  *   - the usual state checks (missing / completed / already claimed).
  */
+export type WorkerTier = 'standard' | 'premium'
+
+/**
+ * The tier a worker claims to be, from the deployment's `worker_tiers` map.
+ *
+ * Unknown ids and unknown tier strings degrade to `standard`: a capability
+ * declaration that cannot be read must not silently become "premium".
+ */
+export function workerTierOf(agentId: string, tiers?: Readonly<Record<string, string>>): WorkerTier {
+  return tiers?.[agentId] === 'premium' ? 'premium' : 'standard'
+}
+
+/**
+ * Whether a task's routing contract excludes this worker, and why.
+ *
+ * The rules are deliberately small and provider-agnostic:
+ *   - `required_worker_tier: 'premium'` demands a premium worker;
+ *   - a `high` complexity task that *declares* a non-`any` requirement is also
+ *     refused to a standard worker — the requirement is the contract, and a
+ *     high-complexity block with an explicit tier is not a cheap job;
+ *   - `any` always accepts, which keeps routing opt-in per task.
+ */
+export function routingRefusal(task: TaskRecord, agentId: string, tier: WorkerTier): string | undefined {
+  if (task.required_worker_tier === 'premium' && tier !== 'premium') {
+    return `${task.task_id} requires a premium worker; ${agentId} is ${tier}`
+  }
+  if (task.complexity === 'high' && tier !== 'premium' && task.required_worker_tier !== 'any') {
+    return `${task.task_id} is high complexity and requires a ${task.required_worker_tier} worker; `
+      + `${agentId} is ${tier}`
+  }
+  return undefined
+}
+
 export async function claimTask(
   store: TaskStore,
   taskId: string,
   claimedBy: string,
   clock: Clock = defaultClock,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
+  workerTiers?: Readonly<Record<string, string>>,
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -491,6 +557,14 @@ export async function claimTask(
       code: 'invalid_state',
       message: `${taskId} is ${found.task.status}; retry it with swarm_start or release it back to pending`,
     }
+  }
+
+  // Capability routing: refuse before any file or lock work when this worker is
+  // below the tier the task declares.
+  const tier = workerTierOf(claimedBy, workerTiers)
+  const refusal = routingRefusal(found.task, claimedBy, tier)
+  if (refusal !== undefined) {
+    return { ok: false, code: 'worker_too_weak', message: refusal }
   }
 
   // Context-integrity pre-check: a task that names prerequisite files must not
@@ -515,27 +589,19 @@ export async function claimTask(
     }
   }
 
-  const all = await store.readAll()
-  const byId = new Map(all.tasks.map(task => [task.task_id, task]))
-  const conflict = findScopeConflict(byId.get(taskId) ?? found.task, all.tasks)
-  if (conflict !== undefined) {
-    const holder = conflict.claimed_by.length > 0 ? conflict.claimed_by : 'another agent'
-    return {
-      ok: false,
-      code: 'scope_conflict',
-      message: `${taskId} refused: write scope "${conflict.scope}" overlaps "${conflict.other_scope}" `
-        + `of ${conflict.task_id} (held by ${holder}). Serialise them with swarm_set_deps, or make the scopes narrower. `
-        + `建议将 write_scopes 缩小到具体文件，或用 swarm_set_deps 串行化。`,
-    }
-  }
+  // Scope conflicts are checked once, under the lock (see below). An earlier
+  // pre-lock scan was a latency optimisation that cost a full pool read per
+  // attempt; the under-lock check is the authoritative one and is enough.
 
-  // The state says pending, so any lock still on disk belongs to a dead holder.
-  // But only clear it if no other claim for this task is in progress in this process.
+  // A stale lock may only be cleared when NO claim for this task is in flight.
+  // The counter is not decoration: a losing claim must not delete the guard that
+  // belongs to the winner, or a third claim could then clear the winner's live
+  // lock and both would be admitted (measured before v0.5.0).
   let staleLockCleared = false
-  const alreadyClaiming = claimInProgress.has(taskId)
-  claimInProgress.add(taskId)
+  const concurrent = claimInProgress.get(taskId) ?? 0
+  claimInProgress.set(taskId, concurrent + 1)
   try {
-    if (!alreadyClaiming && lockExists(store.dirPath, taskId)) {
+    if (concurrent === 0 && lockExists(store.dirPath, taskId)) {
       removeLock(store.dirPath, taskId)
       staleLockCleared = true
     }
@@ -643,7 +709,9 @@ export async function claimTask(
       releaseLock(store.dirPath, taskId, lock.mode)
     }
   } finally {
-    claimInProgress.delete(taskId)
+    const remaining = (claimInProgress.get(taskId) ?? 1) - 1
+    if (remaining <= 0) claimInProgress.delete(taskId)
+    else claimInProgress.set(taskId, remaining)
   }
 }
 

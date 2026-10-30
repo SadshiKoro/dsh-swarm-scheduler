@@ -268,7 +268,7 @@ Use the swarm scheduler for this:
 
 | Tool | Purpose | Main parameters |
 |---|---|---|
-| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`, `required_hashes`) |
+| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`, `required_hashes`, `complexity`, `required_worker_tier`) |
 | `swarm_ready` | List the tasks a worker may start right now (0 when `max_workers` is reached) | optional `big_task_id` filter |
 | `swarm_claim` | Atomically claim one task (`pending` → `claimed`) | `task_id` / `claimed_by` |
 | `swarm_start` | Start work (`claimed` → `running`), recording the heartbeat | `task_id` / `started_by` |
@@ -321,7 +321,13 @@ pool. Set it in the profile's `cordis.patch.yml`:
 - id: swarm-scheduler
   config:
     max_workers: 3
+    worker_tiers:
+      worker-cheap: standard
+      worker-strong: premium
 ```
+
+`worker_tiers` is the capability map used by intelligent routing (§6.5). Unlisted workers are
+`standard`; the scheduler never knows model names, only tiers.
 
 ### 6.3 调度智能化（v0.3.2）
 
@@ -374,6 +380,29 @@ worker: swarm_claim(t) → swarm_start(t)
 loop:   每 staleAssignmentSec/2 调一次 swarm_heartbeat(t, me)
         swarm_complete(t, success=…)
 ```
+
+### 6.5 智能路由：complexity 与 required_worker_tier（v0.5.0）
+
+任务可声明两件事，用于把活分给“够强”的 Worker：
+
+| 字段 | 取值 | 默认 | 含义 |
+|---|---|---|---|
+| `complexity` | `low` / `medium` / `high` | `medium` | 难度估计，仅用于路由展示与判定，**不绑定任何具体模型** |
+| `required_worker_tier` | `any` / `standard` / `premium` | `any` | 允许领取该任务的最低 Worker 等级；`any` 表示不设限 |
+
+Worker 等级来自 profile 配置的 `worker_tiers`（§6.2），未配置的 Worker 视为 `standard`。
+`swarm_claim` 在取锁前判定，失败返回 `worker_too_weak`：
+
+1. `required_worker_tier: 'premium'` → 只有 `premium` 能领；
+2. `complexity: 'high'` 且声明了非 `any` 的等级 → `standard` 不能领（高难度 + 明确等级要求，不交给弱 Worker）；
+3. `any` → 一律放行，路由按任务 opt-in。
+
+`swarm_status` 对非默认配置的行追加 `[complexity: high, req: premium]`。Lead 拆解时应给每个小块评估
+complexity，并对高风险块标 `premium`；具体用哪个 provider/model 由 Lead 在 spawn 时决定，调度层只认等级。
+
+**压力测试**：`test/core/stress.test.ts` 模拟 10 个 Worker 对 50 个任务（10 个 scope）并发抢占，并模拟
+5 个 Worker 领取后消失、由 `swarm_reap` 一轮回收。它曾在 v0.5.0 开发中抓到一个真实并发缺陷：失败的
+claim 会删掉成功 claim 的进程内互斥标记，导致第三次 claim 清掉活锁并双双写入；修复为按任务引用计数。
 
 ---
 
@@ -476,19 +505,22 @@ without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
      here;
    - if DSH promotes that package into a default bundle, or removes it, **the installation steps in
      §4 will change** and this README may be out of date.
-9. **Concurrency correctness is verified by hand; the core logic now has 55 automated tests.** The
-   suite covers the six-state lifecycle (`claim`/`start`/`complete`/`release`/`reap`/`set_dependencies`),
+9. **Concurrency correctness has both unit and stress coverage — 80 automated tests.** The suite
+   covers the six-state lifecycle (`claim`/`start`/`complete`/`release`/`reap`/`set_dependencies`),
    retry and blocked transitions, the `write_scopes` admission check, residual-lock cleanup,
-   readiness/staleness, the `max_workers` ceiling, and concurrent races (same-task double claim,
-   overlapping-scope claim, stale-lock claim). Run them with `npm test` (Node's built-in runner, no
-   extra dependency; it runs the `.ts` sources directly, which needs Node 22.18+, or 22.6+ with
-   `--experimental-strip-types`). If your shell forbids a child process from capturing piped stdio — a
-   sandboxed DSH session is the case this was measured in — the runner cannot spawn its per-file worker
-   and fails with `spawn EPERM`; run `npm run test:sandbox` instead, which runs the same cases in a
-   single process (`--test-isolation=none`). What is still measured manually is the *concurrent*
-   behaviour in a real DSH host (multiple live teammates). So the logic has regression protection; the
-   claim that it is safe under real concurrency still rests on those manual runs. If you intend to use
-   this in production, repeat them in your own scenario.
+   readiness/staleness, the `max_workers` ceiling, routing refusals, and concurrent races (same-task
+   double claim, overlapping-scope claim, stale-lock claim). `test/core/stress.test.ts` additionally runs
+   10 workers against 50 tasks / 10 scopes and checks that the 50 claims are exactly-once and that no two
+   overlapping scopes were ever held simultaneously, plus a vanish-and-reap round. Run them with
+   `npm test` (Node's built-in runner, no extra dependency; it runs the `.ts` sources directly, which
+   needs Node 22.18+, or 22.6+ with `--experimental-strip-types`). The stress case's 3-second budget is a
+   Linux/CI budget; on Windows the local filesystem makes a 50-file scan ~40ms, so the test allows a
+   wider clock there while keeping every functional assertion identical. If your shell forbids a child
+   process from capturing piped stdio — a sandboxed DSH session is the case this was measured in — the
+   runner cannot spawn its per-file worker and fails with `spawn EPERM`; run `npm run test:sandbox`
+   instead, which runs the same cases in a single process (`--test-isolation=none`). What is still
+   measured manually is the *concurrent* behaviour in a real DSH host (multiple live teammates). If you
+   intend to use this in production, repeat them in your own scenario.
 10. **Symbol-level parallelism is still unsolved.** `write_scopes` is enforced at **directory**
     granularity: two tasks that both declare `src/` are refused at claim time even if one edits
     `src/a.ts` and the other `src/b.ts`. There is no AST-level analysis and no write interception —
