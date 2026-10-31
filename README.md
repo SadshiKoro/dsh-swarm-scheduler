@@ -25,7 +25,7 @@ shared on-disk pool by atomic claim.
 
 **0.3.0 起**，任务生命周期从两态扩展为六态（pending / claimed / running / completed / failed /
 blocked），支持失败重试、并发上限（`max_workers`）、scope 冲突硬拒绝、看门狗自动回收（`swarm_reap`）
-和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 90 个测试覆盖（含 10-Worker 并发压测）。
+和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 98 个测试覆盖（含 10-Worker 并发压测）。
 
 版本脉络：**v0.2.6** 把 `write_scopes` 从提示升级为 claim 时的硬拒绝 → **v0.2.7** 空 `tasksRoot`
 在激活时直接拒绝（不再静默落到 `process.cwd()`）→ **v0.3.0** 六态生命周期、`max_workers` 上限、
@@ -35,7 +35,8 @@ blocked），支持失败重试、并发上限（`max_workers`）、scope 冲突
 标记与 lease 语义一致 → **v0.5.0** 异构路由（`complexity` / `required_worker_tier` / `worker_tiers`）
 与 50 任务 / 10 scope / 10 Worker 压测 → **v0.6.0** 多维 Worker 画像
 （`worker_profiles`：capabilities / 上下文 / 成本）与能力、上下文硬路由 → **v0.7.0** 成本预算硬拦截
-（`max_cost_tokens`）与 Worker 可靠性统计（`worker_stats.json`，仅记录）。
+（`max_cost_tokens`）与 Worker 可靠性统计（`worker_stats.json`，仅记录） → **v0.8.0** 动态可靠性
+拦截（high 任务、失败 >3 且 >50%）、性能反馈（tokens/耗时均值）与呼救协议 `swarm_escalate`。
 
 ---
 
@@ -250,7 +251,7 @@ band just before the kernel's own Team policy). When you ask the Agent for somet
 files, several modules, several steps — it **switches to scheduling mode by itself**: it calls
 `swarm_plan`, wakes or creates workers, and then reports progress instead of writing the code itself.
 
-The ten tools remain directly callable for explicit control.
+The eleven tools remain directly callable for explicit control.
 
 ### Explicit instruction example
 
@@ -269,7 +270,7 @@ Use the swarm scheduler for this:
 
 ---
 
-## 6. The ten tools
+## 6. The eleven tools
 
 | Tool | Purpose | Main parameters |
 |---|---|---|
@@ -278,7 +279,8 @@ Use the swarm scheduler for this:
 | `swarm_claim` | Atomically claim one task (`pending` → `claimed`) | `task_id` / `claimed_by` |
 | `swarm_start` | Start work (`claimed` → `running`), recording the heartbeat | `task_id` / `started_by` |
 | `swarm_heartbeat` | Renew the lease on a task you hold (`claimed`/`running`) | `task_id` / `agent_id` |
-| `swarm_complete` | Finish a task; `success=false` marks it failed and drives retry/block | `task_id` / `result` / `completed_by` / `success` |
+| `swarm_escalate` | Hand a task back to the Lead as `blocked`, with a reason (holder only; Lead may `force`) | `task_id` / `agent_id` / `reason` / optional `force` |
+| `swarm_complete` | Finish a task; `success=false` marks it failed and drives retry/block | `task_id` / `result` / `completed_by` / `success` / optional `actual_tokens` / `duration_ms` |
 | `swarm_status` | Whole-pool status across all six states | optional `include_log` |
 | `swarm_release` | Return a stuck task to the pool (`claimed`/`running`/`failed` → `pending`) | `task_id` / `released_by` |
 | `swarm_reap` | Watchdog: recover claims/runs older than `staleAssignmentSec` | none |
@@ -447,7 +449,43 @@ Worker 画像来自 profile 的 `worker_profiles`（§6.2 示例）；未配置�
 
 **成本默认仍不是拦截条件**：只有任务显式声明 `max_cost_tokens > 0` 时才做硬拦截；未声明时
 `cost_per_1k_tokens` 只是 Lead 调度的软参考。`swarm_status` 会展示 `[caps: code,test]`、
-`[est: 50k tokens]`，并在末尾列出各 Worker 的 `success / failed` 统计（仅记录，不参与路由）。
+`[est: 50k tokens]`，并在末尾列出各 Worker 的统计。
+
+### 6.7 动态可靠性、性能反馈与呼救协议（v0.8.0）
+
+**可靠性拦截（只针对 high）**：`swarm_complete` 的成功/失败会累计到 `.dsh-tasks/worker_stats.json`。
+当某 Worker **失败次数 > 3** 且 **失败率 > 50%** 时，它领取 `complexity: high` 的任务会被拒：
+
+```
+REJECTED worker_unreliable: t-hard is high complexity and worker-bad has a 80% failure rate
+(4/5 attempts); low and medium tasks remain claimable
+```
+
+`low` / `medium` 任务**永远不因可靠性被拒**——这是有意的翻身通道；阈值与拒绝码都在取锁前判定，
+被拒任务保持 `pending`。
+
+**性能反馈（可选自报）**：`swarm_complete` 成功时可带 `actual_tokens` 与 `duration_ms`，累加到
+`total_tokens_consumed` / `total_task_time_ms`。`swarm_status` 据此算出平均值：
+
+```
+  workers:
+    worker-a: 5 success, 1 failed | avg 1.2k tokens, 45s/task
+```
+
+失败尝试不累加 token/耗时（失败花的钱说明的是阻塞原因，不是 Worker 的常态）。平均值只在
+`success_count > 0` 时展示。
+
+**呼救协议 `swarm_escalate`**：Worker 遇到自己搞不定的问题（缺关键文件、冲突无法解决、需求要重规划）时，
+不要硬写假代码，调用：
+
+```
+swarm_escalate(task_id, agent_id, reason)
+```
+
+任务变为 `blocked`，`claimed_by` 清空，`reason` 写入 `failure_reason`，日志追加 `escalated by <agent>: <reason>`。
+`swarm_status` 会显示 `[blocked]` 与原因。只有任务持有者能呼救（否则 `not_owner`）；Lead 可用
+`force: true` 从任何 Worker 手里强制收回。与 `failed` 的区别：`failed` 消耗重试并读作「做坏了」，
+`blocked` 读作「等 Lead 决策」，不会被重试逻辑自动重跑。
 
 ---
 
@@ -470,7 +508,7 @@ prevent. Serialising the decision on a single writer is what makes the cycle che
 
 ## 8. Architecture: route B (the file pool is the source of truth)
 
-The pool lives on disk, and its ten tools are the **only** scheduling interface. The kernel's Team
+The pool lives on disk, and its eleven tools are the **only** scheduling interface. The kernel's Team
 task board is used for nothing but waking workers.
 
 **Why route B.** The goal is "work finds the worker". The file pool's three primitives are exactly that
@@ -550,7 +588,7 @@ without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
      here;
    - if DSH promotes that package into a default bundle, or removes it, **the installation steps in
      §4 will change** and this README may be out of date.
-9. **Concurrency correctness has both unit and stress coverage — 90 automated tests.** The suite
+9. **Concurrency correctness has both unit and stress coverage — 98 automated tests.** The suite
    covers the six-state lifecycle (`claim`/`start`/`complete`/`release`/`reap`/`set_dependencies`),
    retry and blocked transitions, the `write_scopes` admission check, residual-lock cleanup,
    readiness/staleness, the `max_workers` ceiling, routing refusals, and concurrent races (same-task
@@ -573,11 +611,13 @@ without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
     **heartbeat timeout recovery** (`swarm_reap`) so a hung worker no longer pins a slot forever, but
     it does not make file-level concurrency safe. Declare narrower scopes (`src/api/routes.ts`) when
     you need finer resolution.
-11. **能力画像是静态配置，历史统计尚未参与路由。** `worker_profiles` 里的 `capabilities`、
-    `max_context_tokens`、`cost_per_1k_tokens` 都是**部署时手写的声明**，DSH 不提供跨会话记忆，插件
-    也无法验证 Worker 的真实能力。v0.7.0 开始把每次 `swarm_complete` 的成功/失败记到
-    `.dsh-tasks/worker_stats.json`，并在 `swarm_status` 中展示，但**这些统计目前只记录、不参与任何
-    拦截**——未来版本才可能据此自动降级不可靠 Worker。在那之前，能力匹配仍信任配置。
+11. **能力画像是静态配置；可靠性只拦 high 任务，且阈值很保守。** `worker_profiles` 里的
+    `capabilities`、`max_context_tokens`、`cost_per_1k_tokens` 都是**部署时手写的声明**，DSH 不提供
+    跨会话记忆，插件也无法验证 Worker 的真实能力。v0.7.0 起把每次 `swarm_complete` 的成功/失败记到
+    `.dsh-tasks/worker_stats.json`；v0.8.0 起该记录只对 `complexity: high` 生效（失败次数 > 3 且
+    失败率 > 50% 才拒），low/medium 永远放行。原因：一两次失败说明不了问题，而把失败简单归因给
+    Worker 可能惩罚的是任务拆解本身；统计仍主要作为证据与性能参考（平均 tokens/耗时），没有自动降级
+    或自动重排班。呼救（`swarm_escalate`）把「做不了」显式交给 Lead，避免 Worker 硬写假代码。
 
 ---
 

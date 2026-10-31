@@ -32,7 +32,9 @@ import {
   setDependencies,
   startTask,
   heartbeatTask,
+  escalateTask,
   reapTask,
+  readLog,
   viewsOf,
   findScopeConflict,
   scopesOverlap,
@@ -745,4 +747,94 @@ test('worker_stats records success and failure counts', async () => {
   assert.equal(stats['worker-b']?.failed_count, 1)
   // Persisted, not in-memory only.
   assert.equal(existsSync(join(dir, TASKS_DIR, 'worker_stats.json')), true)
+})
+
+// ------------------------------------- dynamic reliability and escalation ---
+
+function seedWorkerStats(stats: Record<string, { success_count: number; failed_count: number }>): void {
+  mkdirSync(join(dir, TASKS_DIR), { recursive: true })
+  writeFileSync(join(dir, TASKS_DIR, 'worker_stats.json'), JSON.stringify(stats), 'utf8')
+}
+
+test('an unreliable worker is refused a high-complexity task', async () => {
+  seedWorkerStats({ 'worker-bad': { success_count: 1, failed_count: 4 } })
+  await store.createExclusive(blankTask('t-high', { complexity: 'high' }))
+  const outcome = await claimTask(store, 't-high', 'worker-bad')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'worker_unreliable')
+  assert.match(outcome.message, /high complexity/)
+  assert.match(outcome.message, /failure rate/)
+  // Refusal must not touch state.
+  assert.equal(readRaw('t-high').status, 'pending')
+})
+
+test('the same unreliable worker can still claim a medium task', async () => {
+  seedWorkerStats({ 'worker-bad': { success_count: 1, failed_count: 4 } })
+  await store.createExclusive(blankTask('t-medium', { complexity: 'medium' }))
+  const outcome = await claimTask(store, 't-medium', 'worker-bad')
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})
+
+test('the same unreliable worker can still claim a low task', async () => {
+  seedWorkerStats({ 'worker-bad': { success_count: 1, failed_count: 4 } })
+  await store.createExclusive(blankTask('t-low', { complexity: 'low' }))
+  const outcome = await claimTask(store, 't-low', 'worker-bad')
+  assert.equal(outcome.ok, true)
+})
+
+test('completion metrics accumulate total tokens and time', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  const outcome = await completeTask(store, 't1', 'ok', 'worker-a', undefined, true, {
+    actual_tokens: 1200,
+    duration_ms: 45000,
+  })
+  assert.equal(outcome.ok, true)
+  const stats = await store.readWorkerStats()
+  assert.equal(stats['worker-a']?.total_tokens_consumed, 1200)
+  assert.equal(stats['worker-a']?.total_task_time_ms, 45000)
+  assert.equal(stats['worker-a']?.success_count, 1)
+})
+
+test('escalation blocks the task with the reason and a log line', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+  const outcome = await escalateTask(store, 't1', 'worker-a', 'missing schema.json')
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'escalated')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'blocked')
+  assert.equal(raw.claimed_by, '')
+  assert.equal(raw.failure_reason, 'missing schema.json')
+  const log = await readLog(store, 't1')
+  assert.equal(log.some(line => line.includes('escalated by worker-a: missing schema.json')), true)
+})
+
+test("a non-owner cannot escalate someone else's task", async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  const outcome = await escalateTask(store, 't1', 'worker-b', 'not mine')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'not_owner')
+  assert.equal(readRaw('t1').status, 'claimed')
+  assert.equal(readRaw('t1').claimed_by, 'worker-a')
+})
+
+test('the Lead can force-escalate a task held by a worker', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  const outcome = await escalateTask(store, 't1', 'lead', 'pull it back', true)
+  assert.equal(outcome.ok, true)
+  assert.equal(readRaw('t1').status, 'blocked')
+})
+
+test('escalating a completed task is invalid_state', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'done', 'worker-a')
+  const outcome = await escalateTask(store, 't1', 'worker-a', 'too late')
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'invalid_state')
 })

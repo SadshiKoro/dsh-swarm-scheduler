@@ -143,13 +143,15 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
    需要 premium 级 Worker 时，创建/复用一个能力更强的 teammate，并在部署的 worker_tiers 或 worker_profiles 配置里标成 premium（provider/model 由你按可用性分配，调度层不认识具体模型名）。
 
 3. 给每个 worker 发一条 send_message，消息里只说：
-   "去 swarm_ready 查就绪任务，swarm_claim 自领，swarm_start 开工，做完用 swarm_complete 回报（失败时 success=false），然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。预计耗时超过 staleAssignmentSec 一半的任务，running 期间每隔一段时间调一次 swarm_heartbeat 续约。"
+   "去 swarm_ready 查就绪任务，swarm_claim 自领，swarm_start 开工，做完用 swarm_complete 回报（失败时 success=false，成功时可附带 actual_tokens / duration_ms 供性能统计），然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。预计耗时超过 staleAssignmentSec 一半的任务，running 期间每隔一段时间调一次 swarm_heartbeat 续约。如果你发现自己搞不定（缺关键文件、代码冲突无法解决、需求本身需要重新规划），不要硬写假代码，调用 swarm_escalate 把任务挂起（状态变 blocked，原因写进 failure_reason），让 Lead 重新规划。"
 
 4. 不要指定具体任务给 worker。谁领到哪一个是原子竞争的结果。
 
 5. 用 swarm_status 查看整体进度，向用户汇报。
 
 6. 如果 worker 在执行中撞到依赖冲突（比如两个任务要改同一个文件、或者串行链在规划期没声明），它会通过 send_message 报告你。你收到报告后，用 swarm_set_deps 调整任务的 blocked_by，把冲突的任务串行化。依赖调整只由你做，不要让 worker 自己改。
+   如果收到 worker 的呼救（swarm_escalate），任务会以 blocked 状态出现并在 failure_reason 里写明原因；用 swarm_status 查看，再决定改需求、补依赖或重新拆解。需要从某个 Worker 手里强行收回任务时，用 swarm_escalate(force: true)。
+   注意：失败率过高（失败次数 > 3 且失败率 > 50%）的 Worker 会被拒绝领取 complexity=high 的任务（worker_unreliable），但 low/medium 仍对它开放——这是有意的「练手与翻身」通道。
 
 7. 看到 failed 的任务时，判断是否重试：可以再发一条 send_message 让 worker 重新 swarm_start 该任务（failed 任务可直接 start），或用 swarm_release 把它放回 pending 让别人重领。retry_count 达到 max_retries 后会变成 blocked，此时需要人工介入或调整拆解。
 

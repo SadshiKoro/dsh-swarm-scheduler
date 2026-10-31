@@ -63,12 +63,22 @@ const LOG_SUFFIX = '.log'
 /** Pool-level reliability counters, keyed by worker id. */
 const STATS_FILE = 'worker_stats.json'
 
-/** One worker's attempt counters. Telemetry only: never consulted by routing. */
+/** One worker's attempt counters and accumulated performance totals. */
 export interface WorkerStats {
   success_count: number
   failed_count: number
+  /** Accumulated runtime of successful completions, in milliseconds. */
+  total_task_time_ms: number
+  /** Accumulated tokens reported by successful completions. */
+  total_tokens_consumed: number
 }
 export type WorkerStatsMap = Record<string, WorkerStats>
+
+/** Optional self-report attached to a completion (both fields optional). */
+export interface CompletionMetrics {
+  actual_tokens?: number
+  duration_ms?: number
+}
 /**
  * Task storage over `ctx.fs`, with an explicitly-labelled filesystem fallback.
  *
@@ -414,10 +424,17 @@ export class TaskStore {
       const out: WorkerStatsMap = {}
       for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
         if (typeof value !== 'object' || value === null) continue
-        const entry = value as { success_count?: unknown; failed_count?: unknown }
+        const entry = value as {
+          success_count?: unknown
+          failed_count?: unknown
+          total_task_time_ms?: unknown
+          total_tokens_consumed?: unknown
+        }
         out[id] = {
           success_count: typeof entry.success_count === 'number' ? entry.success_count : 0,
           failed_count: typeof entry.failed_count === 'number' ? entry.failed_count : 0,
+          total_task_time_ms: typeof entry.total_task_time_ms === 'number' ? entry.total_task_time_ms : 0,
+          total_tokens_consumed: typeof entry.total_tokens_consumed === 'number' ? entry.total_tokens_consumed : 0,
         }
       }
       return out
@@ -427,20 +444,28 @@ export class TaskStore {
   }
 
   /**
-   * Increment one worker's success/failure counter.
+   * Increment one worker's counters, and on success accumulate its self-reported
+   * runtime and token consumption.
    *
-   * Best-effort by design: the counters are evidence for a future routing
-   * policy, so a failure to write them must never fail the completion that
-   * triggered the write.
+   * Best-effort by design: the counters are evidence for routing and for a
+   * future performance model, so a failure to write them must never fail the
+   * completion that triggered the write.
    */
-  async recordWorkerOutcome(workerId: string, success: boolean): Promise<void> {
+  async recordWorkerOutcome(workerId: string, success: boolean, metrics?: CompletionMetrics): Promise<void> {
     const id = workerId.trim()
     if (id.length === 0) return
     try {
       const current = await this.readWorkerStats()
-      const entry = current[id] ?? { success_count: 0, failed_count: 0 }
-      if (success) entry.success_count += 1
-      else entry.failed_count += 1
+      const entry = current[id] ?? { success_count: 0, failed_count: 0, total_task_time_ms: 0, total_tokens_consumed: 0 }
+      if (success) {
+        entry.success_count += 1
+        // Performance feedback is only meaningful for work that produced a result;
+        // a failed attempt's "time spent" says more about the blocker than the worker.
+        entry.total_task_time_ms += Math.max(0, metrics?.duration_ms ?? 0)
+        entry.total_tokens_consumed += Math.max(0, metrics?.actual_tokens ?? 0)
+      } else {
+        entry.failed_count += 1
+      }
       current[id] = entry
       mkdirSync(this.dirPath, { recursive: true })
       writeFileSync(join(this.dirPath, STATS_FILE), `${JSON.stringify(current, null, 2)}\n`, 'utf8')
@@ -668,7 +693,8 @@ export function profileRefusal(
   task: TaskRecord,
   agentId: string,
   profile: WorkerProfile,
-): { code: 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive'; message: string } | undefined {
+  stats?: WorkerStats,
+): { code: 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable'; message: string } | undefined {
   if (task.required_capabilities.length > 0) {
     const have = new Set(profile.capabilities)
     const missing = task.required_capabilities.filter(capability => !have.has(capability))
@@ -699,6 +725,20 @@ export function profileRefusal(
       }
     }
   }
+  // Dynamic reliability: only high-complexity work is gated. Low/medium tasks stay
+  // open to a struggling worker on purpose — a demoted worker needs work to recover
+  // its record, and blocking everything would turn one bad run into a dead worker.
+  if (task.complexity === 'high' && stats !== undefined) {
+    const attempts = stats.success_count + stats.failed_count
+    const failureRate = attempts > 0 ? stats.failed_count / attempts : 0
+    if (stats.failed_count > 3 && failureRate > 0.5) {
+      return {
+        code: 'worker_unreliable',
+        message: `${task.task_id} is high complexity and ${agentId} has a ${(failureRate * 100).toFixed(0)}% failure rate `
+          + `(${stats.failed_count}/${attempts} attempts); low and medium tasks remain claimable`,
+      }
+    }
+  }
   return undefined
 }
 
@@ -709,7 +749,7 @@ export async function claimTask(
   clock: Clock = defaultClock,
   workerTiers?: Readonly<Record<string, string>>,
   workerProfiles?: Readonly<Record<string, WorkerProfileInput>>,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -729,15 +769,18 @@ export async function claimTask(
     }
   }
 
-  // Capability routing: tier, then capability tags, then context size — all
-  // hard gates, all before the lock. Cost is deliberately absent from this
-  // list: it is a scheduling preference, not an eligibility rule.
+  // Routing gates: tier, then capability tags, context size, cost budget and —
+  // for high-complexity work only — the worker's own failure record. All run
+  // before the lock; none of them mutate task state.
   const profile = resolveWorkerProfile(claimedBy, workerProfiles, workerTiers)
   const refusal = routingRefusal(found.task, claimedBy, profile.tier)
   if (refusal !== undefined) {
     return { ok: false, code: 'worker_too_weak', message: refusal }
   }
-  const profileMiss = profileRefusal(found.task, claimedBy, profile)
+  // Reliability is only consulted for high-complexity blocks; low/medium never
+  // pay for a bad record (see profileRefusal).
+  const workerStats = found.task.complexity === 'high' ? (await store.readWorkerStats())[claimedBy] : undefined
+  const profileMiss = profileRefusal(found.task, claimedBy, profile, workerStats)
   if (profileMiss !== undefined) {
     return { ok: false, code: profileMiss.code, message: profileMiss.message }
   }
@@ -1042,6 +1085,65 @@ export async function startTask(
 }
 
 /**
+ * Escalation: the holder hands a claimed/running task back to the Lead as
+ * `blocked`, with the reason recorded, instead of waiting for a timeout or
+ * writing work it knows is wrong.
+ *
+ * `blocked` is deliberate rather than `failed`: failed consumes a retry and
+ * reads as "the worker tried and broke it", while escalated means "this needs a
+ * decision" — exactly the state `swarm_status` shows with a reason and the Lead
+ * resolves via re-planning or `swarm_set_deps`.
+ *
+ * Ownership mirrors `swarm_heartbeat`: another agent's claim cannot be escalated
+ * away. `force` is the Lead's override, trusted by convention (DSH exposes no
+ * role check to the pool).
+ */
+export async function escalateTask(
+  store: TaskStore,
+  taskId: string,
+  agentId: string,
+  reason: string,
+  force: boolean = false,
+): Promise<{ ok: boolean; code: 'escalated' | 'not_found' | 'invalid_state' | 'not_owner' | 'io_error'; message: string; degraded?: string }> {
+  const found = await store.readOne(taskId)
+  if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
+  if (found.task.status !== 'claimed' && found.task.status !== 'running') {
+    return {
+      ok: false,
+      code: 'invalid_state',
+      message: `${taskId} is ${found.task.status}; only a claimed or running task can be escalated`,
+    }
+  }
+  if (!force && found.task.claimed_by !== agentId) {
+    return {
+      ok: false,
+      code: 'not_owner',
+      message: `${taskId} is held by ${found.task.claimed_by || 'another agent'}, not ${agentId}; `
+        + 'only the holder or the Lead (force) can escalate it',
+    }
+  }
+  const next: TaskRecord = {
+    ...found.task,
+    status: 'blocked',
+    claimed_by: '',
+    claimed_at: '',
+    failure_reason: reason,
+  }
+  const written = await store.writeExisting(next)
+  if (!written.ok) {
+    return { ok: false, code: 'io_error', message: `escalation not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
+  }
+  removeLock(store.dirPath, taskId)
+  await logTransition(store, taskId, 'escalated', `${agentId}: ${reason}`)
+  return {
+    ok: true,
+    code: 'escalated',
+    message: `${taskId} escalated by ${agentId}: ${reason}`,
+    degraded: written.degraded,
+  }
+}
+
+/**
  * Lease renewal: record that the current holder is still alive.
  *
  * Without this, a worker doing a legitimately long task is indistinguishable
@@ -1099,6 +1201,7 @@ export async function completeTask(
   completedBy: string,
   clock: Clock = defaultClock,
   success: boolean = true,
+  metrics?: CompletionMetrics,
 ): Promise<{ ok: boolean; code: 'completed' | 'failed' | 'blocked' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -1152,10 +1255,10 @@ export async function completeTask(
     return { ok: false, code: 'io_error', message: `${code} not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
   }
   await logTransition(store, taskId, code, completedBy)
-  // Reliability data collection: record the attempt outcome per worker. This
-  // never gates a claim (see DESIGN §12.8) — it exists so a future version can
-  // demote unreliable workers from evidence rather than guesswork.
-  await store.recordWorkerOutcome(completedBy, success)
+  // Reliability and performance telemetry: record the attempt, and on success
+  // accumulate the worker's self-reported tokens/runtime. This feeds the
+  // high-complexity reliability gate (see profileRefusal), never a low/medium one.
+  await store.recordWorkerOutcome(completedBy, success, metrics)
   return { ok: true, code, message: `${taskId} ${code}`, degraded: written.degraded }
 }
 

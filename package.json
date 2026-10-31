@@ -1,7 +1,7 @@
 {
   "name": "dsh-swarm-scheduler-beta",
-  "version": "0.7.0",
-  "description": "Parallel coding scheduler for DSH with six-state lifecycle, priority scheduling, multidimensional worker routing (tier, capabilities, context, cost budget), dependency/hash pre-checks, scope conflict prevention, concurrency ceiling, heartbeat lease renewal, worker reliability stats, and a DSH-independent core.",
+  "version": "0.8.0",
+  "description": "Parallel coding scheduler for DSH with six-state lifecycle, priority scheduling, multidimensional worker routing (tier, capabilities, context, cost budget), dynamic reliability gating, task performance feedback, a worker escalation protocol, dependency/hash pre-checks, scope conflict prevention, concurrency ceiling, heartbeat lease renewal, and a DSH-independent core.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

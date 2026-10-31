@@ -20,6 +20,7 @@ import {
   setDependencies,
   startTask,
   heartbeatTask,
+  escalateTask,
   reapTask,
   readLog,
   computeReady,
@@ -344,7 +345,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'worker_unreliable', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -378,12 +379,15 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       'Record that one task finished, with its outcome. Call it yourself when you did the work, or on a '
       + 'worker\'s behalf when it reported back. The result is the compressed outcome — paths, decisions, '
       + 'evidence. Use success=false to mark a failure (will retry up to max_retries, then become blocked). '
-      + 'A second completion of the same task is refused rather than silently accepted.',
+      + 'On success you may report actual_tokens and duration_ms: they feed the per-worker performance '
+      + 'averages shown by swarm_status. A second completion of the same task is refused rather than silently accepted.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'Task that finished' },
       result: { type: 'string', required: true, description: 'Compressed outcome: files, decisions, evidence' },
       completed_by: { type: 'string', required: true, description: 'Agent id that did the work' },
       success: { type: 'boolean', description: 'Whether the task succeeded (default true). False triggers retry logic.' },
+      actual_tokens: { type: 'number', description: 'Optional self-report: tokens consumed by this task' },
+      duration_ms: { type: 'number', description: 'Optional self-report: wall time spent on this task, in milliseconds' },
     },
     output: {
       schema: {
@@ -408,7 +412,15 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           completed_at: '', degraded: '',
         }
       }
-      const outcome = await completeTask(store, args.task_id, args.result, args.completed_by, undefined, args.success ?? true)
+      const outcome = await completeTask(
+        store,
+        args.task_id,
+        args.result,
+        args.completed_by,
+        undefined,
+        args.success ?? true,
+        { actual_tokens: args.actual_tokens, duration_ms: args.duration_ms },
+      )
       const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
       return {
         ok: outcome.ok,
@@ -536,7 +548,15 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       const stats = await store.readWorkerStats()
       const workerLines = Object.entries(stats)
         .sort(([a], [b]) => a.localeCompare(b))
-        .map(([id, entry]) => `${id}: ${entry.success_count} success, ${entry.failed_count} failed`)
+        .map(([id, entry]) => {
+          let line = `${id}: ${entry.success_count} success, ${entry.failed_count} failed`
+          if (entry.success_count > 0) {
+            const avgTokens = Math.round(entry.total_tokens_consumed / entry.success_count)
+            const avgSeconds = entry.total_task_time_ms / entry.success_count / 1000
+            line += ` | avg ${formatTokens(avgTokens)} tokens, ${formatAge(avgSeconds)}/task`
+          }
+          return line
+        })
       return {
         dir: TASKS_DIR,
         total: views.length,
@@ -718,6 +738,50 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       return {
         ok: outcome.ok,
         reaped: outcome.reaped,
+        degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ---------------------------------------------------------- swarm_escalate ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_escalate',
+    description:
+      'Hand a claimed/running task back to the Lead as blocked, with a reason, instead of waiting for a '
+      + 'timeout or writing code you know is wrong. Use it when you hit something you cannot resolve '
+      + '(missing prerequisite, unresolvable conflict, requirement that needs re-planning). '
+      + 'Only the holder may escalate; the Lead may pass force=true to pull a task away from a worker. '
+      + 'The task becomes blocked, claimed_by is cleared, and failure_reason carries your reason so '
+      + 'swarm_status shows it.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Task to escalate' },
+      agent_id: { type: 'string', required: true, description: 'Who is escalating, e.g. the claiming worker or lead' },
+      reason: { type: 'string', required: true, description: 'Why this task needs the Lead (missing file, conflict, wrong decomposition…)' },
+      force: { type: 'boolean', description: 'Lead-only override: escalate a task held by another agent (default false)' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['escalated', 'not_found', 'invalid_state', 'not_owner', 'io_error'] },
+          message: { type: 'string' },
+          failure_reason: { type: 'string' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      const outcome = await escalateTask(store, args.task_id, args.agent_id, args.reason, args.force ?? false)
+      const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
+      return {
+        ok: outcome.ok,
+        code: outcome.code,
+        message: outcome.message,
+        failure_reason: after.task?.failure_reason ?? '',
         degraded: outcome.degraded ?? store.degraded ?? '',
       }
     },
