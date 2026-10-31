@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { appendFileSync } from 'node:fs'
 import { Config, resolveTasksRoot, type Config as SwarmConfig } from './config.js'
 import { TaskStore, TASKS_DIR, type FsLike } from './core/task-store.js'
+import { autoReap } from './core/auto-reap.js'
 import { registerFileTools } from './tools-file.js'
 
 export const name = 'dsh-swarm-scheduler-beta'
@@ -97,6 +98,9 @@ function debugLog(configured: string, line: string): void {
  * subagent tool entries, so whether that service is provided is unverified.
  */
 export const inject = ['tools', 'fs', 'systemPrompt']
+
+/** Debounce for the idle-triggered watchdog: bursts collapse into one scan. */
+const AUTO_REAP_DEBOUNCE_MS = 2000
 
 /**
  * The dispatch protocol, published as a prompt section.
@@ -206,6 +210,57 @@ export function apply(ctx: Context, config: SwarmConfig) {
     // plugin uses, so `ensureDir` writes a sentinel through the filesystem; a
     // failure is reported on every later result rather than thrown here.
     void store.ensureDir().catch(() => undefined)
+
+    /**
+     * Event-driven watchdog (v0.9.0).
+     *
+     * `agent/status` is a real harness event (emit mode, `idle` ⇄ `running`, no
+     * service injection needed), so the pool can be reaped without a human
+     * remembering `swarm_reap`. Two guards keep that from becoming a hazard:
+     *
+     *   - only `idle` schedules work — `running` is the common transition and
+     *     reaping on it would compete with the agent that is doing the work;
+     *   - the schedule is debounced two seconds, so a burst of idle events from
+     *     several agents collapses into one scan.
+     *
+     * The reap itself runs in the background: this listener must return
+     * immediately, because the harness emits the event on its own critical
+     * path. Every failure is contained and logged, never thrown into the event.
+     * `config.auto_reap: false` restores the manual-only behaviour.
+     */
+    if (config.auto_reap !== false) {
+      let reapTimer: ReturnType<typeof setTimeout> | undefined
+      const runAutoReap = (): void => {
+        void autoReap(store, staleAssignmentSec).then(result => {
+          if (result.reaped.length > 0) {
+            debugLog(config.debugLogPath, `AUTO REAP ${result.reaped.length} task(s); ready=${result.ready}`)
+          }
+        }).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error)
+          debugLog(config.debugLogPath, `AUTO REAP FAILED ${message}`)
+        })
+      }
+      const scheduleAutoReap = (): void => {
+        if (reapTimer !== undefined) clearTimeout(reapTimer)
+        reapTimer = setTimeout(() => {
+          reapTimer = undefined
+          runAutoReap()
+        }, AUTO_REAP_DEBOUNCE_MS)
+      }
+      try {
+        const off = ctx.on('agent/status', (payload: { status?: string }) => {
+          if (payload?.status === 'idle') scheduleAutoReap()
+        })
+        disposers.push(() => {
+          if (reapTimer !== undefined) clearTimeout(reapTimer)
+          off()
+        })
+        debugLog(config.debugLogPath, `AUTO REAP LISTENER OK debounce=${AUTO_REAP_DEBOUNCE_MS}ms stale=${staleAssignmentSec}s`)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        debugLog(config.debugLogPath, `AUTO REAP LISTENER FAILED ${message}`)
+      }
+    }
 
     /**
      * Publish the dispatch protocol.

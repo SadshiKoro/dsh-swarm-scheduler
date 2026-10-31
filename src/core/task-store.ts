@@ -15,7 +15,7 @@
  *   - Nothing here throws on missing state: absent directory, absent lock and
  *     malformed file are all ordinary states this layer reports.
  */
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, isAbsolute } from 'node:path'
 import {
@@ -62,6 +62,8 @@ const KEEP_FILE = '.keep'
 const LOG_SUFFIX = '.log'
 /** Pool-level reliability counters, keyed by worker id. */
 const STATS_FILE = 'worker_stats.json'
+/** Append-only audit trail for the event-driven watchdog. */
+const AUTO_REAP_LOG = 'auto-reap.log'
 
 /** One worker's attempt counters and accumulated performance totals. */
 export interface WorkerStats {
@@ -440,6 +442,21 @@ export class TaskStore {
       return out
     } catch {
       return {}
+    }
+  }
+
+  /**
+   * Append one line to the automatic-watchdog audit trail (`.dsh-tasks/auto-reap.log`).
+   *
+   * Best-effort like the other telemetry: a failed audit line must not fail the
+   * reap that produced it.
+   */
+  appendAutoReapLog(line: string): void {
+    try {
+      mkdirSync(this.dirPath, { recursive: true })
+      appendFileSync(join(this.dirPath, AUTO_REAP_LOG), `${new Date().toISOString()} ${line}\n`, 'utf8')
+    } catch {
+      // Telemetry only; swallow.
     }
   }
 

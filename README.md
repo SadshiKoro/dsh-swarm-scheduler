@@ -25,7 +25,7 @@ shared on-disk pool by atomic claim.
 
 **0.3.0 起**，任务生命周期从两态扩展为六态（pending / claimed / running / completed / failed /
 blocked），支持失败重试、并发上限（`max_workers`）、scope 冲突硬拒绝、看门狗自动回收（`swarm_reap`）
-和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 98 个测试覆盖（含 10-Worker 并发压测）。
+和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 102 个测试覆盖（含 10-Worker 并发压测）。
 
 版本脉络：**v0.2.6** 把 `write_scopes` 从提示升级为 claim 时的硬拒绝 → **v0.2.7** 空 `tasksRoot`
 在激活时直接拒绝（不再静默落到 `process.cwd()`）→ **v0.3.0** 六态生命周期、`max_workers` 上限、
@@ -36,7 +36,8 @@ blocked），支持失败重试、并发上限（`max_workers`）、scope 冲突
 与 50 任务 / 10 scope / 10 Worker 压测 → **v0.6.0** 多维 Worker 画像
 （`worker_profiles`：capabilities / 上下文 / 成本）与能力、上下文硬路由 → **v0.7.0** 成本预算硬拦截
 （`max_cost_tokens`）与 Worker 可靠性统计（`worker_stats.json`，仅记录） → **v0.8.0** 动态可靠性
-拦截（high 任务、失败 >3 且 >50%）、性能反馈（tokens/耗时均值）与呼救协议 `swarm_escalate`。
+拦截（high 任务、失败 >3 且 >50%）、性能反馈（tokens/耗时均值）与呼救协议 `swarm_escalate` →
+**v0.9.0** 事件驱动自动回收（`agent/status` idle → 防抖 2s → `autoReap`，`auto_reap` 默认开）。
 
 ---
 
@@ -328,6 +329,8 @@ pool. Set it in the profile's `cordis.patch.yml`:
 - id: swarm-scheduler
   config:
     max_workers: 3
+    staleAssignmentSec: 600
+    auto_reap: true
     # legacy tier map (still supported)
     worker_tiers:
       worker-cheap: standard
@@ -487,6 +490,29 @@ swarm_escalate(task_id, agent_id, reason)
 `force: true` 从任何 Worker 手里强制收回。与 `failed` 的区别：`failed` 消耗重试并读作「做坏了」，
 `blocked` 读作「等 Lead 决策」，不会被重试逻辑自动重跑。
 
+### 6.8 看门狗：手动与自动（v0.9.0）
+
+死锁回收现在有两条入口，共用**同一套 lease 规则**（`claimed` 取 `claimed_at`/`heartbeat_at` 较晚者，
+`running` 只看 `heartbeat_at`）：
+
+| 方式 | 触发 | 配置 |
+|---|---|---|
+| 手动 `swarm_reap` | Lead 主动调用 | 无 |
+| 自动 | 运行时进入 `idle`（DSH `agent/status` 事件），防抖 **2 秒**后后台执行 | `auto_reap: true`（默认） |
+
+自动回收的行为与手动完全一致：超时的 `claimed` → `pending`（释放锁），超时的 `running` → `failed`
+（`heartbeat timeout`，走重试）。每次自动回收会写一行到 `.dsh-tasks/auto-reap.log`：
+
+```
+Auto-reaped task big-1/small-2 due to lease timeout.
+```
+
+并附带 `Pool has new ready tasks (N).`（当回收后确有就绪任务）。`auto_reap: false` 恢复 v0.8.0 的
+「只有手动调用才回收」行为。`staleAssignmentSec <= 0` 表示不判定，自动看门狗也不会动手。
+
+设计要点（详见 DESIGN §12.10）：只在 `idle` 触发（`running` 是常见转换，回收会和新工作抢资源）；
+防抖把多个 agent 的 idle 合并成一次扫描；回收在后台执行，监听器立即返回，失败只记日志不抛进事件。
+
 ---
 
 ## 7. Two-layer validation on `swarm_set_deps`
@@ -557,13 +583,15 @@ without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
    `dismiss`, `release` or `evict`. `interrupt` only stops the current turn. The roster only grows and
    is cleared when the Lead session ends. The protocol therefore prefers **reusing idle workers** over
    creating new ones.
-5. **Dead workers are recoverable, and since v0.3.0 also reaped.** A worker that disappears would
-   otherwise leave its task `claimed`/`running` forever, and everything blocked by it unreachable.
+5. **Dead workers are recoverable, and reaped both manually and automatically.** A worker that disappears
+   would otherwise leave its task `claimed`/`running` forever, and everything blocked by it unreachable.
    `swarm_release` returns such a task to the pool (deleting its `.lock`), and `swarm_claim` clears a
-   **residual lock** left mid-claim. New in v0.3.0: **`swarm_reap`** scans `claimed`/`running` tasks,
-   reverts stale claims to `pending`, and turns stale runs into `failed` with reason
-   `heartbeat timeout` — which then follows the retry path. Reaping is still **manual** (the Lead calls
-   the tool); the plugin runs no background timer.
+   **residual lock** left mid-claim. **`swarm_reap`** scans `claimed`/`running` tasks, reverts stale claims
+   to `pending`, and turns stale runs into `failed` with reason `heartbeat timeout` — which then follows
+   the retry path. Since v0.9.0 the same scan also runs **automatically**: when the runtime goes `idle`
+   (the `agent/status` event), a two-second debounced background reap runs unless `auto_reap: false`.
+   Every automatic reclaim is appended to `.dsh-tasks/auto-reap.log`. The manual tool remains for
+   on-demand control; the two paths share one lease rule, so they cannot disagree.
 6. **`swarm_set_deps` cannot be enforced at runtime.** It is Lead-only by description and protocol,
    not by a permission check — checking would require `agentTeams.membership`, i.e. reintroducing the
    service route B deliberately removed.
@@ -588,7 +616,7 @@ without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
      here;
    - if DSH promotes that package into a default bundle, or removes it, **the installation steps in
      §4 will change** and this README may be out of date.
-9. **Concurrency correctness has both unit and stress coverage — 98 automated tests.** The suite
+9. **Concurrency correctness has both unit and stress coverage — 102 automated tests.** The suite
    covers the six-state lifecycle (`claim`/`start`/`complete`/`release`/`reap`/`set_dependencies`),
    retry and blocked transitions, the `write_scopes` admission check, residual-lock cleanup,
    readiness/staleness, the `max_workers` ceiling, routing refusals, and concurrent races (same-task

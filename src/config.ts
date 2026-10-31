@@ -26,6 +26,15 @@ export interface Config {
    */
   debugLogPath: string
   /**
+   * Run the watchdog automatically when the runtime goes idle.
+   *
+   * `swarm_reap` remains the manual trigger; this flag decides whether an
+   * `agent/status` = idle event schedules a debounced background reap (default
+   * true). Off means the pool is only reaped when someone calls the tool — the
+   * pre-v0.9.0 behaviour.
+   */
+  auto_reap: boolean
+  /**
    * A `claimed` or `running` task older than this many **seconds** is reported
    * as `STALE` by `swarm_status`. Default 600 (ten minutes).
    *
@@ -93,6 +102,7 @@ export interface Config {
 export const Config: Schema<Config> = Schema.object({
   tasksRoot: Schema.string().default(''),
   debugLogPath: Schema.string().default(''),
+  auto_reap: Schema.boolean().default(true),
   staleAssignmentSec: Schema.number().default(600),
   max_workers: Schema.number().default(3),
   worker_tiers: Schema.dict(Schema.string()).default({}),
