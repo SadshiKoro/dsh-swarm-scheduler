@@ -1,6 +1,6 @@
 {
   "name": "dsh-swarm-scheduler-beta",
-  "version": "0.9.0",
+  "version": "1.1.0",
   "description": "Parallel coding scheduler for DSH with six-state lifecycle, priority scheduling, multidimensional worker routing (tier, capabilities, context, cost budget), dynamic reliability gating, task performance feedback, a worker escalation protocol, event-driven automatic deadlock recovery, dependency/hash pre-checks, scope conflict prevention, concurrency ceiling, heartbeat lease renewal, and a DSH-independent core.",
   "type": "module",
   "main": "lib/index.js",
@@ -26,7 +26,7 @@
     "build": "tsc -p tsconfig.json --noEmit && tsup",
     "prepare": "npm run build",
     "prepublishOnly": "npm test && tsc --noEmit && tsup",
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --test --test-isolation=none \"test/**/*.test.ts\"",
     "test:sandbox": "node --test --test-isolation=none \"test/**/*.test.ts\""
   },
   "peerDependencies": {

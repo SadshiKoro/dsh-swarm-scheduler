@@ -78,6 +78,25 @@ export interface Config {
     max_context_tokens: number
     cost_per_1k_tokens: number
   }>
+  /**
+   * Shell command run as a quality gate after every successful completion.
+   * Empty (the default) means "no gate at all" — the shipping behaviour.
+   *
+   * `swarm_complete` reporting success only says the *worker* believed it
+   * succeeded; it says nothing about whether the workspace still builds, still
+   * type-checks, or still passes its tests. A worker can hand back a task that
+   * is confidently wrong, and the pool has no way to notice. This setting is
+   * that notice: when non-empty, every `success: true` completion runs the
+   * command in the pool root (`tasksRoot`), and a **non-zero exit fails the
+   * task** instead of completing it.
+   *
+   * Why the pool root and not `process.cwd()`: the cwd is the profile directory
+   * in this deployment (see `tasksRoot` above), not the workspace being
+   * scheduled — running `npm test` there would gate on the wrong tree. Why empty
+   * by default: a gate that runs an arbitrary shell command on every completion
+   * is opt-in, so a deployment that never sets it behaves exactly as before.
+   */
+  quality_gate_command: string
 }
 
 /**
@@ -112,6 +131,7 @@ export const Config: Schema<Config> = Schema.object({
     max_context_tokens: Schema.number().default(32000),
     cost_per_1k_tokens: Schema.number().default(0.01),
   })).default({}),
+  quality_gate_command: Schema.string().default(''),
 })
 
 /**

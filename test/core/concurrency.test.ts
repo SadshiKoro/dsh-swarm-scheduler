@@ -11,8 +11,10 @@
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   TASKS_DIR,
   TaskStore,
@@ -180,4 +182,101 @@ test('concurrent claim with residual lock: one clears lock, one fails', async ()
   assert.equal(readRaw('task-lock').status, 'claimed')
   // Lock should be cleared by the successful claim
   assert.equal(existsSync(lockPath('task-lock')), false)
+})
+
+// ================================================================
+// 7. Cross-process: two real OS processes race for one `wx` lock
+// ================================================================
+/**
+ * The lock's whole job is to be atomic **between processes**, but every test
+ * above races two promises inside one Node process. That can still pass if the
+ * lock were only an in-memory guard: the `await` boundaries alone would
+ * serialise the callers.
+ *
+ * This case removes that possibility. Two genuine child processes race to
+ * `openSync(path, 'wx')` the same lock file, so the winner is decided by the
+ * operating system's O_EXCL, not by JavaScript scheduling.
+ *
+ * ## Why the fixture is a separate file and why stdio is ignored
+ *
+ * The DSH sandbox refuses a child process whose stdio is piped
+ * (`spawn EPERM`, errno -4048) — measured with both `fork()` and a piped
+ * `spawn()` on this host. So this case does not read stdout: each child writes
+ * its outcome to its own result file and the parent reads that file afterwards.
+ * `stdio: 'ignore'` is the only mode that works under the sandbox.
+ *
+ * The fixture is written to the OS temp directory rather than committed next to
+ * this test, so it cannot be picked up as a test file by the runner's glob.
+ */
+const RACER_SOURCE = `import { openSync, closeSync, writeFileSync } from 'node:fs'
+const [lockFile, resultFile] = process.argv.slice(2)
+let outcome
+try {
+  const fd = openSync(lockFile, 'wx')
+  closeSync(fd)
+  outcome = { won: true, code: null }
+} catch (error) {
+  outcome = { won: false, code: error.code ?? String(error) }
+}
+writeFileSync(resultFile, JSON.stringify({ ...outcome, pid: process.pid }), 'utf8')
+`
+
+type RaceOutcome = { won: boolean; code: string | null; pid: number }
+
+/** Launch both racers and wait for both to exit; returns their parsed results. */
+async function raceOnce(racerPath: string, lock: string, resultFiles: string[]): Promise<RaceOutcome[]> {
+  const children = resultFiles.map(resultFile =>
+    spawn(process.execPath, [racerPath, lock, resultFile], { stdio: 'ignore' }))
+  await Promise.all(children.map(child => new Promise<void>((resolve, reject) => {
+    child.on('error', reject)
+    child.on('exit', () => resolve())
+  })))
+  return resultFiles.map(file => JSON.parse(readFileSync(file, 'utf8')) as RaceOutcome)
+}
+
+test('cross-process lock: two OS processes race one wx file → exactly one wins, one EEXIST', async () => {
+  const fixtures = mkdtempSync(join(tmpdir(), 'swarm-lock-racer-'))
+  try {
+    const racer = join(fixtures, 'lock-racer.mjs')
+    writeFileSync(racer, RACER_SOURCE, 'utf8')
+
+    const ROUNDS = 5
+    for (let round = 0; round < ROUNDS; round += 1) {
+      const lock = join(fixtures, `race-${round}.lock`)
+      const results = await raceOnce(racer, lock, [
+        join(fixtures, `race-${round}-a.json`),
+        join(fixtures, `race-${round}-b.json`),
+      ])
+
+      const winners = results.filter(result => result.won)
+      const losers = results.filter(result => !result.won)
+
+      const detail = `round ${round + 1}/${ROUNDS}: ${JSON.stringify(results)}`
+      // Exactly one winner: two winners would mean O_EXCL was not honoured, and
+      // two losers would mean the lock file was already there (a broken fixture,
+      // not a real race).
+      assert.equal(winners.length, 1, `exactly one process must win the wx race. ${detail}`)
+      assert.equal(losers.length, 1, `exactly one process must lose the wx race. ${detail}`)
+      assert.equal(losers[0]?.code, 'EEXIST', `the loser must fail with EEXIST, not another code. ${detail}`)
+      // The two racers are genuinely distinct OS processes.
+      assert.notEqual(results[0]?.pid, results[1]?.pid, `the racers must be separate processes. ${detail}`)
+    }
+
+    // A sixth round proves the lock is really on disk: a third process that
+    // races an already-held lock must lose, and cannot be a coincidence of the
+    // first two finishing before it started.
+    const heldLock = join(fixtures, 'held.lock')
+    const held = await raceOnce(racer, heldLock, [
+      join(fixtures, 'held-a.json'),
+      join(fixtures, 'held-b.json'),
+    ])
+    const holder = held.find(result => result.won)
+    assert.notEqual(holder, undefined, 'one process must create the lock')
+    assert.equal(existsSync(heldLock), true, 'the winning process must have created the lock file on disk')
+    const lateComer = await raceOnce(racer, heldLock, [join(fixtures, 'held-c.json')])
+    assert.equal(lateComer[0]?.won, false, 'a later process must not be able to take an existing lock')
+    assert.equal(lateComer[0]?.code, 'EEXIST', 'the later process must receive EEXIST')
+  } finally {
+    rmSync(fixtures, { recursive: true, force: true })
+  }
 })

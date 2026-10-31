@@ -79,6 +79,14 @@ export interface FileToolDeps {
   worker_tiers: Record<string, string>
   /** agent id → capability picture (tier, capabilities, context, cost). */
   worker_profiles: Record<string, WorkerProfileInput>
+  /**
+   * Shell command run as a quality gate after every successful completion.
+   *
+   * Empty (the default) means "no gate at all". Passed straight through to
+   * `completeTask`; the adapter never runs the command itself, so the "a claim
+   * of success is checked, not trusted" rule lives in exactly one place.
+   */
+  quality_gate_command: string
   /** Collects every disposer from this registration, in one ownership list. */
   disposers: Array<() => void>
 }
@@ -102,7 +110,7 @@ function viewRow(view: TaskView): Record<string, unknown> {
   }
 }
 
-export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, worker_tiers, worker_profiles, disposers }: FileToolDeps): void {
+export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, worker_tiers, worker_profiles, quality_gate_command, disposers }: FileToolDeps): void {
   // ------------------------------------------------------------- swarm_plan ---
   disposers.push(ctx.tools.register(defineTool({
     name: 'swarm_plan',
@@ -380,7 +388,10 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       + 'worker\'s behalf when it reported back. The result is the compressed outcome — paths, decisions, '
       + 'evidence. Use success=false to mark a failure (will retry up to max_retries, then become blocked). '
       + 'On success you may report actual_tokens and duration_ms: they feed the per-worker performance '
-      + 'averages shown by swarm_status. A second completion of the same task is refused rather than silently accepted.',
+      + 'averages shown by swarm_status. A second completion of the same task is refused rather than silently accepted. '
+      + 'If this deployment configured `quality_gate_command`, every success claim runs that command first: a '
+      + 'non-zero exit turns the completion into a failure (retry_count + 1), so `success: true` is a claim, '
+      + 'not a decision.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'Task that finished' },
       result: { type: 'string', required: true, description: 'Compressed outcome: files, decisions, evidence' },
@@ -412,6 +423,12 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           completed_at: '', degraded: '',
         }
       }
+      // Quality gate: when this deployment configured one, a claim of success is
+      // checked before it is believed. The command is only *passed through*; the
+      // decision and the failure semantics live in `completeTask`. An empty or
+      // whitespace-only command is omitted entirely rather than sent as `''`, so
+      // "not configured" is a distinct fact from "configured as empty".
+      const gateCommand = quality_gate_command.trim()
       const outcome = await completeTask(
         store,
         args.task_id,
@@ -420,12 +437,24 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         undefined,
         args.success ?? true,
         { actual_tokens: args.actual_tokens, duration_ms: args.duration_ms },
+        gateCommand.length > 0
+          ? { qualityGate: { command: gateCommand }, cwd: store.workspacePath }
+          : undefined,
       )
+      // A gate can turn a claimed success into a failure. Say so explicitly, so a
+      // worker reading `failed` does not conclude its result was ignored: it was
+      // submitted, and the workspace rejected it.
+      const gateDowngraded = (args.success ?? true) && outcome.code !== 'completed'
+      const note = gateDowngraded
+        ? `Your success claim was not accepted: the deployment's quality gate command `
+          + `(\`${gateCommand}\`) did not pass. The task is recorded as ${outcome.code}, not completed. `
+          + `Fix the workspace so the gate command exits 0, then retry.`
+        : ''
       const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
       return {
         ok: outcome.ok,
         code: outcome.code,
-        message: outcome.message,
+        message: note.length > 0 ? `${outcome.message} | ${note}` : outcome.message,
         completed_at: after.task?.completed_at ?? '',
         degraded: outcome.degraded ?? store.degraded ?? '',
       }
@@ -550,10 +579,19 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([id, entry]) => {
           let line = `${id}: ${entry.success_count} success, ${entry.failed_count} failed`
-          if (entry.success_count > 0) {
-            const avgTokens = Math.round(entry.total_tokens_consumed / entry.success_count)
-            const avgSeconds = entry.total_task_time_ms / entry.success_count / 1000
-            line += ` | avg ${formatTokens(avgTokens)} tokens, ${formatAge(avgSeconds)}/task`
+          // Averages divide by the number of *samples*, not by success_count: a
+          // completion that reported no metrics is not a 0-token completion, and
+          // showing it as one would invent performance data out of silence.
+          // No samples means the honest answer is "n/a", never "0".
+          const tokenSamples = entry.tokens_sample_count ?? 0
+          const timeSamples = entry.time_sample_count ?? 0
+          if (tokenSamples > 0 || timeSamples > 0) {
+            const avgTokens = tokenSamples > 0
+              ? `${formatTokens(Math.round(entry.total_tokens_consumed / tokenSamples))} tokens`
+              : 'n/a tokens'
+            const avgSeconds = timeSamples > 0 ? entry.total_task_time_ms / timeSamples / 1000 : Number.NaN
+            const avgTime = timeSamples > 0 ? `${formatAge(avgSeconds)}/task` : 'n/a/任务'
+            line += ` | avg ${avgTokens}, ${avgTime}`
           }
           return line
         })
@@ -701,7 +739,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
     description:
       'Watchdog: scan claimed/running tasks and recover those past the staleAssignmentSec threshold. '
       + '- claimed (not running) past threshold: revert to pending, delete lock. '
-      + '- running past threshold: mark failed (heartbeat timeout), increment retry_count; if retry_count >= max_retries, mark blocked. '
+      + '- running past threshold but before 1.5x: report "stale" only — failure_reason flags the silence, status stays running, retry_count and completed_at untouched. '
+      + '- running past 1.5x threshold without a heartbeat: mark failed (heartbeat timeout), increment retry_count; if retry_count >= max_retries, mark blocked. '
       + 'Returns list of reaped tasks and their outcomes. Call periodically from the Lead.',
     parameters: {},
     output: {
@@ -717,7 +756,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
               additionalProperties: false,
               properties: {
                 task_id: { type: 'string' },
-                action: { type: 'string', enum: ['released', 'failed', 'blocked'] },
+                action: { type: 'string', enum: ['released', 'failed', 'blocked', 'stale'] },
                 message: { type: 'string' },
               },
             },

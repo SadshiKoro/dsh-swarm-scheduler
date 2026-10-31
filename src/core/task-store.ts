@@ -16,6 +16,7 @@
  *     malformed file are all ordinary states this layer reports.
  */
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { execSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { join, isAbsolute } from 'node:path'
 import {
@@ -73,6 +74,20 @@ export interface WorkerStats {
   total_task_time_ms: number
   /** Accumulated tokens reported by successful completions. */
   total_tokens_consumed: number
+  /**
+   * Successful completions that actually reported `actual_tokens`.
+   *
+   * The divisor for the token average, and the reason the totals above can no
+   * longer be divided by `success_count`. A completion without the metric
+   * contributes nothing — not a zero — so counting it as a sample would drag
+   * the average toward 0 and make an honest worker look token-free.
+   *
+   * Optional so a `worker_stats.json` written by an older version still reads:
+   * a missing count means "no samples were tracked", which is 0 here.
+   */
+  tokens_sample_count?: number
+  /** Successful completions that actually reported `duration_ms`; see above. */
+  time_sample_count?: number
 }
 export type WorkerStatsMap = Record<string, WorkerStats>
 
@@ -179,6 +194,17 @@ export class TaskStore {
 
   get dirPath(): string {
     return join(this.#cwd, TASKS_DIR)
+  }
+
+  /**
+   * The workspace the pool lives in — the directory that *contains* the pool.
+   *
+   * This is what a quality gate should run in: `dirPath` is `<workspace>/.dsh-tasks`,
+   * a bookkeeping folder with no `package.json` in it, so running `npm test`
+   * there would fail for a reason that has nothing to do with the work.
+   */
+  get workspacePath(): string {
+    return this.#cwd
   }
 
   /**
@@ -431,12 +457,18 @@ export class TaskStore {
           failed_count?: unknown
           total_task_time_ms?: unknown
           total_tokens_consumed?: unknown
+          tokens_sample_count?: unknown
+          time_sample_count?: unknown
         }
         out[id] = {
           success_count: typeof entry.success_count === 'number' ? entry.success_count : 0,
           failed_count: typeof entry.failed_count === 'number' ? entry.failed_count : 0,
           total_task_time_ms: typeof entry.total_task_time_ms === 'number' ? entry.total_task_time_ms : 0,
           total_tokens_consumed: typeof entry.total_tokens_consumed === 'number' ? entry.total_tokens_consumed : 0,
+          // Absent in files written before the sample counters existed; 0 is the
+          // honest reading there (no metric was ever tracked).
+          tokens_sample_count: typeof entry.tokens_sample_count === 'number' ? entry.tokens_sample_count : 0,
+          time_sample_count: typeof entry.time_sample_count === 'number' ? entry.time_sample_count : 0,
         }
       }
       return out
@@ -473,13 +505,33 @@ export class TaskStore {
     if (id.length === 0) return
     try {
       const current = await this.readWorkerStats()
-      const entry = current[id] ?? { success_count: 0, failed_count: 0, total_task_time_ms: 0, total_tokens_consumed: 0 }
+      const entry = current[id] ?? {
+        success_count: 0,
+        failed_count: 0,
+        total_task_time_ms: 0,
+        total_tokens_consumed: 0,
+        tokens_sample_count: 0,
+        time_sample_count: 0,
+      }
       if (success) {
         entry.success_count += 1
         // Performance feedback is only meaningful for work that produced a result;
         // a failed attempt's "time spent" says more about the blocker than the worker.
-        entry.total_task_time_ms += Math.max(0, metrics?.duration_ms ?? 0)
-        entry.total_tokens_consumed += Math.max(0, metrics?.actual_tokens ?? 0)
+        //
+        // An absent metric is *not* a zero measurement: a worker that reports
+        // nothing at all must leave both the total and the sample count alone,
+        // otherwise the average silently counts it as 0 tokens / 0 seconds.
+        // Only the paired (total, count) update keeps avg = total / count honest.
+        const tokens = metrics?.actual_tokens
+        if (typeof tokens === 'number' && Number.isFinite(tokens) && tokens >= 0) {
+          entry.total_tokens_consumed += tokens
+          entry.tokens_sample_count = (entry.tokens_sample_count ?? 0) + 1
+        }
+        const duration = metrics?.duration_ms
+        if (typeof duration === 'number' && Number.isFinite(duration) && duration >= 0) {
+          entry.total_task_time_ms += duration
+          entry.time_sample_count = (entry.time_sample_count ?? 0) + 1
+        }
       } else {
         entry.failed_count += 1
       }
@@ -619,6 +671,16 @@ export interface WorkerProfile {
   capabilities: string[]
   max_context_tokens: number
   cost_per_1k_tokens: number
+  /**
+   * True when this profile is the fallback, not a declaration.
+   *
+   * The flag exists so a refusal can say *why* the worker was turned away: an
+   * empty `capabilities` list means "the deployment declared no capabilities"
+   * only if someone declared the worker at all. Without the flag the two cases
+   * — "declared empty" and "never declared" — produce the same confusing
+   * message, which is exactly the bug this marks.
+   */
+  isDefault?: boolean
 }
 
 export const DEFAULT_WORKER_PROFILE: WorkerProfile = {
@@ -644,6 +706,11 @@ export interface WorkerProfileInput {
  * taken from the legacy map when no profile exists, so the two surfaces cannot
  * disagree for the same id. Unknown ids degrade to the default profile — a
  * capability declaration that cannot be read must not become a capability.
+ *
+ * The fallback is marked `isDefault: true` so callers can tell "nothing was
+ * declared for this worker" apart from "declarations exist and say nothing".
+ * A hit in either table is never marked default, including a legacy
+ * `worker_tiers` hit, which still comes from a real declaration.
  */
 export function resolveWorkerProfile(
   agentId: string,
@@ -661,10 +728,11 @@ export function resolveWorkerProfile(
       cost_per_1k_tokens: typeof raw.cost_per_1k_tokens === 'number' && raw.cost_per_1k_tokens >= 0
         ? raw.cost_per_1k_tokens
         : DEFAULT_WORKER_PROFILE.cost_per_1k_tokens,
+      isDefault: false,
     }
   }
-  if (tiers?.[agentId] === 'premium') return { ...DEFAULT_WORKER_PROFILE, tier: 'premium' }
-  return { ...DEFAULT_WORKER_PROFILE }
+  if (tiers?.[agentId] === 'premium') return { ...DEFAULT_WORKER_PROFILE, tier: 'premium', isDefault: false }
+  return { ...DEFAULT_WORKER_PROFILE, isDefault: true }
 }
 
 /**
@@ -716,6 +784,18 @@ export function profileRefusal(
     const have = new Set(profile.capabilities)
     const missing = task.required_capabilities.filter(capability => !have.has(capability))
     if (missing.length > 0) {
+      // A worker nobody declared has no capabilities *because it was never
+      // described*, which is a deployment gap, not a missing skill. Say so
+      // first: "declared: []" reads like the worker claimed to know nothing.
+      if (profile.isDefault === true) {
+        return {
+          code: 'worker_lacks_capability',
+          message: `${task.task_id} requires capabilities [${task.required_capabilities.join(', ')}]; `
+            + `Worker ${agentId} 不在 worker_profiles 中，且无默认 capabilities，无法领取能力任务。`
+            + ` (required: [${task.required_capabilities.join(', ')}]; `
+            + `add an entry under worker_profiles, or give the worker_profiles default an explicit capabilities list)`,
+        }
+      }
       return {
         code: 'worker_lacks_capability',
         message: `${task.task_id} requires capabilities [${task.required_capabilities.join(', ')}]; `
@@ -1191,7 +1271,14 @@ export async function heartbeatTask(
     }
   }
   const stamp = clock().toISOString()
-  const written = await store.writeExisting({ ...found.task, heartbeat_at: stamp })
+  const written = await store.writeExisting({
+    ...found.task,
+    heartbeat_at: stamp,
+    // Liveness proof retires the watchdog's warning: a task whose worker just
+    // checked in is no longer suspected, and leaving the flag would make it
+    // permanent — nothing else clears `failure_reason` while the task runs.
+    failure_reason: found.task.failure_reason === STALE_WARNING_REASON ? '' : found.task.failure_reason,
+  })
   if (!written.ok) {
     return { ok: false, code: 'io_error', message: `heartbeat not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
   }
@@ -1206,10 +1293,78 @@ export async function heartbeatTask(
 }
 
 /**
- * Mark a task completed or failed, with retry logic.
+ * How one quality-gate command is executed.
  *
+ * Returns `{ ok, output }` rather than throwing: a non-zero exit is an ordinary
+ * gate failure, and the caller only cares whether it passed. `output` is the
+ * merged stdout+stderr, used verbatim in `failure_reason` (truncated).
+ */
+export type QualityGateRunner = (command: string, cwd: string) => { ok: boolean; output: string }
+
+/** Cap on the gate output quoted into `failure_reason` (see `completeTask`). */
+export const QUALITY_GATE_OUTPUT_LIMIT = 500
+
+function truncateGateOutput(output: string): string {
+  const text = output.trim()
+  return text.length <= QUALITY_GATE_OUTPUT_LIMIT ? text : `${text.slice(0, QUALITY_GATE_OUTPUT_LIMIT)}…`
+}
+
+/**
+ * The shipping runner: `execSync`, with stdout and stderr merged.
+ *
+ * Synchronous on purpose — the gate must finish before the completion is
+ * written, and an async seam would let two completions race around one check.
+ * A throw is a failure, not a crash: `execSync` throws on both a non-zero exit
+ * and a spawn error, and the pool must record either as "the gate did not pass"
+ * rather than leave the task `running` forever.
+ */
+export const qualityGateRunner: QualityGateRunner = (command: string, cwd: string) => {
+  try {
+    const stdout = execSync(command, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 300_000,
+    })
+    return { ok: true, output: String(stdout) }
+  } catch (caught) {
+    const error = caught as { stdout?: unknown; stderr?: unknown; message?: unknown }
+    const stdout = typeof error.stdout === 'string' ? error.stdout : ''
+    const stderr = typeof error.stderr === 'string' ? error.stderr : ''
+    const detail = `${stdout}\n${stderr}`.trim()
+    return {
+      ok: false,
+      output: detail.length > 0 ? detail : (typeof error.message === 'string' ? error.message : 'quality gate command failed'),
+    }
+  }
+}
+
+/** Optional behaviour for `completeTask`; appended so existing callers compile. */
+export interface CompleteTaskOptions {
+  qualityGate?: {
+    /** The command to run; empty means "no gate" (handled by the caller too). */
+    command: string
+    /** Defaults to `qualityGateRunner` (`execSync`). Tests inject a fake. */
+    runner?: QualityGateRunner
+  }
+  /** Working directory for the gate; defaults to the workspace (the pool's parent). */
+  cwd?: string
+}
+
+/**
+ * Mark a task completed or failed, with retry logic.
  * `success=true` (default): claimed/running -> completed
  * `success=false`: claimed/running -> failed, retry_count + 1; if retry_count >= max_retries -> blocked
+ *
+ * `options.qualityGate` adds the v1.1.0 check between "the worker says it is
+ * done" and "the pool agrees": a shell command run after a successful
+ * completion, whose non-zero exit turns the completion into a failure (with the
+ * same retry semantics as `success=false`). It only ever *downgrades* an outcome
+ * — a failed completion never runs the gate, and a gate can never rescue one.
+ *
+ * `options.qualityGate.runner` is the seam that keeps this module host-free and
+ * testable: production passes nothing and gets `execSync`, tests pass a fake and
+ * never spawn a process. See `qualityGateRunner` for the default.
  */
 export async function completeTask(
   store: TaskStore,
@@ -1219,6 +1374,7 @@ export async function completeTask(
   clock: Clock = defaultClock,
   success: boolean = true,
   metrics?: CompletionMetrics,
+  options?: CompleteTaskOptions,
 ): Promise<{ ok: boolean; code: 'completed' | 'failed' | 'blocked' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -1233,9 +1389,31 @@ export async function completeTask(
     }
   }
   const stamp = clock().toISOString()
+
+  // --- quality gate -------------------------------------------------------
+  // Judged before any state is written, so a gate failure takes the ordinary
+  // failure path (one code path for retry accounting) instead of a second one.
+  let gateFailure: string | undefined
+  const gate = options?.qualityGate
+  if (success && gate !== undefined && gate.command.trim().length > 0) {
+    const runner = gate.runner ?? qualityGateRunner
+    // The workspace, not `store.dirPath`: the pool directory is `<workspace>/.dsh-tasks`,
+    // which contains the task files but no project, so a gate run there would
+    // check a directory with no source and fail for the wrong reason. Not
+    // `process.cwd()` either — in this deployment that is the profile directory.
+    const cwd = options?.cwd ?? store.workspacePath
+    const outcome = runner(gate.command, cwd)
+    if (!outcome.ok) {
+      gateFailure = truncateGateOutput(outcome.output)
+    }
+  }
+  // A gate failure is a failure with a reason: same retry path as below.
+  const effectiveSuccess = success && gateFailure === undefined
+
   let next: TaskRecord
   let code: 'completed' | 'failed' | 'blocked'
-  if (success) {
+  let message: string
+  if (effectiveSuccess) {
     next = {
       ...found.task,
       status: 'completed',
@@ -1243,7 +1421,14 @@ export async function completeTask(
       result,
     }
     code = 'completed'
+    message = `${taskId} ${code}`
+    if (gate !== undefined && gate.command.trim().length > 0) {
+      message += ' (quality gate passed)'
+    }
   } else {
+    const reason = gateFailure !== undefined
+      ? `Quality gate failed: ${gateFailure}`
+      : (result || 'failed without reason')
     const newRetryCount = found.task.retry_count + 1
     if (newRetryCount >= found.task.max_retries) {
       next = {
@@ -1252,7 +1437,7 @@ export async function completeTask(
         completed_at: stamp,
         result,
         retry_count: newRetryCount,
-        failure_reason: result || 'failed without reason',
+        failure_reason: reason,
       }
       code = 'blocked'
     } else {
@@ -1262,39 +1447,82 @@ export async function completeTask(
         completed_at: stamp,
         result,
         retry_count: newRetryCount,
-        failure_reason: result || 'failed without reason',
+        failure_reason: reason,
       }
       code = 'failed'
     }
+    message = gateFailure !== undefined
+      ? `${taskId} ${code} — quality gate failed (command exited non-zero)`
+      : `${taskId} ${code}`
   }
   const written = await store.writeExisting(next)
   if (!written.ok) {
     return { ok: false, code: 'io_error', message: `${code} not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
   }
-  await logTransition(store, taskId, code, completedBy)
+  await logTransition(store, taskId, gateFailure !== undefined ? `${code}:quality-gate` : code, completedBy)
   // Reliability and performance telemetry: record the attempt, and on success
   // accumulate the worker's self-reported tokens/runtime. This feeds the
   // high-complexity reliability gate (see profileRefusal), never a low/medium one.
-  await store.recordWorkerOutcome(completedBy, success, metrics)
-  return { ok: true, code, message: `${taskId} ${code}`, degraded: written.degraded }
+  //
+  // A gate failure counts as a failed attempt, because that is what it is: the
+  // work did not survive the check, and letting it feed the success counters
+  // would make a worker that ships broken code look reliable.
+  await store.recordWorkerOutcome(completedBy, effectiveSuccess, effectiveSuccess ? metrics : undefined)
+  return { ok: true, code, message, degraded: written.degraded }
+}
+
+/** The reason a running task carries while it is only *warned* about, never reaped. */
+export const STALE_WARNING_REASON = 'heartbeat stale (grace period)'
+
+/**
+ * One reaper outcome. `stale` is a **warning, not a state**: it is reported here
+ * so the Lead can see it, but the task keeps `status: 'running'` and the six-state
+ * enum stays intact (see `reapTask`).
+ */
+export type ReapAction = 'released' | 'failed' | 'blocked' | 'stale'
+
+export interface ReapedTask {
+  task_id: string
+  action: ReapAction
+  message: string
 }
 
 /**
  * Reap stale tasks: scan claimed/running tasks and recover those past the threshold.
  *
- * - claimed (not running) past threshold: revert to pending, delete lock
- * - running past threshold: mark failed (heartbeat timeout), increment retry_count, retry or block
+ * The threshold has **two phases** for a running task, because the two kinds of
+ * silence are not equally conclusive:
  *
- * Returns list of reaped task ids and their outcomes.
+ *   - a **claimed** task past the threshold never started, so its lease is
+ *     simply gone: revert to pending, delete the lock;
+ *   - a **running** task past the threshold but before `1.5 ×` it is only
+ *     **flagged STALE** — `failure_reason` becomes `heartbeat stale (grace
+ *     period)`, while `status` stays `running`, `retry_count` stays put and
+ *     `completed_at` is not stamped. A worker doing a long step without a
+ *     heartbeat is *suspected*, not dead, and killing it costs the whole
+ *     attempt;
+ *   - a running task past `1.5 ×` has had a full extra half-window to renew and
+ *     did not, so the original logic runs: failed (retry_count + 1), or blocked
+ *     once retries are exhausted.
+ *
+ * The flag deliberately does not introduce a seventh state: `'stale'` would have
+ * to join `TaskStatus`, and `computeReady`/`viewOf`/every existing test reasons
+ * over the six-state enum. `failure_reason` already means "why this record is
+ * not clean", so the warning rides on it and the state machine is untouched.
+ *
+ * Returns the reaped/flagged tasks and their outcomes.
  */
 export async function reapTask(
   store: TaskStore,
   staleAfterSec: number,
   clock: Clock = defaultClock,
-): Promise<{ ok: boolean; reaped: Array<{ task_id: string; action: 'released' | 'failed' | 'blocked'; message: string }>; degraded?: string }> {
+): Promise<{ ok: boolean; reaped: ReapedTask[]; degraded?: string }> {
   const all = await store.readAll()
-  const reaped: Array<{ task_id: string; action: 'released' | 'failed' | 'blocked'; message: string }> = []
+  const reaped: ReapedTask[] = []
   let degraded: string | undefined
+  // Grace deadline: staleAfterSec, then another half window. Computed once so
+  // every task in one round is judged against the same line.
+  const hardReapAfterSec = staleAfterSec + staleAfterSec / 2
 
   for (const task of all.tasks) {
     if (task.status !== 'claimed' && task.status !== 'running') continue
@@ -1329,8 +1557,33 @@ export async function reapTask(
       removeLock(store.dirPath, task.task_id)
       await logTransition(store, task.task_id, 'reap:released', 'reaper')
       reaped.push({ task_id: task.task_id, action: 'released', message: `${task.task_id} reverted to pending (stale claim)` })
+    } else if (task.status === 'running' && ageSec <= hardReapAfterSec) {
+      // Phase 1: grace period. Warn only — every field that would end the
+      // attempt (status, retry_count, completed_at) is copied through unchanged.
+      // Re-writing an already-flagged task is skipped so the audit log records
+      // the warning once, not once per sweep.
+      if (task.failure_reason === STALE_WARNING_REASON) continue
+      const next: TaskRecord = {
+        ...task,
+        status: 'running',
+        completed_at: task.completed_at,
+        retry_count: task.retry_count,
+        failure_reason: STALE_WARNING_REASON,
+      }
+      const written = await store.writeExisting(next)
+      if (!written.ok) {
+        degraded = written.degraded
+        continue
+      }
+      await logTransition(store, task.task_id, 'reap:stale', 'reaper')
+      reaped.push({
+        task_id: task.task_id,
+        action: 'stale',
+        message: `${task.task_id} flagged STALE (no heartbeat for ${ageSec}s, grace until ${Math.ceil(hardReapAfterSec)}s); not reaped`,
+      })
     } else if (task.status === 'running') {
-      // Mark failed (heartbeat timeout), increment retry
+      // Phase 2: the grace period expired without a heartbeat. Original logic:
+      // mark failed (heartbeat timeout), increment retry, block once exhausted.
       const newRetryCount = task.retry_count + 1
       const stamp = clock().toISOString()
       let action: 'failed' | 'blocked'
@@ -1362,7 +1615,7 @@ export async function reapTask(
         continue
       }
       await logTransition(store, task.task_id, `reap:${action}`, 'reaper')
-      reaped.push({ task_id: task.task_id, action, message: `${task.task_id} marked ${action} (heartbeat timeout, retry ${newRetryCount}/${task.max_retries})` })
+      reaped.push({ task_id: task.task_id, action, message: `${task.task_id} marked ${action} (heartbeat timeout after grace period, retry ${newRetryCount}/${task.max_retries})` })
     }
   }
 

@@ -838,3 +838,271 @@ test('escalating a completed task is invalid_state', async () => {
   assert.equal(outcome.ok, false)
   assert.equal(outcome.code, 'invalid_state')
 })
+
+// ------------------------------------------- P5: absent metrics are not 0 ---
+
+/**
+ * The bug these cover: an average taken as `total / success_count` counts a
+ * completion that reported nothing as a 0-token, 0-second completion. The
+ * divisor has to be the number of *samples*, so totals and sample counters are
+ * updated together and only when a valid number arrived.
+ */
+
+test('a completion without metrics adds no samples and no totals', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  const outcome = await completeTask(store, 't1', 'ok', 'worker-a', undefined, true)
+  assert.equal(outcome.ok, true)
+
+  const stats = await store.readWorkerStats()
+  assert.equal(stats['worker-a']?.success_count, 1, 'the attempt still counts as a success')
+  assert.equal(stats['worker-a']?.total_tokens_consumed, 0)
+  assert.equal(stats['worker-a']?.total_task_time_ms, 0)
+  // The counters are the point: 0 samples, not "1 sample of 0".
+  assert.equal(stats['worker-a']?.tokens_sample_count, 0)
+  assert.equal(stats['worker-a']?.time_sample_count, 0)
+})
+
+test('a metric-free success followed by a measured one averages only the measured one', async () => {
+  // Silence first: this must not be folded in as a 0.
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'ok', 'worker-a', undefined, true)
+
+  // Then a real measurement.
+  await store.createExclusive(blankTask('t2'))
+  await claimTask(store, 't2', 'worker-a')
+  const outcome = await completeTask(store, 't2', 'ok', 'worker-a', undefined, true, {
+    actual_tokens: 1200,
+    duration_ms: 45000,
+  })
+  assert.equal(outcome.ok, true)
+
+  const entry = (await store.readWorkerStats())['worker-a']
+  assert.ok(entry)
+  assert.equal(entry.success_count, 2)
+  // Dividing by success_count would give 600 tokens / 22.5s — exactly the
+  // "fake zero" the fix removes.
+  assert.equal(entry.tokens_sample_count, 1)
+  assert.equal(entry.time_sample_count, 1)
+  assert.equal(Math.round(entry.total_tokens_consumed / (entry.tokens_sample_count ?? 1)), 1200)
+  assert.equal(entry.total_task_time_ms / (entry.time_sample_count ?? 1), 45000)
+})
+
+test('the two metrics are sampled independently', async () => {
+  // Tokens only: the time average must stay unpopulated rather than read 0.
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'ok', 'worker-a', undefined, true, { actual_tokens: 800 })
+
+  const entry = (await store.readWorkerStats())['worker-a']
+  assert.ok(entry)
+  assert.equal(entry.tokens_sample_count, 1)
+  assert.equal(entry.total_tokens_consumed, 800)
+  assert.equal(entry.time_sample_count, 0)
+  assert.equal(entry.total_task_time_ms, 0)
+})
+
+test('invalid metrics are ignored instead of being clamped to 0', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'ok', 'worker-a', undefined, true, {
+    actual_tokens: -5,
+    duration_ms: Number.NaN,
+  })
+
+  const entry = (await store.readWorkerStats())['worker-a']
+  assert.ok(entry)
+  assert.equal(entry.success_count, 1)
+  assert.equal(entry.total_tokens_consumed, 0)
+  assert.equal(entry.total_task_time_ms, 0)
+  assert.equal(entry.tokens_sample_count, 0)
+  assert.equal(entry.time_sample_count, 0)
+})
+
+test('a legacy worker_stats.json without the sample counters reads as zero samples', async () => {
+  // Written before P5: totals exist but no counts. The reader must not treat
+  // the missing field as a crash, and must not infer samples from success_count.
+  seedWorkerStats({ 'worker-legacy': { success_count: 3, failed_count: 1 } })
+  const entry = (await store.readWorkerStats())['worker-legacy']
+  assert.ok(entry)
+  assert.equal(entry.success_count, 3)
+  assert.equal(entry.tokens_sample_count, 0)
+  assert.equal(entry.time_sample_count, 0)
+})
+
+// ------------------------------------- v1.1.0 quality gate (fake runner) ---
+
+/**
+ * The quality gate is exercised through its **injected runner**, never by
+ * spawning a shell: the core takes `{ command, runner }`, so every case below
+ * pins the decision without touching `execSync`. A test that really ran
+ * `npm test` would be slow, platform-dependent and recursive.
+ *
+ * A counting fake makes "the runner was not called" a first-class assertion —
+ * for `success=false` the gate must not run at all, and for the default
+ * no-command path it must not run either.
+ */
+interface GateProbe {
+  calls: Array<{ command: string; cwd: string }>
+  runner: (command: string, cwd: string) => { ok: boolean; output: string }
+}
+
+function gateProbe(outcome: { ok: boolean; output: string }): GateProbe {
+  const calls: Array<{ command: string; cwd: string }> = []
+  return {
+    calls,
+    runner: (command: string, cwd: string) => {
+      calls.push({ command, cwd })
+      return outcome
+    },
+  }
+}
+
+test('quality gate: no command configured leaves the runner untouched', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-gate')
+  const probe = gateProbe({ ok: false, output: 'should never run' })
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-gate', undefined, true, undefined, {
+    qualityGate: { command: '', runner: probe.runner },
+  })
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'completed')
+  assert.equal(probe.calls.length, 0, 'an unconfigured gate must not spawn anything')
+  assert.equal(readRaw('t1').status, 'completed')
+  assert.equal(readRaw('t1').failure_reason, '')
+})
+
+test('quality gate: whitespace-only command is also "not configured"', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-gate')
+  const probe = gateProbe({ ok: false, output: 'nope' })
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-gate', undefined, true, undefined, {
+    qualityGate: { command: '   \t ', runner: probe.runner },
+  })
+  assert.equal(outcome.code, 'completed')
+  assert.equal(probe.calls.length, 0)
+})
+
+test('quality gate: a passing gate completes and says so', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-gate')
+  const probe = gateProbe({ ok: true, output: '42 tests passed' })
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-gate', undefined, true, undefined, {
+    qualityGate: { command: 'npm test', runner: probe.runner },
+  })
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'completed')
+  assert.match(outcome.message, /quality gate passed/)
+  assert.equal(probe.calls.length, 1)
+  assert.equal(probe.calls[0]?.command, 'npm test')
+  // The gate runs in the *workspace* (the pool's parent), never in the pool's
+  // own `.dsh-tasks` bookkeeping directory and never in process.cwd().
+  assert.equal(probe.calls[0]?.cwd, dir)
+  assert.equal(readRaw('t1').status, 'completed')
+})
+
+test('quality gate: a failing gate fails the task, even though the worker said success', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-gate')
+  const probe = gateProbe({ ok: false, output: 'FAIL src/core/task-store.ts: expected 1 got 2' })
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-gate', undefined, true, undefined, {
+    qualityGate: { command: 'npm test', runner: probe.runner },
+  })
+  // The whole point: a reported success does not survive a red check.
+  assert.equal(outcome.code, 'failed')
+  assert.equal(outcome.ok, true, 'the transition happened, it was just a failure')
+  assert.match(outcome.message, /quality gate failed/i)
+
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'failed')
+  assert.notEqual(raw.status, 'completed')
+  assert.match(raw.failure_reason, /^Quality gate failed: /)
+  assert.match(raw.failure_reason, /expected 1 got 2/)
+  // Same retry semantics as success=false.
+  assert.equal(raw.retry_count, 1)
+  assert.notEqual(raw.completed_at, '')
+})
+
+test('quality gate: a failing gate on the last retry blocks the task', async () => {
+  await store.createExclusive(blankTask('t1', { max_retries: 1 }))
+  await claimTask(store, 't1', 'worker-gate')
+  const probe = gateProbe({ ok: false, output: 'type error' })
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-gate', undefined, true, undefined, {
+    qualityGate: { command: 'npx tsc --noEmit', runner: probe.runner },
+  })
+  assert.equal(outcome.code, 'blocked')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'blocked')
+  assert.equal(raw.retry_count, 1)
+  assert.match(raw.failure_reason, /^Quality gate failed: /)
+})
+
+test('quality gate: success=false never runs the gate', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-gate')
+  const probe = gateProbe({ ok: true, output: 'would have passed' })
+
+  const outcome = await completeTask(store, 't1', 'broke the build', 'worker-gate', undefined, false, undefined, {
+    qualityGate: { command: 'npm test', runner: probe.runner },
+  })
+  assert.equal(outcome.code, 'failed')
+  // Asserted by count, not by inspection: "never called" is the contract.
+  assert.equal(probe.calls.length, 0, 'an already-failed completion must not spend time on the gate')
+  // The worker's own reason survives; it is not overwritten by a gate message.
+  assert.equal(readRaw('t1').failure_reason, 'broke the build')
+  assert.equal(readRaw('t1').retry_count, 1)
+})
+
+test('quality gate: long gate output is truncated in failure_reason', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-gate')
+  const huge = 'x'.repeat(2000)
+  const probe = gateProbe({ ok: false, output: huge })
+
+  await completeTask(store, 't1', 'done', 'worker-gate', undefined, true, undefined, {
+    qualityGate: { command: 'npm test', runner: probe.runner },
+  })
+
+  const reason = readRaw('t1').failure_reason
+  assert.match(reason, /^Quality gate failed: /)
+  const body = reason.slice('Quality gate failed: '.length)
+  // 500 characters kept plus the ellipsis marker; the limit is "about 500".
+  assert.ok(body.length <= 501, `gate output should be truncated, got ${body.length} chars`)
+  assert.ok(body.length >= 490, `truncation should keep ~500 chars, got ${body.length}`)
+  assert.equal(body.startsWith('x'.repeat(400)), true)
+})
+
+test('quality gate: a gate failure feeds the failure counters, not the success ones', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-gate')
+  const probe = gateProbe({ ok: false, output: 'red' })
+
+  await completeTask(store, 't1', 'done', 'worker-gate', undefined, true, { actual_tokens: 900 }, {
+    qualityGate: { command: 'npm test', runner: probe.runner },
+  })
+
+  const stats = (await store.readWorkerStats())['worker-gate']
+  assert.ok(stats)
+  // Shipping work that fails the check must not look reliable.
+  assert.equal(stats.success_count, 0)
+  assert.equal(stats.failed_count, 1)
+  assert.equal(stats.total_tokens_consumed, 0, 'a failed attempt accumulates no performance credit')
+  assert.equal(stats.tokens_sample_count, 0)
+})
+
+test('quality gate: an omitted gate keeps the pre-v1.1.0 signature working', async () => {
+  // The six optional parameters must stay exactly as they were: this is the
+  // call every existing caller still makes.
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-gate')
+  const outcome = await completeTask(store, 't1', 'ok', 'worker-gate', undefined, true, { actual_tokens: 1200 })
+  assert.equal(outcome.code, 'completed')
+  assert.equal(outcome.message, 't1 completed')
+  assert.equal(readRaw('t1').status, 'completed')
+})

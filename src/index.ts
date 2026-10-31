@@ -9,6 +9,18 @@ export const name = 'dsh-swarm-scheduler-beta'
 export { Config }
 
 /**
+ * Re-export the arithmetic fixtures.
+ *
+ * `src/utils/math.ts` depends on no `@deepseek-ai/*` package and no Node
+ * built-in, which is what lets its consumers — and `test/math.test.ts` — run
+ * under plain `node --test` without a runtime. Re-exporting it here means a
+ * caller of the package can reach `add`/`subtract` without a deep `lib/`
+ * import, and it costs activation nothing: `export *` is a binding, not a
+ * side effect, so the module probe above still measures the same thing.
+ */
+export * from './utils/math.js'
+
+/**
  * Module-evaluation probe, driven by an environment variable.
  *
  * This runs at MODULE SCOPE — after the imports, before anything else — and that
@@ -163,6 +175,11 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
 
 9. 并发上限由 max_workers 控制（默认 3）。swarm_ready 在 claimed+running 达到上限时返回 0，这是正常现象，等已有任务完成后再拉。
 
+10. **质量门禁（若部署配置了 quality_gate_command）**：Worker 交付的代码必须在提交前就能通过该命令，否则即使 swarm_complete 传了 success:true 也会被自动打回为 failed（retry_count + 1），并在 failure_reason 里带上命令输出的前 500 字符。因此：
+    - 在**任务描述里把验收命令写清楚**（例如「验收：npm test 与 npx tsc --noEmit 均通过」），让 Worker 知道门禁会跑什么。
+    - 不要把一个改动范围会导致工作区无法构建或测试变红的小任务并行派出去——门禁是按整块工作区判定的，别人的红也会记在你的任务上。
+    - Worker 收到 failed 不是「result 被丢了」，而是「工作区没通过」；让它修好工作区后重试，不要靠改写 result 绕过。
+
 不要自己领任务、不要自己做具体编码。你的角色是调度者。`
 
 /**
@@ -203,6 +220,7 @@ export function apply(ctx: Context, config: SwarmConfig) {
       max_workers: config.max_workers,
       worker_tiers: config.worker_tiers ?? {},
       worker_profiles: config.worker_profiles ?? {},
+      quality_gate_command: config.quality_gate_command ?? '',
       disposers,
     })
 
