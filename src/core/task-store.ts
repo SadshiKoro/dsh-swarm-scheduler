@@ -60,6 +60,15 @@ const LOCK_SUFFIX = '.lock'
 const KEEP_FILE = '.keep'
 /** Suffix for per-task log files. */
 const LOG_SUFFIX = '.log'
+/** Pool-level reliability counters, keyed by worker id. */
+const STATS_FILE = 'worker_stats.json'
+
+/** One worker's attempt counters. Telemetry only: never consulted by routing. */
+export interface WorkerStats {
+  success_count: number
+  failed_count: number
+}
+export type WorkerStatsMap = Record<string, WorkerStats>
 /**
  * Task storage over `ctx.fs`, with an explicitly-labelled filesystem fallback.
  *
@@ -220,6 +229,8 @@ export class TaskStore {
     for (const entry of entries) {
       const name = entry.name
       if (name === undefined || !name.endsWith('.json')) continue
+      // The worker-stats file lives in the pool directory but is not a task.
+      if (name === STATS_FILE) continue
       const taskId = name.slice(0, -'.json'.length)
       const target = await fs.resolve(`${TASKS_DIR}/${name}`, { cwd: this.#cwd })
       // No readText in the declared slice: a read failure means "skip this
@@ -238,6 +249,9 @@ export class TaskStore {
       if (!existsSync(this.dirPath)) return { tasks, io: { ok: true, degraded: this.#fallbackNote } }
       for (const name of readdirSync(this.dirPath)) {
         if (!name.endsWith('.json')) continue
+        // The worker-stats file lives in the pool directory but is not a task;
+        // without this skip it is parsed as a phantom pending task (measured).
+        if (name === STATS_FILE) continue
         const taskId = name.slice(0, -'.json'.length)
         try {
           const text = readFileSync(join(this.dirPath, name), 'utf8')
@@ -384,6 +398,54 @@ export class TaskStore {
       return createHash('sha256').update(readFileSync(target)).digest('hex')
     } catch {
       return undefined
+    }
+  }
+
+  /**
+   * Read the pool-level worker counters.
+   *
+   * A missing or malformed file is an empty map, never an error: telemetry must
+   * not be able to break a status call.
+   */
+  async readWorkerStats(): Promise<WorkerStatsMap> {
+    try {
+      const raw = JSON.parse(readFileSync(join(this.dirPath, STATS_FILE), 'utf8')) as unknown
+      if (typeof raw !== 'object' || raw === null) return {}
+      const out: WorkerStatsMap = {}
+      for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+        if (typeof value !== 'object' || value === null) continue
+        const entry = value as { success_count?: unknown; failed_count?: unknown }
+        out[id] = {
+          success_count: typeof entry.success_count === 'number' ? entry.success_count : 0,
+          failed_count: typeof entry.failed_count === 'number' ? entry.failed_count : 0,
+        }
+      }
+      return out
+    } catch {
+      return {}
+    }
+  }
+
+  /**
+   * Increment one worker's success/failure counter.
+   *
+   * Best-effort by design: the counters are evidence for a future routing
+   * policy, so a failure to write them must never fail the completion that
+   * triggered the write.
+   */
+  async recordWorkerOutcome(workerId: string, success: boolean): Promise<void> {
+    const id = workerId.trim()
+    if (id.length === 0) return
+    try {
+      const current = await this.readWorkerStats()
+      const entry = current[id] ?? { success_count: 0, failed_count: 0 }
+      if (success) entry.success_count += 1
+      else entry.failed_count += 1
+      current[id] = entry
+      mkdirSync(this.dirPath, { recursive: true })
+      writeFileSync(join(this.dirPath, STATS_FILE), `${JSON.stringify(current, null, 2)}\n`, 'utf8')
+    } catch {
+      // Telemetry only; swallow.
     }
   }
 }
@@ -595,16 +657,18 @@ export function routingRefusal(task: TaskRecord, agentId: string, tier: WorkerTi
 }
 
 /**
- * Capability and context gates, in that order.
+ * Capability, context and cost gates, in that order.
  *
- * Both are hard refusals and both run before the lock. Cost is deliberately
- * absent: a cheap worker is a preference, not an eligibility rule.
+ * Capability and context are about *can it be done*; cost is about *is it worth
+ * doing here*. It is the only place cost becomes a hard refusal — and only when
+ * the task itself sets a ceiling (`max_cost_tokens > 0`), so the default
+ * behaviour stays "cheapest is a preference, not a rule".
  */
 export function profileRefusal(
   task: TaskRecord,
   agentId: string,
   profile: WorkerProfile,
-): { code: 'worker_lacks_capability' | 'worker_context_too_small'; message: string } | undefined {
+): { code: 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive'; message: string } | undefined {
   if (task.required_capabilities.length > 0) {
     const have = new Set(profile.capabilities)
     const missing = task.required_capabilities.filter(capability => !have.has(capability))
@@ -624,6 +688,17 @@ export function profileRefusal(
         + `max_context_tokens (${profile.max_context_tokens})`,
     }
   }
+  if (task.max_cost_tokens > 0) {
+    const estimatedCost = profile.cost_per_1k_tokens * (task.estimated_tokens / 1000)
+    if (estimatedCost > task.max_cost_tokens) {
+      return {
+        code: 'worker_too_expensive',
+        message: `${task.task_id} would cost ${estimatedCost.toFixed(4)} at ${agentId}'s rate `
+          + `(${profile.cost_per_1k_tokens}/1k tokens for ${task.estimated_tokens} tokens), `
+          + `above max_cost_tokens (${task.max_cost_tokens})`,
+      }
+    }
+  }
   return undefined
 }
 
@@ -634,7 +709,7 @@ export async function claimTask(
   clock: Clock = defaultClock,
   workerTiers?: Readonly<Record<string, string>>,
   workerProfiles?: Readonly<Record<string, WorkerProfileInput>>,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -1077,6 +1152,10 @@ export async function completeTask(
     return { ok: false, code: 'io_error', message: `${code} not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
   }
   await logTransition(store, taskId, code, completedBy)
+  // Reliability data collection: record the attempt outcome per worker. This
+  // never gates a claim (see DESIGN §12.8) — it exists so a future version can
+  // demote unreliable workers from evidence rather than guesswork.
+  await store.recordWorkerOutcome(completedBy, success)
   return { ok: true, code, message: `${taskId} ${code}`, degraded: written.degraded }
 }
 

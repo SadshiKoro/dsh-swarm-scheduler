@@ -65,6 +65,14 @@ export interface TaskRecord {
   required_capabilities: string[]
   /** Rough input size; 0 means "not estimated", which disables the context gate. */
   estimated_tokens: number
+  /**
+   * Budget ceiling for this task's estimated cost; 0 means no ceiling.
+   *
+   * Compared against `cost_per_1k_tokens × estimated_tokens / 1000` of the
+   * worker. This is the one place where cost is a hard gate; everywhere else it
+   * stays a scheduling preference.
+   */
+  max_cost_tokens: number
 }
 
 /** A task plus the derived facts callers actually schedule on. */
@@ -125,6 +133,7 @@ export function blankTask(taskId: string, fields: Partial<TaskRecord> = {}): Tas
     required_worker_tier: fields.required_worker_tier ?? 'any',
     required_capabilities: fields.required_capabilities ?? [],
     estimated_tokens: fields.estimated_tokens ?? 0,
+    max_cost_tokens: fields.max_cost_tokens ?? 0,
   }
 }
 
@@ -179,6 +188,7 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
       : 'any',
     required_capabilities: strings(raw.required_capabilities),
     estimated_tokens: Math.max(0, num(raw.estimated_tokens)),
+    max_cost_tokens: Math.max(0, num(raw.max_cost_tokens)),
   })
 }
 

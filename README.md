@@ -25,7 +25,7 @@ shared on-disk pool by atomic claim.
 
 **0.3.0 起**，任务生命周期从两态扩展为六态（pending / claimed / running / completed / failed /
 blocked），支持失败重试、并发上限（`max_workers`）、scope 冲突硬拒绝、看门狗自动回收（`swarm_reap`）
-和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 86 个测试覆盖（含 10-Worker 并发压测）。
+和任务级日志。核心调度逻辑已与 DSH 宿主解耦（`src/core/`），有 90 个测试覆盖（含 10-Worker 并发压测）。
 
 版本脉络：**v0.2.6** 把 `write_scopes` 从提示升级为 claim 时的硬拒绝 → **v0.2.7** 空 `tasksRoot`
 在激活时直接拒绝（不再静默落到 `process.cwd()`）→ **v0.3.0** 六态生命周期、`max_workers` 上限、
@@ -34,7 +34,8 @@ blocked），支持失败重试、并发上限（`max_workers`）、scope 冲突
 预检 → **v0.4.0** 心跳续约 `swarm_heartbeat`、内容 hash 版本校验、npm 打包与 CI → **v0.4.1** STALE
 标记与 lease 语义一致 → **v0.5.0** 异构路由（`complexity` / `required_worker_tier` / `worker_tiers`）
 与 50 任务 / 10 scope / 10 Worker 压测 → **v0.6.0** 多维 Worker 画像
-（`worker_profiles`：capabilities / 上下文 / 成本）与能力、上下文硬路由。
+（`worker_profiles`：capabilities / 上下文 / 成本）与能力、上下文硬路由 → **v0.7.0** 成本预算硬拦截
+（`max_cost_tokens`）与 Worker 可靠性统计（`worker_stats.json`，仅记录）。
 
 ---
 
@@ -272,7 +273,7 @@ Use the swarm scheduler for this:
 
 | Tool | Purpose | Main parameters |
 |---|---|---|
-| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`, `required_hashes`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`) |
+| `swarm_plan` | Submit the decomposition; write it into the task pool | `tasks[]` (`task_id`, `big_task_id`, `title`, `description`, `blocked_by`, `write_scopes`, `priority`, `required_files`, `required_hashes`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`, `max_cost_tokens`) |
 | `swarm_ready` | List the tasks a worker may start right now (0 when `max_workers` is reached) | optional `big_task_id` filter |
 | `swarm_claim` | Atomically claim one task (`pending` → `claimed`) | `task_id` / `claimed_by` |
 | `swarm_start` | Start work (`claimed` → `running`), recording the heartbeat | `task_id` / `started_by` |
@@ -431,6 +432,7 @@ v0.5.0 的 tier 只回答“够不够强”；v0.6.0 增加两个更精确的硬
 |---|---|---|
 | `required_capabilities` | `[]` | Worker 必须**声明拥有全部**这些标签（如 `code` / `test` / `docs` / `sql`）；缺任一即拒 |
 | `estimated_tokens` | `0` | 任务输入规模估计；`> 0` 时若超过 Worker 的 `max_context_tokens` 即拒；`0` 表示不评估 |
+| `max_cost_tokens` | `0` | 成本上限；`> 0` 时按 `worker.cost_per_1k_tokens × estimated_tokens / 1000` 估算，超出即拒；`0` 表示不限 |
 
 Worker 画像来自 profile 的 `worker_profiles`（§6.2 示例）；未配置的 Worker 使用默认画像
 `{ tier: 'standard', capabilities: [], max_context_tokens: 32000, cost_per_1k_tokens: 0.01 }`。
@@ -440,10 +442,12 @@ Worker 画像来自 profile 的 `worker_profiles`（§6.2 示例）；未配置�
 
 1. tier：`worker_too_weak`（§6.5 的既有规则）；
 2. 能力：缺标签 → `worker_lacks_capability`，消息列出缺失标签与 Worker 已声明标签；
-3. 上下文：`estimated_tokens > max_context_tokens` → `worker_context_too_small`，消息列出两边数值。
+3. 上下文：`estimated_tokens > max_context_tokens` → `worker_context_too_small`，消息列出两边数值；
+4. 成本：声明了 `max_cost_tokens` 且 Worker 预估成本超出 → `worker_too_expensive`，消息列出预估成本与上限。
 
-**`cost_per_1k_tokens` 不是拦截条件**，只作为 Lead 调度的软参考（把便宜的任务交给便宜的 Worker）；
-它不会出现在任何拒绝码里。`swarm_status` 会展示 `[caps: code,test]` 与 `[est: 50k tokens]`。
+**成本默认仍不是拦截条件**：只有任务显式声明 `max_cost_tokens > 0` 时才做硬拦截；未声明时
+`cost_per_1k_tokens` 只是 Lead 调度的软参考。`swarm_status` 会展示 `[caps: code,test]`、
+`[est: 50k tokens]`，并在末尾列出各 Worker 的 `success / failed` 统计（仅记录，不参与路由）。
 
 ---
 
@@ -546,7 +550,7 @@ without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
      here;
    - if DSH promotes that package into a default bundle, or removes it, **the installation steps in
      §4 will change** and this README may be out of date.
-9. **Concurrency correctness has both unit and stress coverage — 86 automated tests.** The suite
+9. **Concurrency correctness has both unit and stress coverage — 90 automated tests.** The suite
    covers the six-state lifecycle (`claim`/`start`/`complete`/`release`/`reap`/`set_dependencies`),
    retry and blocked transitions, the `write_scopes` admission check, residual-lock cleanup,
    readiness/staleness, the `max_workers` ceiling, routing refusals, and concurrent races (same-task
@@ -569,6 +573,11 @@ without booting a host; see [DESIGN.md §12.3](./DESIGN.md).
     **heartbeat timeout recovery** (`swarm_reap`) so a hung worker no longer pins a slot forever, but
     it does not make file-level concurrency safe. Declare narrower scopes (`src/api/routes.ts`) when
     you need finer resolution.
+11. **能力画像是静态配置，历史统计尚未参与路由。** `worker_profiles` 里的 `capabilities`、
+    `max_context_tokens`、`cost_per_1k_tokens` 都是**部署时手写的声明**，DSH 不提供跨会话记忆，插件
+    也无法验证 Worker 的真实能力。v0.7.0 开始把每次 `swarm_complete` 的成功/失败记到
+    `.dsh-tasks/worker_stats.json`，并在 `swarm_status` 中展示，但**这些统计目前只记录、不参与任何
+    拦截**——未来版本才可能据此自动降级不可靠 Worker。在那之前，能力匹配仍信任配置。
 
 ---
 

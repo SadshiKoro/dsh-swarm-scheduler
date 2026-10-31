@@ -699,3 +699,50 @@ test('a profile overrides a legacy tier entry for the same agent', async () => {
   assert.equal(outcome.ok, false)
   assert.equal(outcome.code, 'worker_too_weak')
 })
+
+// ------------------------------------------------------- cost and history ---
+
+test('a worker above the task cost budget is refused', async () => {
+  await store.createExclusive(blankTask('t1', { estimated_tokens: 50000, max_cost_tokens: 0.1 }))
+  const profiles = { 'worker-pricey': { cost_per_1k_tokens: 0.01, max_context_tokens: 128000 } }
+  const outcome = await claimTask(store, 't1', 'worker-pricey', undefined, undefined, profiles)
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'worker_too_expensive')
+  // 0.01/1k × 50k = 0.5, above the 0.1 ceiling; both numbers must be visible.
+  assert.match(outcome.message, /0\.5/)
+  assert.match(outcome.message, /0\.1/)
+  assert.equal(readRaw('t1').status, 'pending')
+})
+
+test('a worker within the task cost budget can claim', async () => {
+  await store.createExclusive(blankTask('t1', { estimated_tokens: 50000, max_cost_tokens: 1 }))
+  const profiles = { 'worker-cheap': { cost_per_1k_tokens: 0.01, max_context_tokens: 128000 } }
+  const outcome = await claimTask(store, 't1', 'worker-cheap', undefined, undefined, profiles)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})
+
+test('a cost ceiling without an estimate does not block (cost is 0)', async () => {
+  await store.createExclusive(blankTask('t1', { max_cost_tokens: 0.1 }))
+  const profiles = { 'worker-pricey': { cost_per_1k_tokens: 1 } }
+  const outcome = await claimTask(store, 't1', 'worker-pricey', undefined, undefined, profiles)
+  assert.equal(outcome.ok, true)
+})
+
+test('worker_stats records success and failure counts', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'ok', 'worker-a', undefined, true)
+
+  await store.createExclusive(blankTask('t2'))
+  await claimTask(store, 't2', 'worker-b')
+  await completeTask(store, 't2', 'boom', 'worker-b', undefined, false)
+
+  const stats = await store.readWorkerStats()
+  assert.equal(stats['worker-a']?.success_count, 1)
+  assert.equal(stats['worker-a']?.failed_count, 0)
+  assert.equal(stats['worker-b']?.success_count, 0)
+  assert.equal(stats['worker-b']?.failed_count, 1)
+  // Persisted, not in-memory only.
+  assert.equal(existsSync(join(dir, TASKS_DIR, 'worker_stats.json')), true)
+})

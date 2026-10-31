@@ -134,7 +134,8 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
    - **决定 Worker 等级**：高复杂或高风险的块设 required_worker_tier: 'premium'，其余可留 'any'。这是抽象等级，不要写具体模型名。
    - **评估能力需求**：如果块需要特定技能（test / docs / sql / 前端等），在 required_capabilities 里列出；Worker 必须声明拥有**全部**这些标签才能领取，缺一个即被拒（worker_lacks_capability）。
    - **估算上下文**：复杂或大输入块给出粗略 estimated_tokens；超过 Worker 的 max_context_tokens 会被拒（worker_context_too_small）。0 表示不评估。
-   - **成本是软参考**：cost_per_1k_tokens 只用于「把便宜的任务交给便宜的 Worker」，不做硬拦截。
+   - **成本敏感任务**：若该块有预算上限，请声明 max_cost_tokens（预估 tokens × 单价上限）；Worker 的预估成本超过它会被拒（worker_too_expensive）。未声明时成本只是软参考。
+   - **能力声明要准确**：capabilities 是你按模型能力配置的静态声明，DSH 不提供跨会话验证；请如实配置，避免把重活派给弱 Worker。
 
 2. 用 list_agents 查看有没有空闲的 teammate（status 为 inactive 的）。
    有空闲的 → 直接 send_message 唤醒它们，不要新建。

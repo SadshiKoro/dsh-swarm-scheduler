@@ -114,7 +114,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       + '(workspace-relative paths that must exist before the task may be claimed); `required_hashes` pins '
       + 'each of those files to a sha256 digest, so a changed prerequisite refuses the claim with `hash_mismatch`. '
       + 'Routing fields: `complexity`, `required_worker_tier`, `required_capabilities` (worker must declare every '
-      + 'tag) and `estimated_tokens` (must fit the worker context window).',
+      + 'tag), `estimated_tokens` (must fit the worker context window) and `max_cost_tokens` (budget ceiling; '
+      + 'a worker whose rate would exceed it is refused with `worker_too_expensive`).',
     parameters: {
       tasks: {
         type: 'array',
@@ -141,6 +142,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
             required_worker_tier: { type: 'string', enum: ['any', 'standard', 'premium'], description: 'Minimum worker tier allowed to claim. Default any.' },
             required_capabilities: { type: 'array', description: 'Capability tags the worker must declare (all of them). Default empty.', items: { type: 'string' } },
             estimated_tokens: { type: 'number', description: 'Rough input size in tokens; must fit the worker context window. 0 means not estimated.' },
+            max_cost_tokens: { type: 'number', description: 'Budget ceiling for this task cost (rate × tokens/1000). 0 means no ceiling.' },
           },
         },
       },
@@ -219,6 +221,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           required_worker_tier: spec.required_worker_tier ?? 'any',
           required_capabilities: spec.required_capabilities ?? [],
           estimated_tokens: Math.max(0, spec.estimated_tokens ?? 0),
+          max_cost_tokens: Math.max(0, spec.max_cost_tokens ?? 0),
         })
         const written = await store.createExclusive(record)
         if (written.ok) created.push(taskId)
@@ -341,7 +344,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -448,11 +451,13 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           stale_after_sec: { type: 'integer' },
           big_tasks: { type: 'array', items: { type: 'string' } },
           tasks: { type: 'array', items: { type: 'string' } },
+          workers: { type: 'array', items: { type: 'string' } },
           degraded: { type: 'string' },
         },
       },
       render: (_args, value) => {
         const tasks = value.tasks ?? []
+        const workers = value.workers ?? []
         const stale = value.stale ?? 0
         const head = `pool ${value.dir ?? TASKS_DIR}: total ${value.total ?? 0} · pending ${value.pending ?? 0}`
           + ` · claimed ${value.claimed ?? 0} · running ${value.running ?? 0}${stale > 0 ? ` (${stale} stale)` : ''}`
@@ -461,7 +466,10 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         const hint = stale > 0
           ? [`  ⚠ ${stale} task(s) older than ${value.stale_after_sec ?? 0}s — release with swarm_release or reap with swarm_reap if abandoned`]
           : []
-        return text([head, ...hint, ...tasks.map(line => `  ${line}`),
+        const workerLines = workers.length > 0
+          ? ['  workers:', ...workers.map(line => `    ${line}`)]
+          : []
+        return text([head, ...hint, ...tasks.map(line => `  ${line}`), ...workerLines,
           ...(value.degraded !== undefined && value.degraded !== '' ? [`  degraded: ${value.degraded}`] : [])].join('\n'))
       },
     },
@@ -523,6 +531,12 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           }
         }
       }
+      // Reliability telemetry: recorded by swarm_complete, never used to gate a
+      // claim (see README known limitations / DESIGN §12.8).
+      const stats = await store.readWorkerStats()
+      const workerLines = Object.entries(stats)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([id, entry]) => `${id}: ${entry.success_count} success, ${entry.failed_count} failed`)
       return {
         dir: TASKS_DIR,
         total: views.length,
@@ -537,6 +551,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         stale_after_sec: staleAssignmentSec,
         big_tasks: bigTasks,
         tasks: taskLines,
+        workers: workerLines,
         degraded: (degraded + logOutput).trim(),
       }
     },
