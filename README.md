@@ -48,12 +48,25 @@ measures capability routing against blind round-robin.
   with `scope_conflict`; `required_hashes` pins prerequisite files to sha256 digests and refuses a
   stale one with `hash_mismatch`.
 - **Escalation protocol** — `swarm_escalate` hands a task back as `blocked` with a reason instead of
-  waiting for a timeout or shipping known-bad code.
+  waiting for a timeout or shipping known-bad code. The tool replies with an explicit stop instruction,
+  so a worker that has just given up does not keep going.
+- **Anti-blockage: self-assessment and forced re-splitting** — the failure mode a scheduler fears is not
+  a failed task but a task that quietly holds a slot and stalls its whole dependency chain. Workers are
+  instructed to give up early — more than 3 files to touch, more than ~200 lines of logic, or two
+  consecutive failed attempts at making build/tests pass — and escalate with
+  `Task too large, needs decomposition` instead of grinding. A `blocked` task carrying that reason may
+  **not** be re-dispatched as-is: the Lead must split it into 2–4 smaller tasks with dependencies wired
+  before waking anyone.
+- **Deadline highlighting** — a task may declare `max_duration_ms`. `swarm_status` marks a `running`
+  task `[OVERDUE]` once it exceeds that budget. This is deliberately *not* a kill: nothing is
+  reclaimed. `STALE` asks "is anyone alive?", `OVERDUE` asks "is this taking longer than planned?" — a
+  perfectly heartbeating worker can be overdue, and only the Lead can decide whether to extend, split,
+  or interrupt.
 - **Quality gate** — a deployment may set `quality_gate_command`; every `success: true` completion then
   runs that command, and a **non-zero exit turns the completion into a failure** (`retry_count + 1`,
   with the command's output quoted into `failure_reason`). A worker saying "done" is a claim, not a
   decision. Off by default: an empty command changes nothing.
-- **Test coverage** — 135 automated tests, including a claim-lock stress suite of 400 concurrent
+- **Test coverage** — 142 automated tests, including a claim-lock stress suite of 400 concurrent
   claims (10 workers × 2 cases × 20 rounds) that produced zero double-claims, and a cross-process
   case where two real OS processes race one lock file.
 
@@ -122,22 +135,46 @@ and cost rate).
 
 ### 4. Restart DSH
 
-**There is no hot reload.** All four installation steps — bundle list, plugin install, `config`, and
-any later change to them — require a full DSH restart to take effect.
+**There is no hot reload. Editing the config without restarting changes nothing.**
+
+All four installation steps — bundle list, plugin install, `config`, and any later change to them —
+require a full DSH restart to take effect. This is not a stylistic preference; it was established by
+measurement. When `quality_gate_command` was removed from a running profile, the plugin kept *running
+the deleted command* through every reload path available: re-creating the plugin fiber, unloading the
+entry, and reinstalling the package all reported success while the old value stayed in memory. A task
+that should have passed was still rejected by a gate command that no longer existed in any file on
+disk. The value only changed after DSH itself restarted.
+
+The same applies to `worker_profiles`. A capability change does not reach a teammate that is already
+running — its profile is a snapshot taken when the session started. If a worker is refused with
+`worker_lacks_capability` after you edited its profile, the fix is a restart, not another retry.
+
+So: **edit `cordis.patch.yml`, then restart DSH.** Treat a config edit that has not been followed by a
+restart as not applied.
 
 ## Quick Start
 
-The minimal loop is three steps:
+The minimal loop is three steps.
 
-1. **Build the pool.** Call `swarm_plan` once with the entire decomposition: every task with its
-   `task_id`, `big_task_id`, `description`, `write_scopes`, and any routing fields. Dependencies are
-   declared with `blocked_by`. An existing `task_id` is never overwritten; it is reported as a
-   conflict, so repeating a plan cannot silently reset finished work.
-2. **Wake the workers.** Spawn teammates (`spawn_teammate`) or reuse idle ones (`send_message`) and
-   point them at the pool. A Worker's loop is: `swarm_ready` → `swarm_claim` → `swarm_start` →
-   execute → `swarm_complete`, repeated until `swarm_ready` returns zero.
-3. **Watch progress.** `swarm_status` reports the whole pool in one call — per-state counts, how many
-   tasks are ready, how many are still blocked, and a compact line per task.
+1. **Build the pool.** Call `swarm_plan` once with the whole decomposition. Four fields are required
+   per task, and all four are plain strings: `task_id` (unique within the pool; convention is
+   `<block>/<index>`, e.g. `big-1/small-2`), `big_task_id` (the block it belongs to — a label, not a
+   foreign key), `title`, and `description` (state inputs, outputs and acceptance criteria so the
+   worker does not have to guess). Dependencies are declared with `blocked_by`, a list of `task_id`s
+   that must be `completed` before the task becomes ready. All other fields are optional:
+   `write_scopes` (declare it whenever tasks could touch the same directory — see the conflict note
+   below), the routing fields `complexity`, `required_worker_tier`, `required_capabilities`,
+   `estimated_tokens`, `max_cost_tokens`, plus `max_duration_ms` (marks the task `[OVERDUE]` in
+   `swarm_status` once a run exceeds it — a nudge, not a kill), `priority`, `required_files` and
+   `required_hashes`. An existing `task_id` is never overwritten: a repeat plan reports it as a
+   conflict, so re-running `swarm_plan` cannot silently reset finished work.
+2. **Wake the workers.** Spawn teammates with `spawn_teammate`, or reuse idle ones with
+   `send_message`, and point them at the pool. A worker's loop is `swarm_ready` → `swarm_claim` →
+   `swarm_start` → execute → `swarm_complete`, repeated until `swarm_ready` returns zero. You never
+   assign a specific task to a specific worker: which block each one gets is the outcome of an atomic
+   claim race.
+3. **Watch progress.** `swarm_status` reports the whole pool in a single call: per-state counts, how
+   many tasks are ready, how many are still blocked, and one compact line per task.
 
 ### Automatic Dispatch
 
@@ -150,7 +187,7 @@ small tasks are executed directly.
 
 | Tool | Purpose | Core parameters |
 |---|---|---|
-| `swarm_plan` | Create the task pool; one JSON file per task | `tasks[]`: `task_id`, `big_task_id`, `title`, `description`, `write_scopes`, `blocked_by`, `priority`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`, `max_cost_tokens`, `required_files`, `required_hashes` |
+| `swarm_plan` | Create the task pool; one JSON file per task | `tasks[]`: `task_id`, `big_task_id`, `title`, `description`, `write_scopes`, `blocked_by`, `priority`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`, `max_cost_tokens`, `max_duration_ms`, `required_files`, `required_hashes` |
 | `swarm_ready` | List tasks a worker can start right now | `big_task_id` (optional filter) |
 | `swarm_claim` | Atomically claim one task for one worker | `task_id`, `claimed_by` |
 | `swarm_start` | `claimed → running`; records start time and first heartbeat | `task_id`, `started_by` |
@@ -158,7 +195,7 @@ small tasks are executed directly.
 | `swarm_complete` | Record the outcome; `success=false` triggers retry logic; a configured quality gate can downgrade a success | `task_id`, `result`, `completed_by`, `success`, `actual_tokens`, `duration_ms` |
 | `swarm_release` | Return a claimed task to the pool, clearing its lock | `task_id`, `released_by` |
 | `swarm_reap` | Watchdog sweep: release, flag STALE, or fail stale tasks | none |
-| `swarm_escalate` | Hand a task back as `blocked` with a reason (Lead may force) | `task_id`, `agent_id`, `reason`, `force` |
+| `swarm_escalate` | Hand a task back as `blocked` with a reason (Lead may force); replies with an explicit stop instruction | `task_id`, `agent_id`, `reason`, `force` |
 | `swarm_set_deps` | Lead-only: replace a task's `blocked_by` list | `task_id`, `blocked_by[]`, `updated_by` |
 | `swarm_status` | Report the whole pool and per-worker performance | `include_log` |
 

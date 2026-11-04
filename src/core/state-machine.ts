@@ -73,6 +73,15 @@ export interface TaskRecord {
    * stays a scheduling preference.
    */
   max_cost_tokens: number
+  /**
+   * Wall-clock budget for one attempt, in milliseconds; 0 means "no limit".
+   *
+   * This is not enforced — nothing kills the worker. It exists so the Lead can
+   * *see* that a run has outlived its estimate and decide what to do (extend,
+   * split, or interrupt). A hard kill would throw away work in progress; an
+   * overdue marker costs nothing and leaves the decision where it belongs.
+   */
+  max_duration_ms: number
 }
 
 /** A task plus the derived facts callers actually schedule on. */
@@ -87,6 +96,15 @@ export interface TaskView extends TaskRecord {
   heartbeat_age_sec?: number
   /** True when the claim/running is older than the configured threshold. */
   stale: boolean
+  /**
+   * True when a running task has outlived its own `max_duration_ms`.
+   *
+   * Deliberately separate from `stale`: staleness is about the *lease* (is anyone
+   * alive?), overdue is about the *estimate* (is this taking longer than
+   * planned?). A task can be perfectly healthy by heartbeat and still be overdue —
+   * that is exactly the case a watchdog cannot catch and a Lead should.
+   */
+  overdue: boolean
 }
 
 export interface IoOutcome {
@@ -134,6 +152,7 @@ export function blankTask(taskId: string, fields: Partial<TaskRecord> = {}): Tas
     required_capabilities: fields.required_capabilities ?? [],
     estimated_tokens: fields.estimated_tokens ?? 0,
     max_cost_tokens: fields.max_cost_tokens ?? 0,
+    max_duration_ms: fields.max_duration_ms ?? 0,
   }
 }
 
@@ -189,6 +208,7 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
     required_capabilities: strings(raw.required_capabilities),
     estimated_tokens: Math.max(0, num(raw.estimated_tokens)),
     max_cost_tokens: Math.max(0, num(raw.max_cost_tokens)),
+    max_duration_ms: Math.max(0, num(raw.max_duration_ms)),
   })
 }
 
@@ -235,6 +255,11 @@ export function viewOf(
   const leaseAgeSec = leaseMs === undefined ? 0 : Math.max(0, Math.floor((now - leaseMs) / 1000))
   const stale = leaseMs !== undefined && staleAfterSec > 0 && leaseAgeSec > staleAfterSec
   const ready = task.status === 'pending' && open.length === 0
+  // Overdue compares elapsed run time against the task's own budget. It needs a
+  // real start timestamp: without one there is nothing to measure from, and
+  // guessing from the claim time would flag tasks that never began.
+  const overdue = hasStartTime && task.max_duration_ms > 0
+    && now - startedMs > task.max_duration_ms
 
   return {
     ...task,
@@ -244,6 +269,7 @@ export function viewOf(
     ...hasStartTime ? { running_age_sec: runningAgeSec } : {},
     ...hasHeartbeatTime ? { heartbeat_age_sec: heartbeatAgeSec } : {},
     stale,
+    overdue,
   }
 }
 

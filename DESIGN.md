@@ -1,9 +1,9 @@
 # DSH Multi-Session Parallel Coding Scheduler Plugin — Complete Design Document
 
-- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.1.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
+- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.2.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
 - Target runtime: DeepSeek Harness `0.2.0-rc.2` (Cordis ~4.0.4)
-- Test suite: **135 automated tests** (`npm test`, single-process, sandbox-safe)
-- **Current architecture (v1.0.0; v1.1.0 adds the quality gate + benchmark)**: a pure core with no DSH-host dependency, plus one thin host adapter.
+- Test suite: **142 automated tests** (`npm test`, single-process, sandbox-safe)
+- **Current architecture (v1.2.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
   The task pool is a **file pool** at `.dsh-tasks/<task_id>.json` guarded by atomic lock files — *not*
   the kernel's `agentTeams` task board. See §1 for the current design; **§1.4–§1.6 are superseded
   early-draft sections kept for history.**
@@ -1869,8 +1869,21 @@ phase 2 超宽限判 `failed` 且 `retry_count + 1`；边界 150s = 1.5× 仍只
 
 | ID | 级别 | 问题 | 状态 |
 |---|---|---|---|
-| **P2** | 高 | 配置热重载对已启动 Worker 不生效，且不可从症状区分 | **未修复**，不在本次范围 |
+| **P2** | 高 | 配置热重载对已启动 Worker 不生效，且不可从症状区分 | **已决定不修**，见下 |
 | **P4** | 中 | `staleAssignmentSec` 无下限保护 | **未修复**，不在本次范围 |
+
+**P2 的最终处置（v1.2.0 封版决定）：不修代码，改为文档约束。**
+
+P2 的根因在 DSH 宿主——配置快照在会话/纤维创建时固定，插件在 `apply()` 里拿到的是一个已经定型的
+config 对象，没有任何接口能让它请求重读。在插件层绕过（例如自行监听 `cordis.patch.yml` 并热替换）
+需要重新实现宿主的配置生命周期，风险远大于收益，因此**明确不做**。
+
+改为在 README §4「Restart DSH」里把这条写成硬约束，并用封版前实测到的证据支撑：
+删除 `quality_gate_command` 后，重载纤维、卸载 entry、重新安装包三条路径**全部报告成功**，
+而那个已被删除的命令仍在执行——只有在 DSH 重启后才真正消失。
+这比「没有热重载」一句更具体：**任何未伴随重启的配置修改，都应视为未生效。**
+
+P4 停在原状：宽限窗口降低了它的杀伤力，但下限保护仍未实现。
 
 P3 的宽限窗口已显著降低 P4 所述「把阈值当越快越好的旋钮」的杀伤力（误杀被推迟到 1.5× 且先告警），**但不等于 P4 已修**：
 下限保护与低阈值告警仍未实现。
@@ -2096,6 +2109,90 @@ P6 的处置维持 §12.12.4 的结论：**压测未复现，暂不修改**。
 与 stdio 是否 piped 无关；`spawn` 只要捕获管道 stdio 也 EPERM。**子进程唯一可行的姿势是
 `spawn(..., { stdio: 'ignore' })` + 结果写文件回传。** 这条限制同样解释了 `node --test` 为何必须
 带 `--test-isolation=none`（§12.11.7 / §12.12.6）。
+
+## 12.14 v1.2.0：防长任务阻塞（自我评估呼救 + Lead 强制拆分）
+
+### 12.14.1 要解决的问题：阻塞，而不是失败
+
+调度器的效率损失有两种，形式完全不同：
+
+| 失败形态 | 现象 | 代价 |
+|---|---|---|
+| **显式失败** | 任务 `failed`，走重试/blocked | 一次重试，可控 |
+| **静默阻塞** | 一个任务 running 很久，占着 slot，所有 `blocked_by` 它的人都饿着 | **整条依赖链停摆**，且没有任何信号 |
+
+第二种才是真正的痛点。P3 的两阶段宽限（§12.12.2）解决的是「Worker 死了没人管」，但**一个活得好好的 Worker 在错误的题目上死磕**，心跳正常、lease 健康，任何看门狗都判不出来。
+解耦办法不是加一个更强的看门狗，而是**让 Worker 自己认输，让 Lead 被迫重拆**。
+
+### 12.14.2 Worker 侧：自我评估呼救
+
+写进 `PROTOCOL_TEXT` 的强制约束（与派发消息一起下发）。`swarm_start` 之后，出现下面任意一条即**严禁死磕**：
+
+- 需要修改的文件超过 **3** 个；
+- 预计代码逻辑超过 **200** 行；
+- 连续修复编译/测试错误达到 **2** 次仍不过。
+
+此时必须 `swarm_escalate`，`reason` 写 `Task too large, needs decomposition` 并附当前报错原文，然后停止工作、保持静默。
+
+**为什么是这三条阈值**：它们都是 Worker **在开工后很快就能自评**的事实，不需要预测。文件数与行数是规模信号，连续失败是「方向错了」信号——而重复同一个修复两次仍然失败，通常意味着问题不在那个修复上。
+
+**为什么靠协议而非强制**：调度器看不到 Worker 的内部状态（改了哪些文件、试了几次）。真要强制，得让 Worker 每步上报，那本身就是巨大的开销。协议 + 工具返回文案引导是性价比最高的做法；硬拦截（`ctx.tools.guard`）被评估为不必需。
+
+呼救成功后，`swarm_escalate` 的返回值追加：
+
+```
+Escalated successfully. The Lead has been notified. Stop working and remain silent.
+```
+
+这句话是必要的：一个刚刚放弃任务的 Worker，若没有明确的「停下」指令，很容易继续「再试最后一次」。
+
+### 12.14.3 Lead 侧：禁止原样重派
+
+**触发条件**：`swarm_status` 中出现 `blocked` 且 `failure_reason` 含 `Task too large` 的任务。
+
+**强制动作**：**禁止原样重派**（重新 `swarm_start`，或 `swarm_release` 让它被同样方式领走，都算违规）。必须：
+
+1. 用 `swarm_plan` 拆成 **2–4 个更小的任务**，每个都能独立验收；
+2. 用 `blocked_by` 接好拆出来的任务与原任务的前置依赖；
+3. 原任务标记为不再使用（或作为汇总节点）；
+4. 再唤醒空闲 Worker 去领新任务。
+
+**为什么必须禁止原样重派**：原任务之所以被退回，是因为它「太大」——这个属性不会因为换个人做而改变。重派的结果是同一个任务在池子里转一圈，换一个 Worker 再认输一次，白白消耗两轮上下文。**不做拆分的重试不是重试，是浪费。**
+
+**拆分时的硬约束**：新任务各自的 `write_scopes` 必须互不重叠，否则它们之间会立刻 `scope_conflict`（§12.11.2 已记录过的陷阱）。
+
+### 12.14.4 配套：`max_duration_ms` 超时高亮
+
+`TaskRecord` 新增可选字段 `max_duration_ms: number`（默认 0 = 不限），`swarm_plan` 接受传入。
+
+`viewOf` 派生 `overdue: boolean`，判定为：任务 `running`、有可解析的 `started_at`、`max_duration_ms > 0`，且 `now - started_at > max_duration_ms`。
+
+`swarm_status` 对被判定 overdue 的行追加：
+
+```
+[OVERDUE, running 12m ago, budget 5m — consider extending, splitting, or interrupting]
+```
+
+并在汇总行加 `⏱ N running task(s) past their own max_duration_ms` 提示。
+
+**OVERDUE 与 STALE 是两条正交的信号，这个区分是本设计的要点：**
+
+| 标记 | 回答的问题 | 判据 | 意味着 |
+|---|---|---|---|
+| `STALE` | 这个人还在吗？ | lease（heartbeat）超时 | 可能死了，该回收 |
+| `OVERDUE` | 是不是比预期久太多了？ | 实际耗时 vs 任务自己的预算 | 估计错了，或 Worker 卡在错的题目上 |
+
+一个心跳完全正常、lease 健康的任务**可以同时是 OVERDUE 的**——这正是看门狗看不见、而 Lead 必须看见的那一类。
+
+**为什么只高亮、不击杀**：杀掉一个 running 任务会丢弃它已经完成的工作，而这个决定应该由 Lead 结合上下文来做（也许只是预算设得太紧，延长即可；也许是真卡住了，该拆）。渲染层只负责把事实摆出来。
+
+**实现细节**：`overdue` 必须依赖**可解析的 `started_at`**。没有启动时间的任务（pending，或异常记录）一律判 `false`——用 `claimed_at` 去凑会是猜测，而猜测在这里意味着一次错误的打断。
+
+### 12.14.5 测试
+
+`test/core/state-machine.test.ts` 新增 7 个用例，覆盖：预算 0 不告警、预算内不告警、超预算告警、**overdue 与 stale 相互独立**（心跳正常的超时任务 stale=false 但 overdue=true）、非 running 状态永不 overdue、`max_duration_ms` 经 JSON 往返不丢失、负值被 `coerceTask` 归零。
+
+全量由 135 → **142**，全部通过。
 
 ## 13. References and evidence sources
 | Conclusion | Source |

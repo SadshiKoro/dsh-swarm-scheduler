@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   blankTask,
+  coerceTask,
   computeReady,
   compareReadyOrder,
   viewOf,
@@ -181,4 +182,70 @@ test('a claimed task with a fresh heartbeat is not stale despite an old claim', 
   })
   const view = viewOf(task, byId([task]), now, 600)
   assert.equal(view.stale, false)
+})
+
+// ---------------------------------------------------------------- overdue ---
+
+/** A running task whose start is `elapsedMs` in the past. */
+function runningTask(elapsedMs: number, maxDurationMs: number): TaskRecord {
+  return blankTask('r', {
+    status: 'running',
+    claimed_by: 'worker-a',
+    claimed_at: new Date(Date.now() - elapsedMs).toISOString(),
+    started_at: new Date(Date.now() - elapsedMs).toISOString(),
+    heartbeat_at: new Date().toISOString(),
+    max_duration_ms: maxDurationMs,
+  })
+}
+
+test('overdue is false when max_duration_ms is 0 (no budget declared)', () => {
+  const task = runningTask(10 * 60_000, 0)
+  assert.equal(viewOf(task, byId([task]), Date.now(), 600).overdue, false)
+})
+
+test('overdue is false while the run is inside its budget', () => {
+  const task = runningTask(60_000, 5 * 60_000)
+  assert.equal(viewOf(task, byId([task]), Date.now(), 600).overdue, false)
+})
+
+test('overdue is true once the run exceeds its budget', () => {
+  const task = runningTask(10 * 60_000, 5 * 60_000)
+  assert.equal(viewOf(task, byId([task]), Date.now(), 600).overdue, true)
+})
+
+test('overdue and stale are independent: a heartbeating overdue task is stale-free', () => {
+  // The whole point of the marker: a worker can be perfectly alive and still
+  // be stuck on the wrong problem. A watchdog cannot tell you that; this can.
+  const task = runningTask(10 * 60_000, 5 * 60_000)
+  const view = viewOf(task, byId([task]), Date.now(), 600)
+  assert.equal(view.overdue, true)
+  assert.equal(view.stale, false)
+})
+
+test('overdue never fires for a task that is not running', () => {
+  // A pending task has no start time, so nothing can be measured against it.
+  // Flagging it would be a guess, and a guess here means a false interruption.
+  const pending = blankTask('p', { status: 'pending', max_duration_ms: 1 })
+  assert.equal(viewOf(pending, byId([pending]), Date.now(), 600).overdue, false)
+
+  const completed = blankTask('done', {
+    status: 'completed',
+    started_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+    max_duration_ms: 1,
+  })
+  assert.equal(viewOf(completed, byId([completed]), Date.now(), 600).overdue, false)
+})
+
+test('max_duration_ms survives a JSON round-trip through coerceTask', () => {
+  // The field lives in a hand-written JSON file, so the loader must keep it —
+  // a field that vanishes on read is a silent no-op budget.
+  const task = blankTask('rt', { max_duration_ms: 90_000 })
+  const revived = coerceTask(JSON.parse(JSON.stringify(task)), 'rt')
+  assert.equal(revived?.max_duration_ms, 90_000)
+})
+
+test('coerceTask rejects a negative max_duration_ms rather than trusting it', () => {
+  const task = blankTask('neg', { max_duration_ms: -5 })
+  const revived = coerceTask(JSON.parse(JSON.stringify(task)), 'neg')
+  assert.equal(revived?.max_duration_ms, 0)
 })

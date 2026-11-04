@@ -152,6 +152,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
             required_capabilities: { type: 'array', description: 'Capability tags the worker must declare (all of them). Default empty.', items: { type: 'string' } },
             estimated_tokens: { type: 'number', description: 'Rough input size in tokens; must fit the worker context window. 0 means not estimated.' },
             max_cost_tokens: { type: 'number', description: 'Budget ceiling for this task cost (rate × tokens/1000). 0 means no ceiling.' },
+            max_duration_ms: { type: 'number', description: 'Wall-clock budget for one attempt in ms; 0 means no limit. When a running task exceeds it, swarm_status marks it [OVERDUE] so the Lead knows to step in. Nothing is killed.' },
           },
         },
       },
@@ -231,6 +232,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           required_capabilities: spec.required_capabilities ?? [],
           estimated_tokens: Math.max(0, spec.estimated_tokens ?? 0),
           max_cost_tokens: Math.max(0, spec.max_cost_tokens ?? 0),
+          max_duration_ms: Math.max(0, spec.max_duration_ms ?? 0),
         })
         const written = await store.createExclusive(record)
         if (written.ok) created.push(taskId)
@@ -450,11 +452,21 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           + `(\`${gateCommand}\`) did not pass. The task is recorded as ${outcome.code}, not completed. `
           + `Fix the workspace so the gate command exits 0, then retry.`
         : ''
+      // Silence rule (v1.1.1): a completion is not news. The Lead wakes on its own
+      // schedule and reads the pool; a per-task `send_message` here is pure token
+      // burn — it ends the Lead's turn and starts a fresh one for no new decision.
+      // The instruction is attached to every successful outcome only: a failure
+      // the worker must act on already carries `note`, and an escalation has its
+      // own channel (`swarm_escalate`), which stays the sole reason to ping.
+      const silence = outcome.ok && !gateDowngraded
+        ? 'Result saved to pool. Do not send_message to Lead. You are now idle.'
+        : ''
+      const parts = [outcome.message, note, silence].filter(part => part.length > 0)
       const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
       return {
         ok: outcome.ok,
         code: outcome.code,
-        message: note.length > 0 ? `${outcome.message} | ${note}` : outcome.message,
+        message: parts.join(' | '),
         completed_at: after.task?.completed_at ?? '',
         degraded: outcome.degraded ?? store.degraded ?? '',
       }
@@ -490,6 +502,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           ready: { type: 'integer' },
           stale: { type: 'integer' },
           stale_after_sec: { type: 'integer' },
+          overdue: { type: 'integer' },
           big_tasks: { type: 'array', items: { type: 'string' } },
           tasks: { type: 'array', items: { type: 'string' } },
           workers: { type: 'array', items: { type: 'string' } },
@@ -504,9 +517,15 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           + ` · claimed ${value.claimed ?? 0} · running ${value.running ?? 0}${stale > 0 ? ` (${stale} stale)` : ''}`
           + ` · completed ${value.completed ?? 0} · failed ${value.failed ?? 0} · blocked ${value.blocked ?? 0}`
           + ` · ready ${value.ready ?? 0}`
-        const hint = stale > 0
-          ? [`  ⚠ ${stale} task(s) older than ${value.stale_after_sec ?? 0}s — release with swarm_release or reap with swarm_reap if abandoned`]
-          : []
+        const overdue = value.overdue ?? 0
+        const hint = [
+          ...stale > 0
+            ? [`  ⚠ ${stale} task(s) older than ${value.stale_after_sec ?? 0}s — release with swarm_release or reap with swarm_reap if abandoned`]
+            : [],
+          ...overdue > 0
+            ? [`  ⏱ ${overdue} running task(s) past their own max_duration_ms — check whether the estimate was wrong or the worker is stuck`]
+            : [],
+        ]
         const workerLines = workers.length > 0
           ? ['  workers:', ...workers.map(line => `    ${line}`)]
           : []
@@ -525,6 +544,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       const blocked = views.filter(view => view.status === 'blocked').length
       const ready = views.filter(view => view.ready).length
       const stale = views.filter(view => view.stale).length
+      const overdue = views.filter(view => view.overdue).length
       const bigTasks = [...new Set(views.map(view => view.big_task_id).filter(id => id.length > 0))].sort()
       const taskLines = views.map(view => {
         let line = `${view.task_id} [${view.status}${view.ready ? ', ready' : ''}]`
@@ -532,6 +552,14 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         if (view.stale) {
           if (view.status === 'running') line += ` [STALE, running ${formatAge(view.running_age_sec ?? 0)} ago, heartbeat ${formatAge(view.heartbeat_age_sec ?? 0)} ago]`
           else line += ` [STALE, claimed ${formatAge(view.claimed_age_sec ?? 0)} ago]`
+        }
+        // Overdue is orthogonal to STALE: a task can be heartbeating happily and
+        // still have blown its own budget. The marker says "the estimate was
+        // wrong or the worker is stuck on the wrong problem" — it does not
+        // reclaim anything, because throwing away in-flight work is the Lead's
+        // call, not the renderer's.
+        if (view.overdue) {
+          line += ` [OVERDUE, running ${formatAge(view.running_age_sec ?? 0)} ago, budget ${formatAge(Math.floor(view.max_duration_ms / 1000))} — consider extending, splitting, or interrupting]`
         }
         if (view.blocked_by_open.length > 0) line += ` waiting on ${view.blocked_by_open.join(',')}`
         if (view.status === 'failed' || view.status === 'blocked') {
@@ -607,6 +635,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         ready,
         stale,
         stale_after_sec: staleAssignmentSec,
+        overdue,
         big_tasks: bigTasks,
         tasks: taskLines,
         workers: workerLines,
@@ -816,10 +845,16 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
     async execute(args) {
       const outcome = await escalateTask(store, args.task_id, args.agent_id, args.reason, args.force ?? false)
       const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
+      // Escalation is the one moment a worker is *supposed* to be noticed — but
+      // the notice is the `blocked` status in the pool, not a chat message. Say
+      // stop explicitly, or a worker that has just given up will keep going.
+      const stop = outcome.ok
+        ? 'Escalated successfully. The Lead has been notified. Stop working and remain silent.'
+        : ''
       return {
         ok: outcome.ok,
         code: outcome.code,
-        message: outcome.message,
+        message: stop.length > 0 ? `${outcome.message} | ${stop}` : outcome.message,
         failure_reason: after.task?.failure_reason ?? '',
         degraded: outcome.degraded ?? store.degraded ?? '',
       }

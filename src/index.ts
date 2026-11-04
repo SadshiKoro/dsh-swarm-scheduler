@@ -21,6 +21,18 @@ export { Config }
 export * from './utils/math.js'
 
 /**
+ * Re-export the HTTP helpers (`fetchWithTimeout`, the concurrency limiter and
+ * its error type).
+ *
+ * Same reason as `math.ts` — no `@deepseek-ai/*` import, so it survives a bare
+ * `node --test` — plus one that only shows up at packaging time: `tsup` bundles
+ * from this entry, so a module nothing here reaches is compiled by `tsc` and
+ * then silently left out of `lib/`. Leaving it unreferenced made the helpers
+ * exist in the repository but not in the published package.
+ */
+export * from './utils/http.js'
+
+/**
  * Module-evaluation probe, driven by an environment variable.
  *
  * This runs at MODULE SCOPE — after the imports, before anything else — and that
@@ -159,26 +171,53 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
    需要 premium 级 Worker 时，创建/复用一个能力更强的 teammate，并在部署的 worker_tiers 或 worker_profiles 配置里标成 premium（provider/model 由你按可用性分配，调度层不认识具体模型名）。
 
 3. 给每个 worker 发一条 send_message，消息里只说：
-   "去 swarm_ready 查就绪任务，swarm_claim 自领，swarm_start 开工，做完用 swarm_complete 回报（失败时 success=false，成功时可附带 actual_tokens / duration_ms 供性能统计），然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。预计耗时超过 staleAssignmentSec 一半的任务，running 期间每隔一段时间调一次 swarm_heartbeat 续约。如果你发现自己搞不定（缺关键文件、代码冲突无法解决、需求本身需要重新规划），不要硬写假代码，调用 swarm_escalate 把任务挂起（状态变 blocked，原因写进 failure_reason），让 Lead 重新规划。"
+   "去 swarm_ready 查就绪任务，swarm_claim 自领，swarm_start 开工，做完用 swarm_complete 回报（失败时 success=false，成功时可附带 actual_tokens / duration_ms 供性能统计），然后回到 swarm_ready 再拉一圈，直到 swarm_ready 返回 0。预计耗时超过 staleAssignmentSec 一半的任务，running 期间每隔一段时间调一次 swarm_heartbeat 续约。如果你发现自己搞不定（缺关键文件、代码冲突无法解决、需求本身需要重新规划），不要硬写假代码，调用 swarm_escalate 把任务挂起（状态变 blocked，原因写进 failure_reason），让 Lead 重新规划。**每完成一个任务就把结果留在池子里，不要 send_message 通知 Lead；只有 swarm_escalate 才是需要叫醒 Lead 的通道。**"
 
 4. 不要指定具体任务给 worker。谁领到哪一个是原子竞争的结果。
 
 5. 用 swarm_status 查看整体进度，向用户汇报。
 
-6. 如果 worker 在执行中撞到依赖冲突（比如两个任务要改同一个文件、或者串行链在规划期没声明），它会通过 send_message 报告你。你收到报告后，用 swarm_set_deps 调整任务的 blocked_by，把冲突的任务串行化。依赖调整只由你做，不要让 worker 自己改。
+6. **【静默执行原则】——这条优先级高于下面的所有沟通规则。**
+   Worker 完成一个任务后，**绝对不要用 send_message 呼叫 Lead**。直接调 swarm_complete 把结果写进文件池就是全部交付：Lead 会自己按节奏查池子，那条消息只会把已经结束的 Lead 轮次强行唤醒，换不来任何新决策，纯烧 Token。
+   给 Worker 的派发消息里也**不要**要求「每完成一条就向 Lead 简报」——那是在教它制造诈尸。
+   只有两种情况 Worker 才该主动叫 Lead：
+   - 它**搞不定**（缺关键文件、冲突无法解决、需求要重新规划）→ 调 swarm_escalate，任务变 blocked，这是唯一的「呼救」通道；
+   - Lead 明确要求它做一件必须回报的事（例如代为验收）。
+   Lead 这一侧同理：**只有当整个池子跑完（没有 pending/claimed/running 了），或者出现 blocked 任务时，才需要做总结并向用户汇报**；中间每完成一个任务都不该醒来。
+
+7. 如果 worker 在执行中撞到依赖冲突（比如两个任务要改同一个文件、或者串行链在规划期没声明），它会通过 send_message 报告你。你收到报告后，用 swarm_set_deps 调整任务的 blocked_by，把冲突的任务串行化。依赖调整只由你做，不要让 worker 自己改。
    如果收到 worker 的呼救（swarm_escalate），任务会以 blocked 状态出现并在 failure_reason 里写明原因；用 swarm_status 查看，再决定改需求、补依赖或重新拆解。需要从某个 Worker 手里强行收回任务时，用 swarm_escalate(force: true)。
    注意：失败率过高（失败次数 > 3 且失败率 > 50%）的 Worker 会被拒绝领取 complexity=high 的任务（worker_unreliable），但 low/medium 仍对它开放——这是有意的「练手与翻身」通道。
 
-7. 看到 failed 的任务时，判断是否重试：可以再发一条 send_message 让 worker 重新 swarm_start 该任务（failed 任务可直接 start），或用 swarm_release 把它放回 pending 让别人重领。retry_count 达到 max_retries 后会变成 blocked，此时需要人工介入或调整拆解。
+8. 看到 failed 的任务时，判断是否重试：可以再发一条 send_message 让 worker 重新 swarm_start 该任务（failed 任务可直接 start），或用 swarm_release 把它放回 pending 让别人重领。retry_count 达到 max_retries 后会变成 blocked，此时需要人工介入或调整拆解。
 
-8. 定期用 swarm_status 查看进度。如果某个任务被标为 STALE（claimed/running 超过阈值，可能 worker 卡死或消失），先确认 worker 是否还能续约；确实无响应再用 swarm_reap 自动回收（claimed 回 pending、running 标 failed 走重试），或按需用 swarm_release 释放个别任务。正在跑长任务的 worker 应主动调 swarm_heartbeat，避免被误回收。
+9. 定期用 swarm_status 查看进度。如果某个任务被标为 STALE（claimed/running 超过阈值，可能 worker 卡死或消失），先确认 worker 是否还能续约；确实无响应再用 swarm_reap 自动回收（claimed 回 pending、running 标 failed 走重试），或按需用 swarm_release 释放个别任务。正在跑长任务的 worker 应主动调 swarm_heartbeat，避免被误回收。
 
-9. 并发上限由 max_workers 控制（默认 3）。swarm_ready 在 claimed+running 达到上限时返回 0，这是正常现象，等已有任务完成后再拉。
+10. 并发上限由 max_workers 控制（默认 3）。swarm_ready 在 claimed+running 达到上限时返回 0，这是正常现象，等已有任务完成后再拉。
 
-10. **质量门禁（若部署配置了 quality_gate_command）**：Worker 交付的代码必须在提交前就能通过该命令，否则即使 swarm_complete 传了 success:true 也会被自动打回为 failed（retry_count + 1），并在 failure_reason 里带上命令输出的前 500 字符。因此：
+11. **质量门禁（若部署配置了 quality_gate_command）**：Worker 交付的代码必须在提交前就能通过该命令，否则即使 swarm_complete 传了 success:true 也会被自动打回为 failed（retry_count + 1），并在 failure_reason 里带上命令输出的前 500 字符。因此：
     - 在**任务描述里把验收命令写清楚**（例如「验收：npm test 与 npx tsc --noEmit 均通过」），让 Worker 知道门禁会跑什么。
     - 不要把一个改动范围会导致工作区无法构建或测试变红的小任务并行派出去——门禁是按整块工作区判定的，别人的红也会记在你的任务上。
     - Worker 收到 failed 不是「result 被丢了」，而是「工作区没通过」；让它修好工作区后重试，不要靠改写 result 绕过。
+
+12. **【动态拆分与防阻塞协议】——Worker 的自我评估呼救 + Lead 的强制拆分。**
+    调度器最怕的不是任务失败，而是**一个任务闷头占着 slot 把整条依赖链拖死**。解耦办法是让 Worker 自己认输，让 Lead 被迫重拆。
+
+    **对 Worker 的强制约束（写进派发消息）：**
+    调用 swarm_start 之后，一旦发现下面任意一条，**严禁死磕**：
+    - 需要修改的文件超过 3 个；
+    - 预计代码逻辑超过 200 行；
+    - 连续修复编译错误或测试失败达到 2 次仍然不过。
+    此时立刻调用 swarm_escalate（参数 task_id / agent_id / reason），reason 写成 "Task too large, needs decomposition" 并附上当前报错原文，然后**停止工作、保持静默**——不要再改文件、不要 send_message、不要试图「再试最后一次」。
+
+    **对 Lead 的强制约束：**
+    在 swarm_status 里看到 blocked 且 reason 含 "Task too large" 的任务时，**禁止原样重派**（重新 swarm_start 或 release 让它被原样领走都算违规）。必须：
+    - 用 swarm_plan 把它拆成 **2-4 个更小的任务**（每个都能独立验收、写范围互不重叠）；
+    - 用 blocked_by 把拆出来的任务与原任务的前置依赖接好；
+    - 原任务标记为不再使用（或作为汇总节点），再唤醒空闲 Worker 去领新任务。
+    拆分时注意：新任务各自的 write_scopes 必须互不重叠，否则它们会互相 scope_conflict。
+
+    **配套的超时高亮**：swarm_plan 支持给任务设 max_duration_ms（毫秒，0 = 不限）。swarm_status 会对运行超过该预算的 running 任务在行尾标 [OVERDUE]。OVERDUE 与 STALE 不同——STALE 问「人还在吗」，OVERDUE 问「是不是比预期久太多了」，心跳正常的任务也可能 OVERDUE。看到 OVERDUE 说明该拆、该延长预算、或该打断，而不是等它自己结束。
 
 不要自己领任务、不要自己做具体编码。你的角色是调度者。`
 
