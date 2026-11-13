@@ -35,6 +35,7 @@ import {
   type TaskView,
 } from './state-machine.ts'
 import { findScopeConflict, normalizeScope, scopesOverlap } from './scope.ts'
+import { createWorkspace, mergeWorkspace, removeWorkspace } from './workspace.ts'
 
 // Re-exported so callers keep one import site for the pool surface.
 export {
@@ -846,7 +847,7 @@ export async function claimTask(
   clock: Clock = defaultClock,
   workerTiers?: Readonly<Record<string, string>>,
   workerProfiles?: Readonly<Record<string, WorkerProfileInput>>,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean; workspace?: string }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -1002,14 +1003,27 @@ export async function claimTask(
         }
       }
 
+      // Isolation for high-complexity work: run the attempt in a linked
+      // worktree so a bad merge can never damage the main checkout. Best-effort:
+      // a workspace root that cannot host a worktree still gets the claim, and
+      // the record simply keeps `workspace: ''` (the pre-v1.4.0 behaviour).
+      let workspace = ''
+      if (current.task.complexity === 'high') {
+        const created = createWorkspace(store.workspacePath, TASKS_DIR, taskId)
+        if (created.ok) workspace = created.path
+      }
+
       const next: TaskRecord = {
         ...current.task,
         status: 'claimed',
         claimed_by: claimedBy,
         claimed_at: clock().toISOString(),
+        workspace,
       }
       const written = await store.writeExisting(next)
       if (!written.ok) {
+        // Do not leave an orphan checkout behind when the claim itself was lost.
+        if (workspace !== '') removeWorkspace(workspace)
         return { ok: false, code: 'io_error', message: `claim not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
       }
       await logTransition(store, taskId, 'claim', claimedBy)
@@ -1019,6 +1033,7 @@ export async function claimTask(
         message: `${taskId} claimed by ${claimedBy}`,
         degraded: written.degraded ?? lock.degraded,
         ...staleLockCleared ? { stale_lock_cleared: true } : {},
+        workspace,
       }
     } finally {
       releaseLock(store.dirPath, taskId, lock.mode)
@@ -1076,6 +1091,7 @@ export async function releaseTask(
     status: 'pending',
     claimed_by: '',
     claimed_at: '',
+    workspace: '',
   }
   const written = await store.writeExisting(next)
   if (!written.ok) {
@@ -1086,6 +1102,9 @@ export async function releaseTask(
       degraded: written.degraded,
     }
   }
+  // A released claim abandons its isolated checkout; the next attempt gets a
+  // fresh one. Cleanup is best-effort and must not fail the release.
+  if (found.task.workspace !== '') removeWorkspace(found.task.workspace)
   // Clear the other half of the claim. Failure is not an error: a missing lock
   // is the normal case, and an undeletable one is cleared on the next claim.
   const hadLock = lockExists(store.dirPath, taskId)
@@ -1225,11 +1244,14 @@ export async function escalateTask(
     claimed_by: '',
     claimed_at: '',
     failure_reason: reason,
+    workspace: '',
   }
   const written = await store.writeExisting(next)
   if (!written.ok) {
     return { ok: false, code: 'io_error', message: `escalation not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
   }
+  // The holder is leaving; its isolated checkout is dead weight from here on.
+  if (found.task.workspace !== '') removeWorkspace(found.task.workspace)
   removeLock(store.dirPath, taskId)
   await logTransition(store, taskId, 'escalated', `${agentId}: ${reason}`)
   return {
@@ -1410,15 +1432,79 @@ export async function completeTask(
   // A gate failure is a failure with a reason: same retry path as below.
   const effectiveSuccess = success && gateFailure === undefined
 
+  // --- budget accounting (v1.4.0) ----------------------------------------
+  // A successful attempt's self-reported tokens accumulate even when the pool
+  // then refuses to call it completed: the spend happened either way.
+  const reportedTokens = typeof metrics?.actual_tokens === 'number'
+    && Number.isFinite(metrics.actual_tokens) && metrics.actual_tokens >= 0
+    ? metrics.actual_tokens
+    : 0
+  const tokensUsed = found.task.tokens_used + (effectiveSuccess ? reportedTokens : 0)
+  // The brake only fires on an attempt that would otherwise complete: a failed
+  // attempt already has its own retry accounting and must not be rewritten into
+  // a budget block (that would silently swallow the failure).
+  const budgetExceeded = effectiveSuccess
+    && found.task.max_budget_tokens > 0
+    && tokensUsed > found.task.max_budget_tokens
+
+  // --- isolation merge (v1.4.0) ------------------------------------------
+  // Merge before anything is written: if the isolated work cannot reach the
+  // main tree, "completed" would be a lie. A conflict blocks without
+  // overwriting the record into a completed/failed one.
+  let workspaceFailure: string | undefined
+  if (found.task.workspace !== '') {
+    if (effectiveSuccess && !budgetExceeded) {
+      const merged = mergeWorkspace(found.task.workspace)
+      if (!merged.ok) {
+        workspaceFailure = merged.conflict ? 'Merge conflict' : `Merge failed: ${merged.message}`
+      }
+    }
+    // The checkout has served its purpose from here on, whatever the outcome.
+    removeWorkspace(found.task.workspace)
+  }
+
   let next: TaskRecord
   let code: 'completed' | 'failed' | 'blocked'
   let message: string
-  if (effectiveSuccess) {
+  if (effectiveSuccess && budgetExceeded) {
+    next = {
+      ...found.task,
+      status: 'blocked',
+      claimed_by: '',
+      claimed_at: '',
+      completed_at: stamp,
+      result,
+      tokens_used: tokensUsed,
+      failure_reason: 'Budget exceeded',
+      workspace: '',
+    }
+    code = 'blocked'
+    message = `${taskId} blocked — budget exceeded (${tokensUsed} > ${found.task.max_budget_tokens} tokens)`
+  } else if (effectiveSuccess && workspaceFailure !== undefined) {
+    next = {
+      ...found.task,
+      status: 'blocked',
+      claimed_by: '',
+      claimed_at: '',
+      completed_at: stamp,
+      result,
+      tokens_used: tokensUsed,
+      failure_reason: workspaceFailure,
+      workspace: '',
+    }
+    code = 'blocked'
+    message = `${taskId} blocked — ${workspaceFailure}`
+  } else if (effectiveSuccess) {
     next = {
       ...found.task,
       status: 'completed',
       completed_at: stamp,
       result,
+      tokens_used: tokensUsed,
+      // A success ends the failure streak; the upgrade flag is not cleared by a
+      // single good run (it records that the model already needed replacing).
+      consecutive_failures: 0,
+      workspace: '',
     }
     code = 'completed'
     message = `${taskId} ${code}`
@@ -1429,28 +1515,26 @@ export async function completeTask(
     const reason = gateFailure !== undefined
       ? `Quality gate failed: ${gateFailure}`
       : (result || 'failed without reason')
+    // Consecutive-failure escalation: only when a model is assigned, so tasks
+    // without one keep the plain retry accounting. Two in a row marks the model
+    // as needing an upgrade; a success resets the streak (see above).
+    const hasModel = found.task.model !== ''
+    const streak = hasModel ? found.task.consecutive_failures + 1 : found.task.consecutive_failures
+    const needsUpgrade = hasModel && streak >= 2 ? true : found.task.needs_upgrade
     const newRetryCount = found.task.retry_count + 1
-    if (newRetryCount >= found.task.max_retries) {
-      next = {
-        ...found.task,
-        status: 'blocked',
-        completed_at: stamp,
-        result,
-        retry_count: newRetryCount,
-        failure_reason: reason,
-      }
-      code = 'blocked'
-    } else {
-      next = {
-        ...found.task,
-        status: 'failed',
-        completed_at: stamp,
-        result,
-        retry_count: newRetryCount,
-        failure_reason: reason,
-      }
-      code = 'failed'
+    const failureStatus = newRetryCount >= found.task.max_retries ? 'blocked' : 'failed'
+    next = {
+      ...found.task,
+      status: failureStatus,
+      completed_at: stamp,
+      result,
+      retry_count: newRetryCount,
+      failure_reason: reason,
+      consecutive_failures: streak,
+      needs_upgrade: needsUpgrade,
+      workspace: '',
     }
+    code = failureStatus
     message = gateFailure !== undefined
       ? `${taskId} ${code} — quality gate failed (command exited non-zero)`
       : `${taskId} ${code}`
@@ -1459,7 +1543,15 @@ export async function completeTask(
   if (!written.ok) {
     return { ok: false, code: 'io_error', message: `${code} not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
   }
-  await logTransition(store, taskId, gateFailure !== undefined ? `${code}:quality-gate` : code, completedBy)
+  // The budget brake explicitly drops the claim: the task is blocked, not held
+  // by a worker that already reported in.
+  if (budgetExceeded) removeLock(store.dirPath, taskId)
+  const event = budgetExceeded
+    ? 'blocked:budget'
+    : workspaceFailure !== undefined
+      ? 'blocked:merge'
+      : gateFailure !== undefined ? `${code}:quality-gate` : code
+  await logTransition(store, taskId, event, completedBy)
   // Reliability and performance telemetry: record the attempt, and on success
   // accumulate the worker's self-reported tokens/runtime. This feeds the
   // high-complexity reliability gate (see profileRefusal), never a low/medium one.
@@ -1548,12 +1640,14 @@ export async function reapTask(
         status: 'pending',
         claimed_by: '',
         claimed_at: '',
+        workspace: '',
       }
       const written = await store.writeExisting(next)
       if (!written.ok) {
         degraded = written.degraded
         continue
       }
+      if (task.workspace !== '') removeWorkspace(task.workspace)
       removeLock(store.dirPath, task.task_id)
       await logTransition(store, task.task_id, 'reap:released', 'reaper')
       reaped.push({ task_id: task.task_id, action: 'released', message: `${task.task_id} reverted to pending (stale claim)` })
@@ -1596,6 +1690,7 @@ export async function reapTask(
           result: task.result,
           retry_count: newRetryCount,
           failure_reason: 'heartbeat timeout',
+          workspace: '',
         }
         action = 'blocked'
       } else {
@@ -1606,6 +1701,7 @@ export async function reapTask(
           result: task.result,
           retry_count: newRetryCount,
           failure_reason: 'heartbeat timeout',
+          workspace: '',
         }
         action = 'failed'
       }
@@ -1614,6 +1710,8 @@ export async function reapTask(
         degraded = written.degraded
         continue
       }
+      // The worker is gone; its isolated checkout is unrecoverable work.
+      if (task.workspace !== '') removeWorkspace(task.workspace)
       await logTransition(store, task.task_id, `reap:${action}`, 'reaper')
       reaped.push({ task_id: task.task_id, action, message: `${task.task_id} marked ${action} (heartbeat timeout after grace period, retry ${newRetryCount}/${task.max_retries})` })
     }

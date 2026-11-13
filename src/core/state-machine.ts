@@ -82,6 +82,24 @@ export interface TaskRecord {
    * overdue marker costs nothing and leaves the decision where it belongs.
    */
   max_duration_ms: number
+  /** Model that executed (or is assigned to execute) the task; '' = unknown. */
+  model: string
+  /**
+   * Set when repeated failures indicate the assigned model is too weak.
+   *
+   * Advisory only: it routes future work, it never changes the six-state machine.
+   */
+  needs_upgrade: boolean
+  /** Failed completions since the last success; reset to 0 on success. */
+  consecutive_failures: number
+  /** Named checkpoints a resumed worker can restart from; strings only. */
+  anchors: string[]
+  /** Token budget ceiling; 0 means "no budget declared". */
+  max_budget_tokens: number
+  /** Tokens consumed across all attempts so far. */
+  tokens_used: number
+  /** Worktree path for isolated execution; '' means "run in the main checkout". */
+  workspace: string
 }
 
 /** A task plus the derived facts callers actually schedule on. */
@@ -153,6 +171,13 @@ export function blankTask(taskId: string, fields: Partial<TaskRecord> = {}): Tas
     estimated_tokens: fields.estimated_tokens ?? 0,
     max_cost_tokens: fields.max_cost_tokens ?? 0,
     max_duration_ms: fields.max_duration_ms ?? 0,
+    model: fields.model ?? '',
+    needs_upgrade: fields.needs_upgrade ?? false,
+    consecutive_failures: fields.consecutive_failures ?? 0,
+    anchors: fields.anchors ?? [],
+    max_budget_tokens: fields.max_budget_tokens ?? 0,
+    tokens_used: fields.tokens_used ?? 0,
+    workspace: fields.workspace ?? '',
   }
 }
 
@@ -173,6 +198,8 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
   const strings = (input: unknown): string[] =>
     Array.isArray(input) ? input.filter((item): item is string => typeof item === 'string') : []
   const num = (input: unknown): number => typeof input === 'number' && Number.isFinite(input) ? input : 0
+  const nonNegative = (input: unknown): number => Math.max(0, num(input))
+  const bool = (input: unknown): boolean => input === true
   const hashMap = (input: unknown): Record<string, string> => {
     if (typeof input !== 'object' || input === null || Array.isArray(input)) return {}
     const out: Record<string, string> = {}
@@ -209,6 +236,13 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
     estimated_tokens: Math.max(0, num(raw.estimated_tokens)),
     max_cost_tokens: Math.max(0, num(raw.max_cost_tokens)),
     max_duration_ms: Math.max(0, num(raw.max_duration_ms)),
+    model: typeof raw.model === 'string' ? raw.model : '',
+    needs_upgrade: bool(raw.needs_upgrade),
+    consecutive_failures: nonNegative(raw.consecutive_failures),
+    anchors: strings(raw.anchors),
+    max_budget_tokens: nonNegative(raw.max_budget_tokens),
+    tokens_used: nonNegative(raw.tokens_used),
+    workspace: typeof raw.workspace === 'string' ? raw.workspace : '',
   })
 }
 

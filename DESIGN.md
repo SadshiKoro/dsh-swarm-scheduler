@@ -1,20 +1,22 @@
 # DSH Multi-Session Parallel Coding Scheduler Plugin — Complete Design Document
 
-- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.2.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
+- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.4.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
 - Target runtime: DeepSeek Harness `0.2.0-rc.2` (Cordis ~4.0.4)
-- Test suite: **142 automated tests** (`npm test`, single-process, sandbox-safe)
-- **Current architecture (v1.2.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
+- Test suite: **193 automated tests** (`npm test`, single-process, sandbox-safe)
+- **Current architecture (v1.4.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
   The task pool is a **file pool** at `.dsh-tasks/<task_id>.json` guarded by atomic lock files — *not*
   the kernel's `agentTeams` task board. See §1 for the current design; **§1.4–§1.6 are superseded
   early-draft sections kept for history.**
 
 > **Reading order for new contributors.** §1 (current architecture) → §12.2 (why route B, the file
 > pool, won over the kernel task board) → §12.11–§12.13 (the v0.9.0 end-to-end stress report, the
-> v1.0.0 fix record, and the v1.1.0 quality gate + benchmark). Sections §0.1–§0.3 and §2–§11 are
+> v1.0.0 fix record, and the v1.1.0 quality gate + benchmark) → §12.14 (v1.2.0 anti-blockage) →
+> §12.15 (v1.4.0 isolation, budget, upgrade escalation, whisper inbox, anchor recall, and the
+> no-hidden-model-downgrade guarantee). Sections §0.1–§0.3 and §2–§11 are
 > **historical design notes from before the route-B decision**; they are useful as rationale, not as
 > a description of the shipped code.
 >
-> *Document revision: v2.3 (2026-10-31). Earlier revisions of this file recorded the pre-route-B design.*
+> *Document revision: v2.4 (2026-11-13). Earlier revisions of this file recorded the pre-route-B design.*
 
 ### Contents
 
@@ -30,6 +32,8 @@
 | §12.11 | **CURRENT** | v0.9.0 end-to-end stress report (the E2E evidence) |
 | §12.12 | **CURRENT** | v1.0.0 fix record: P1 / P3 / P5 shipped, P6 not reproduced, P2 / P4 out of scope |
 | §12.13 | **CURRENT** | v1.1.0: quality gate design, benchmark results, cross-process lock evidence |
+| §12.14 | **CURRENT** | v1.2.0: anti-blockage protocol (self-assessment escalation + forced re-splitting) |
+| §12.15 | **CURRENT** | v1.4.0: worktree isolation, budget circuit breaker, `needs_upgrade`, whisper inbox, anchor recall, and the no-hidden-model-downgrade guarantee |
 
 ---
 
@@ -127,17 +131,18 @@ knows about everything else.**
 | Layer | File(s) | Responsibility | Dependency rule |
 |---|---|---|---|
 | **Pure core** | `src/core/` | Six-state machine, task records and the derived views, readiness computation, the atomic claim lock, scope arithmetic, routing/gate refusals, retry and reaping rules | **Node built-ins only.** No `@deepseek-ai/*` import anywhere. This is what makes the scheduler testable in a plain `node --test` process with no host, no temp service, and no Cordis context |
-| **Host adapter** | `src/tools-file.ts`, `src/index.ts` | Exposes the core as **11 `swarm_*` tools**, wires `ctx.fs` for storage, and registers the dispatch protocol as a `ctx.systemPrompt` section (order 590) | The only modules that know Cordis exists |
-| **Storage** | `.dsh-tasks/<task_id>.json` + `<task_id>.log` + `.lock-<task_id>` | Durable task pool, per-task audit trail, per-claim lock | Plain files. No database, no daemon, no in-memory state that can diverge from disk |
+| **Host adapter** | `src/tools-file.ts`, `src/index.ts` | Exposes the core as **14 `swarm_*` tools**, wires `ctx.fs` for storage, and registers the dispatch protocol as a `ctx.systemPrompt` section (order 590) | The only modules that know Cordis exists |
+| **Storage** | `.dsh-tasks/<task_id>.json` + `<task_id>.log` + `.lock-<task_id>` + `inbox/<worker_id>.json` + `<tasksRoot>/workspaces/<task_id>` | Durable task pool, per-task audit trail, per-claim lock, per-worker whisper inbox, and optional isolated worktrees | Plain files (and plain git checkouts). No database, no daemon, no in-memory state that can diverge from disk |
 
 The core takes a filesystem slice as a *parameter* rather than reaching for a Cordis context. That
-single decision is why 125 tests can exercise the real scheduling rules — including the full
-concurrency suite — without standing up a DSH runtime.
+single decision is why the whole scheduling rule set — including the full concurrency suite and the
+real-git worktree suite — can be exercised without standing up a DSH runtime.
 
-### 1.2 The 11 tools
+### 1.2 The 14 tools
 
 `swarm_plan` · `swarm_ready` · `swarm_claim` · `swarm_start` · `swarm_heartbeat` · `swarm_complete` ·
-`swarm_release` · `swarm_reap` · `swarm_escalate` · `swarm_set_deps` · `swarm_status`
+`swarm_release` · `swarm_reap` · `swarm_escalate` · `swarm_set_deps` · `swarm_status` ·
+`swarm_whisper` · `swarm_inbox` · `swarm_recall`
 
 There is **no** `swarm_task_claim`, no `reassign`, no `team_task_*` wrapper, and no guard registered on
 kernel tools. The Lead is kept out of claiming **by protocol**, not by a tool-layer guard — see §12.2
@@ -2193,6 +2198,160 @@ Escalated successfully. The Lead has been notified. Stop working and remain sile
 `test/core/state-machine.test.ts` 新增 7 个用例，覆盖：预算 0 不告警、预算内不告警、超预算告警、**overdue 与 stale 相互独立**（心跳正常的超时任务 stale=false 但 overdue=true）、非 running 状态永不 overdue、`max_duration_ms` 经 JSON 往返不丢失、负值被 `coerceTask` 归零。
 
 全量由 135 → **142**，全部通过。
+
+## 12.15 v1.4.0：隔离、预算、升维、Whisper 与 Anchor 召回
+
+v1.2.0 解决的是「任务卡住」；v1.4.0 解决的是**并行之下另外五个会静默出错的地方**：
+
+| 缺陷 | 后果 | v1.4.0 的答案 |
+|---|---|---|
+| 多个 Worker 同时改同一个工作区 | 半成品互相覆盖，主分支被污染 | `high` 复杂度任务在**独立 git worktree** 中执行，回流走 `--no-ff` 合并；冲突打回 `blocked` |
+| 一个任务无限烧 token | 预算失控，且失败后无法归因 | `max_budget_tokens` + `tokens_used` **熔断**，越界记录为 `blocked` |
+| 模型太弱，反复失败却没人知道 | 同一个任务换人重试，问题原样复现 | 连续失败 2 次置 `needs_upgrade`，由 Lead **显式**换更强模型/Worker |
+| Lead 想追加指示只能 `send_message` | 打断 Worker 当前轮次，或叫醒不该叫醒的会话 | `swarm_whisper` / `swarm_inbox`：落盘、不打断、读即确认 |
+| 同一个问题被反复重新解决 | 上下文无法复用，历史结论埋在 result 里 | `anchors` + `swarm_recall`：按持久定位符召回 |
+
+### 12.15.1 `TaskRecord` 新增字段
+
+全部为**向后兼容的可选字段**：旧池子里的 JSON 没有它们时，`coerceTask` 补齐默认值，六状态机语义不变。
+
+| 字段 | 类型 / 默认 | 含义 |
+|---|---|---|
+| `model` | `string` / `''` | 本任务被**记录**为使用的模型名；`''` = 继承（渲染为 `inherit`）。只用于展示与审计 |
+| `needs_upgrade` | `boolean` / `false` | 连续失败达到阈值后的**建议换模型**标记；纯建议，不改变任何状态迁移 |
+| `consecutive_failures` | `number` / `0` | 上一次成功之后的连续失败次数；成功时归零 |
+| `anchors` | `string[]` / `[]` | 2–3 个持久定位符（`文件:行`、符号名），供 `swarm_recall` 搜索 |
+| `max_budget_tokens` | `number` / `0` | 整任务（跨多次尝试）的 token 预算上限；0 = 不限 |
+| `tokens_used` | `number` / `0` | 已累计消耗的 token；只由**成功**的尝试累加 |
+| `workspace` | `string` / `''` | 隔离 worktree 的绝对路径；`''` = 在主工作区执行（1.4.0 之前的行为） |
+
+读取路径全部经过 `coerceTask` 白名单：`needs_upgrade` 只有字面 `true` 才为真，数字字段被 `Math.max(0, …)` 归零，`anchors` 只保留字符串。**不信任池子文件**是既有原则，新字段不例外。
+
+### 12.15.2 Worktree 隔离与「合并冲突 = 打回」
+
+**触发条件**：`swarm_claim` 成功后，仅当 `complexity === 'high'` 时创建隔离工作区。
+
+**创建**（`src/core/workspace.ts`）：`git worktree add --detach <tasksRoot>/.dsh-tasks/workspaces/<task_id> HEAD`。路径记录进 `workspace` 字段，`swarm_claim` 的返回值把它打印出来，Worker 必须在**那里**编辑——在主 checkout 里改，合并时看不见。
+
+**回流**（`swarm_complete`，成功且未触发预算熔断时）：
+
+1. 在 worktree 里 `git add -A`，无改动则直接返回 `ok: true`（空工作区不是错误）；
+2. 建临时分支 `swarm-merge-<taskid>-<pid>-<ts>-<rand>` 并提交（身份用 `-c user.name/user.email/commit.gpgsign=false` 注入，不依赖宿主配置，也不会触发签名提示）；
+3. 在**主 worktree** 里 `git merge --no-ff <branch>`；
+4. 失败时用 `git rev-parse -q --verify MERGE_HEAD` 判断是否真的停在冲突上：是则 `git merge --abort`，主 HEAD 原样不动，返回 `{ ok: false, conflict: true }`。
+
+**冲突的语义是 `blocked`，不是 `failed`。** 冲突意味着「两块工作真的撞了」，换个人重跑并不会让它消失；重试只会再撞一次。因此 `completeTask` 把它写成 `status: 'blocked'`、`failure_reason: 'Merge conflict'`（其他合并失败写 `Merge failed: <git 输出>`），并**不**把记录写成 `completed`——合并没进主树，`completed` 就是谎言。
+
+**清理是幂等的**：`release` / `escalate` / `reap`（release 或 heartbeat timeout）/ `complete` 的任何结局都会 `removeWorkspace`；claim 写盘失败也会立刻删除刚创建的 checkout，避免留下孤儿 worktree。`git worktree remove --force` 从主 worktree 执行，不存在的目录视为成功。
+
+**失败尝试的产出被丢弃**（不合并、只删除）。这是刻意的：失败分支上的半成品没有经过验收，合并它等于把已知有问题的代码塞进主树。
+
+**降级是显式的**：不在 git 仓库里、或 `git worktree add` 失败时，claim 仍然成功，`workspace` 保持 `''`，行为等价于 1.4.0 之前。隔离是**安全增益**，不是硬保证——这与 v1.0 的 `ctx.fs` 降级原则一致：能降级，但必须可见。
+
+### 12.15.3 预算熔断：`max_budget_tokens`
+
+`completeTask` 在落盘前做一次记账：
+
+```text
+reportedTokens = actual_tokens（仅当是有限非负数，否则 0）
+tokensUsed     = 记录里的 tokens_used + (effectiveSuccess ? reportedTokens : 0)
+budgetExceeded = effectiveSuccess && max_budget_tokens > 0 && tokensUsed > max_budget_tokens
+```
+
+四条刻意的设计决定：
+
+1. **只累加成功尝试的 token。** 失败的尝试走自己的重试账本（`retry_count`），把它的消耗混进预算会让「失败」与「超支」两个事实互相污染；而一次通过质量门禁的尝试，钱是真花了，所以即使随后因预算被拦，`tokens_used` 也要落下。
+2. **严格大于才熔断。** 恰好等于上限是允许的——预算写的是「不能超过」。
+3. **只在「本来会成功」的路径上熔断。** 一个已经失败的尝试若被改写成「预算超支」，真实失败原因就被吞掉了。失败有失败的账。
+4. **熔断的结果是 `blocked` 而不是 `failed`。** 任务没有做错，是这个块太贵；该由人决定追加预算、拆小，还是换更省的 Worker。同时 `removeLock` 掉认领锁——认领者已经交付，不该继续占着 slot。事件记 `blocked:budget`。
+
+**代价要说清楚**：熔断发生在完成时，无法中途叫停。一次尝试可以超支后才被记账；且超支时**不合并** worktree（与失败尝试同一处理），已完成的产出被丢弃。它是检查点，不是 kill switch。
+
+### 12.15.4 `needs_upgrade`：失败升维
+
+```text
+hasModel = model !== ''
+streak   = hasModel ? consecutive_failures + 1 : consecutive_failures
+needsUpgrade = hasModel && streak >= 2 ? true : needs_upgrade
+```
+
+- **必须有 `model` 才计数。** 没有记录模型的任务，失败只走普通重试账本；给一个「不知道是谁跑的」任务贴「该换模型」是凭空发明事实。
+- **阈值 2。** 一次失败可能只是题目难；同一任务连续两次失败，最可能的解释是执行它的模型/Worker 不胜任——这正是需要 Lead 干预的信号，而不是再来一次。
+- **成功清零 streak，但不清 `needs_upgrade`。** 一次侥幸通过不能证明弱者变强了；标记记录的是「已经发生过需要替换的证据」。
+- **纯建议。** 状态机、路由拒绝码都不看它；它只是 `swarm_status` 行尾的 `⚠ needs_upgrade`。
+
+### 12.15.5 Whisper 信箱：`swarm_whisper` / `swarm_inbox`
+
+**为什么不是 `send_message`**：`send_message` 会**开始一个 turn**。这对「马上回来」是对的，对「你下次开工时从 max-4 开始」是错的——它会打断 Worker 正在做的事，或者叫醒一个本该静默的会话（§6 的静默执行原则）。whisper 是落盘的：Worker 忙、闲、甚至还没被创建，话都在；直到它主动来取，成本为零。
+
+**存储**：`<tasksRoot>/.dsh-tasks/inbox/<worker_id>.json`，一个 Worker 一个文件，内容为 `InboxEntry[]`（`ts` 由写入侧本地时钟生成，`from` 默认 `lead`，`text` 已 trim）。
+
+**投递语义**：
+
+- **append 不做「读-改-写」的竞态窗口**：重新读文件、追加、写临时文件、`rename` 就位——读者永远看不到半截数组；
+- `readInbox` 是 **ack**：先 `rename` 走（`<file>.<pid>.ack`），再读、再删。先清后读正是并发 append 安全的关键——append 看到原文件不存在，就写一个新文件，而不是被清理步骤删掉；
+- 第二次读只会拿到**新写入的那批**，重复读不是确认；空信箱是 `ok: true`，不是错误；
+- 损坏的文件当作空信箱消费掉（并允许下一次 append 覆盖它）：一个 JSON 语法错误不该让 Worker 永远取不到指令；
+- `worker_id` 直接进路径，因此用 `^[A-Za-z0-9][A-Za-z0-9._-]*$` + 拒绝 `..` 做**包含性校验**，`../lead` 写不出 inbox 目录；
+- 单条 **≤ 1000 字符**：它是指令，不是第二份任务书/交接文档；长内容属于任务描述或仓库文件。
+
+所有函数返回结果对象而非抛异常：信箱故障**不允许**让触发它的 claim/plan 失败。
+
+**使用节奏**：派发协议要求 Worker **每 3 步、以及每个任务开始前后** 调一次 `swarm_inbox`。需要立刻唤醒、改派或中断，仍然用 `send_message`。
+
+### 12.15.6 Anchor 与 `swarm_recall`
+
+**anchor 是什么**：一条**能被再次命中的持久定位符**——`src/core/task-store.ts:claimTask`、`TaskStore.writeExisting`、某个决策 id。它回答「去哪找」，而不是「做了什么」；「已完成」「测试全绿」这类描述不是 anchor，因为搜它没有意义。
+
+**写入**：`swarm_plan` 可带 `anchors`（trim、去空）；`swarm_complete` 也可带，且在**状态迁移之前**写进记录——`completeTask` 会 `spread` 它读到的记录，完成后再补写就是与第一次写竞争的第二写。补写只对 `claimed`/`running` 的任务生效，且**best-effort**：记不下 anchor 不能把一件已完成的工作变成失败任务。
+
+**检索**（`src/core/recall.ts`）：四个字段 `anchor` → `title` → `description` → `result`，大小写不敏感**子串**匹配，无分词器、无模糊距离。
+
+- 排序按「最早命中的字段」的质量，anchor 高于 title，高于 description/result；同质量按 `task_id` 排序，因此同一查询两次返回同一份 shortlist（目录遍历顺序不稳定，排序不能也不该依赖它）。
+- 命中结果报告 `matchedIn`，让调用者分得清「这个任务就是在讲它」和「它的某一步顺带提过」。
+- `limit` 默认 20，`0` 表示不设上限；空查询不匹配任何东西（否则每次调用都返回全池）。
+- **不猜**：近似匹配是猜测，而 Worker 按错误 anchor 行动会浪费一整轮——这是本设计刻意拒绝的功能。
+- 池子读不出来时，`swarm_recall` 报告 `ok: false` 并带 `degraded`，而不是把「读失败」伪装成「无命中」——后者是静默错误，代码库在别处同样拒绝。
+
+### 12.15.7 明确保证：没有暗中模型降级，模型控制权归开发者
+
+这一条是**用「不存在」实现的**，不是配置项：
+
+- 调度器不认识 provider，没有模型客户端，没有任何「失败→换便宜模型→重试」的分支；
+- `model` 只是被记录。`swarm_status` 行尾的 `[ROUTING] Task <id> on <model|inherit>` 是**展示**，不是决策；
+- `needs_upgrade` 只是建议。把它变成动作的，只有 Lead/开发者；
+- 任务连续失败，`swarm_release` 让它回到池子，下一个**声明了能力**的 Worker 原子竞争——换的是 Worker，而且这是既有路由规则的结果，不是模型降级；
+- 质量门禁失败、预算超支、合并冲突都不会触发任何模型替换，只产生 `failed`/`blocked` 记录。
+
+用一句话写进 README 与协议文本：
+
+> **There is no hidden model downgrade: model control belongs to the developer.**
+> 调度器不做、也不会做任何自动换模型；`model` 是记录，`needs_upgrade` 是信号，换模型是人的显式动作。
+
+**为什么要写成声明**：并行调度里最危险的不是调度器做错决定，而是它**替人做了一个没人同意的决定**——悄悄把任务交给更弱的模型，短期看「有产出」，长期看质量下降且无人归因。能力路由（§12.6）选择的是**声明过能力**的 Worker，而不是偷偷降级；两者边界必须写清楚。
+
+### 12.15.8 测试
+
+v1.4.0 新增 **39** 个用例，全量 **193** 个全部通过（单进程、沙箱安全）：
+
+| 测试文件 | 用例数 | 覆盖 |
+|---|---:|---|
+| `test/core/workspace.test.ts` | 6 | 真实 `git`：detached worktree 创建、已存在路径拒绝、`--no-ff` 回流、空工作区 no-op、冲突且主 HEAD 不变、`removeWorkspace` 幂等 |
+| `test/core/inbox.test.ts` | 10 | append 保序、读即 ack、二次读为空、损坏文件消费为空、单条坏记录被跳过、路径逃逸 id 被拒、空 whisper 被拒、并发 append 在 drain 中幸存 |
+| `test/core/recall.test.ts` | 10 | 大小写不敏感、四字段命中、anchor 高于 title、同质量按 id 稳定、limit、空查询不匹配、真实池子端到端 |
+| `test/core/state-machine.test.ts` | +5 | 新字段默认值、显式值保留、JSON 往返、类型白名单、缺失字段回落 |
+| `test/core/task-store.test.ts` | +8 | 预算熔断/累加/恰好等于上限、连续失败置 `needs_upgrade`、无 model 不计数、高复杂度完成回流、冲突打回、release 清理 worktree |
+
+**一处需要记录的数字修正**：`README.md` 与本文档此前分别写着 135 / 142 个测试，而用 `git show HEAD:test/...` 静态统计 v1.2.0 基线实际是 **154** 个。v1.4.0 是 154 + 39 = **193**，这是 `npm test` 的实际输出，文档现在以它为准。
+
+### 12.15.9 边界
+
+- **worktree 隔离仅覆盖 `high`**；`medium`/`low` 仍在主工作区顺序执行（它们本来就假定不会与别人撞车，且建 worktree 有真实成本）。
+- **隔离依赖 `git` 二进制与一个 git 仓库**；失败时静默降级为 `workspace: ''`，不阻止 claim。
+- **冲突不会被自动解决**：`blocked` + `Merge conflict` 等人（或拆小任务）处理；隔离分支的改动被丢弃，不会强行覆盖主树。
+- **预算不能中途刹车**，只能在完成记账时熔断；超支的产出不合并。
+- **whisper 不是交接通道**：≤1000 字符、按 Worker 的节奏取；关键指令仍应 `send_message`。
+- **recall 是子串匹配**：没有分词、同义、模糊；anchor 写得含糊就搜不到，这是刻意的「宁可没有，也不猜」。
 
 ## 13. References and evidence sources
 | Conclusion | Source |

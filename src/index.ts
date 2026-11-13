@@ -219,6 +219,21 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
 
     **配套的超时高亮**：swarm_plan 支持给任务设 max_duration_ms（毫秒，0 = 不限）。swarm_status 会对运行超过该预算的 running 任务在行尾标 [OVERDUE]。OVERDUE 与 STALE 不同——STALE 问「人还在吗」，OVERDUE 问「是不是比预期久太多了」，心跳正常的任务也可能 OVERDUE。看到 OVERDUE 说明该拆、该延长预算、或该打断，而不是等它自己结束。
 
+13. **【Whisper 信箱】——不打断的调度通道。**
+    - 想给某个 Worker 追加指示、又不想打断它当前轮次时，用 swarm_whisper(worker_id, message, from) 把话写进池子的 inbox/<worker_id>.json，而不是 send_message。一条 whisper ≤ 1000 字符：它是「下次开工先看一眼」，不是第二份任务书。
+    - Worker **每 3 步（以及每个任务开始前后）调一次 swarm_inbox(worker_id)** 检查信箱。它是 **ack 语义**：读一次即清空，第二次读只会返回新写入的那批；不要把重复读取当成确认。
+    - 需要**立刻唤醒、改派或中断**，仍然用 send_message；whisper 只在「不该叫醒的时候」使用。
+
+14. **【提交规范】——产物落盘，摘要 10 字。**
+    - **严禁用 send_message 发送长代码或长报告**：代码和文档写进仓库文件，结论写进 swarm_complete(result=...)，≤4000 字符，理想是 10 字左右的一句话 + 关键路径。
+    - 调用 swarm_complete 时附 **2-3 个 anchors**（例如 dsh-swarm-scheduler/src/core/task-store.ts:claimTask）：锚点必须是能被 swarm_recall 命中的持久定位符，不能是「已完成」这类描述。写任务前先 swarm_recall(锚点/关键词)，别重复解决别人已经解决过的问题。
+    - 长交接（表格、权衡、被否掉的方案）放进仓库里的 handoff 文件，并在 result 里写它的路径。
+
+15. **【派发与知识边界】。**
+    - 派发消息**不带主会话历史**：Worker 看不到你这一轮的上下文，所以消息必须自包含（任务 id、写范围、验收命令、依赖关系）。
+    - Worker 不确定某个 API/字段存不存在时，**直接读源码**（src/core/*.ts 与工具定义），不要猜；猜出来的字段会让 tsc 或测试变红。
+    - **不存在任何自动模型降级/自动换模型**：调度器不认识 provider，也不会自作主张换模型。swarm_status 行尾的 [ROUTING] Task X on <model|inherit> 只是**记录**；同一任务连续失败两次会置 needs_upgrade=true，而「换成一个更强的模型/Worker」是 **Lead 唯一允许的替换动作**，必须由你显式执行——它绝不会自动发生。
+
 不要自己领任务、不要自己做具体编码。你的角色是调度者。`
 
 /**

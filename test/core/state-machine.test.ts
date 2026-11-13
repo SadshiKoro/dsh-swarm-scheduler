@@ -249,3 +249,88 @@ test('coerceTask rejects a negative max_duration_ms rather than trusting it', ()
   const revived = coerceTask(JSON.parse(JSON.stringify(task)), 'neg')
   assert.equal(revived?.max_duration_ms, 0)
 })
+
+// ------------------------------------------------------ v1.4.0 record fields ---
+
+test('blankTask defaults the v1.4.0 fields without touching the six-state machine', () => {
+  const task = blankTask('fresh')
+  assert.equal(task.model, '')
+  assert.equal(task.needs_upgrade, false)
+  assert.equal(task.consecutive_failures, 0)
+  assert.deepEqual(task.anchors, [])
+  assert.equal(task.max_budget_tokens, 0)
+  assert.equal(task.tokens_used, 0)
+  assert.equal(task.workspace, '')
+  // Adding fields must not change the default lifecycle state.
+  assert.equal(task.status, 'pending')
+})
+
+test('blankTask keeps explicitly supplied v1.4.0 fields', () => {
+  const task = blankTask('rich', {
+    model: 'deepseek-v4',
+    needs_upgrade: true,
+    consecutive_failures: 2,
+    anchors: ['core', 'store'],
+    max_budget_tokens: 50_000,
+    tokens_used: 12_345,
+    workspace: '.dsh-tasks/workspaces/rich',
+  })
+  assert.equal(task.model, 'deepseek-v4')
+  assert.equal(task.needs_upgrade, true)
+  assert.equal(task.consecutive_failures, 2)
+  assert.deepEqual(task.anchors, ['core', 'store'])
+  assert.equal(task.max_budget_tokens, 50_000)
+  assert.equal(task.tokens_used, 12_345)
+  assert.equal(task.workspace, '.dsh-tasks/workspaces/rich')
+})
+
+test('coerceTask preserves valid v1.4.0 fields through a JSON round-trip', () => {
+  const task = blankTask('rt2', {
+    model: 'deepseek-v4',
+    needs_upgrade: true,
+    consecutive_failures: 3,
+    anchors: ['a', 'b'],
+    max_budget_tokens: 1_000,
+    tokens_used: 999,
+    workspace: 'ws/path',
+  })
+  const revived = coerceTask(JSON.parse(JSON.stringify(task)), 'rt2')
+  assert.equal(revived?.model, 'deepseek-v4')
+  assert.equal(revived?.needs_upgrade, true)
+  assert.equal(revived?.consecutive_failures, 3)
+  assert.deepEqual(revived?.anchors, ['a', 'b'])
+  assert.equal(revived?.max_budget_tokens, 1_000)
+  assert.equal(revived?.tokens_used, 999)
+  assert.equal(revived?.workspace, 'ws/path')
+})
+
+test('coerceTask whitelists v1.4.0 types instead of trusting the file', () => {
+  const revived = coerceTask({
+    task_id: 'bad',
+    model: 42,
+    needs_upgrade: 'yes',
+    consecutive_failures: -4,
+    anchors: ['ok', 7, null, 'fine'],
+    max_budget_tokens: -100,
+    tokens_used: Number.NaN,
+    workspace: { path: 'nope' },
+  }, 'bad')
+  assert.equal(revived?.model, '')
+  assert.equal(revived?.needs_upgrade, false)
+  assert.equal(revived?.consecutive_failures, 0)
+  assert.deepEqual(revived?.anchors, ['ok', 'fine'])
+  assert.equal(revived?.max_budget_tokens, 0)
+  assert.equal(revived?.tokens_used, 0)
+  assert.equal(revived?.workspace, '')
+})
+
+test('coerceTask falls back to blank defaults when the field is absent', () => {
+  const revived = coerceTask({ task_id: 'legacy' }, 'legacy')
+  assert.equal(revived?.model, '')
+  assert.equal(revived?.needs_upgrade, false)
+  assert.equal(revived?.consecutive_failures, 0)
+  assert.deepEqual(revived?.anchors, [])
+  assert.equal(revived?.max_budget_tokens, 0)
+  assert.equal(revived?.tokens_used, 0)
+  assert.equal(revived?.workspace, '')
+})

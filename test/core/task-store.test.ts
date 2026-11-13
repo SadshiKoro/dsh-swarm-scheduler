@@ -18,6 +18,7 @@
  */
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
@@ -67,6 +68,25 @@ function readRaw(taskId: string): TaskRecord {
 
 function lockPath(taskId: string): string {
   return join(dir, TASKS_DIR, `${taskId}.lock`)
+}
+
+/** Commit identity for the temporary repositories built by workspace tests. */
+const GIT_IDENTITY = [
+  '-c', 'user.name=task-store-test',
+  '-c', 'user.email=task-store-test@localhost',
+  '-c', 'commit.gpgsign=false',
+]
+
+function gitIn(cwd: string, args: string[]): string {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true })
+  if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed (${result.status}): ${result.stderr}`)
+  return (result.stdout ?? '').trim()
+}
+
+/** Normalize line endings so a Windows CRLF checkout still compares equal. */
+function readText(path: string): string {
+  return readFileSync(path, 'utf8').replace(/\r\n/g, '\n')
 }
 
 // --------------------------------------------------------------- createTask ---
@@ -1105,4 +1125,172 @@ test('quality gate: an omitted gate keeps the pre-v1.1.0 signature working', asy
   assert.equal(outcome.code, 'completed')
   assert.equal(outcome.message, 't1 completed')
   assert.equal(readRaw('t1').status, 'completed')
+})
+
+// ------------------------------------------------------- v1.4.0 budget ---
+
+test('budget brake: exceeding max_budget_tokens blocks instead of completing', async () => {
+  await store.createExclusive(blankTask('t1', { max_budget_tokens: 100 }))
+  await claimTask(store, 't1', 'worker-a')
+  // A lock left behind must be cleared by the brake, like every other block.
+  writeFileSync(lockPath('t1'), 'stale\n')
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true, { actual_tokens: 150 })
+
+  assert.equal(outcome.code, 'blocked')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'blocked')
+  assert.equal(raw.failure_reason, 'Budget exceeded')
+  assert.equal(raw.tokens_used, 150)
+  assert.equal(raw.claimed_by, '')
+  assert.equal(raw.claimed_at, '')
+  assert.equal(existsSync(lockPath('t1')), false)
+})
+
+test('budget accounting: under the ceiling the tokens accumulate and the task completes', async () => {
+  await store.createExclusive(blankTask('t1', { max_budget_tokens: 1000, tokens_used: 100 }))
+  await claimTask(store, 't1', 'worker-a')
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true, { actual_tokens: 200 })
+
+  assert.equal(outcome.code, 'completed')
+  assert.equal(readRaw('t1').tokens_used, 300)
+})
+
+test('budget accounting: exactly at the ceiling is allowed (strictly greater blocks)', async () => {
+  await store.createExclusive(blankTask('t1', { max_budget_tokens: 100 }))
+  await claimTask(store, 't1', 'worker-a')
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true, { actual_tokens: 100 })
+
+  assert.equal(outcome.code, 'completed')
+  assert.equal(readRaw('t1').tokens_used, 100)
+})
+
+// -------------------------------------------------- v1.4.0 failure streak ---
+
+test('two consecutive failures mark the assigned model as needing an upgrade', async () => {
+  await store.createExclusive(blankTask('t1', { model: 'deepseek-flash', max_retries: 5 }))
+  await claimTask(store, 't1', 'worker-a')
+
+  await completeTask(store, 't1', 'boom-1', 'worker-a', undefined, false)
+  let raw = readRaw('t1')
+  assert.equal(raw.consecutive_failures, 1)
+  assert.equal(raw.needs_upgrade, false)
+
+  await startTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'boom-2', 'worker-a', undefined, false)
+  raw = readRaw('t1')
+  assert.equal(raw.consecutive_failures, 2)
+  assert.equal(raw.needs_upgrade, true)
+
+  // A success ends the streak (the upgrade flag itself stays: the model was
+  // already judged, one good run does not undo that).
+  await startTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'ok', 'worker-a')
+  raw = readRaw('t1')
+  assert.equal(raw.status, 'completed')
+  assert.equal(raw.consecutive_failures, 0)
+  assert.equal(raw.needs_upgrade, true)
+})
+
+test('failure streak is never invented for a task with no model assigned', async () => {
+  await store.createExclusive(blankTask('t1', { max_retries: 5 }))
+  await claimTask(store, 't1', 'worker-a')
+
+  await completeTask(store, 't1', 'boom-1', 'worker-a', undefined, false)
+  await startTask(store, 't1', 'worker-a')
+  await completeTask(store, 't1', 'boom-2', 'worker-a', undefined, false)
+
+  const raw = readRaw('t1')
+  assert.equal(raw.consecutive_failures, 0)
+  assert.equal(raw.needs_upgrade, false)
+})
+
+// ------------------------------------------------ v1.4.0 isolated workspace ---
+
+test('a completed high-complexity task merges its isolated work back', async () => {
+  writeFileSync(join(dir, 'file.txt'), 'base\n')
+  gitIn(dir, ['init', '-q'])
+  gitIn(dir, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+  gitIn(dir, ['add', 'file.txt'])
+  gitIn(dir, [...GIT_IDENTITY, 'commit', '-q', '-m', 'init'])
+
+  await store.createExclusive(blankTask('t1', { complexity: 'high' }))
+  const claimed = await claimTask(store, 't1', 'worker-a')
+  assert.equal(claimed.ok, true, claimed.message)
+  assert.ok(claimed.workspace !== undefined && claimed.workspace.length > 0)
+  const workspace = claimed.workspace as string
+  assert.equal(existsSync(workspace), true)
+  assert.equal(readText(join(workspace, 'file.txt')), 'base\n')
+
+  writeFileSync(join(workspace, 'file.txt'), 'isolated change\n')
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true)
+
+  assert.equal(outcome.code, 'completed')
+  assert.equal(readText(join(dir, 'file.txt')), 'isolated change\n')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'completed')
+  assert.equal(raw.workspace, '')
+  assert.equal(existsSync(workspace), false)
+})
+
+test('a merge conflict in an isolated workspace blocks instead of completing', async () => {
+  writeFileSync(join(dir, 'file.txt'), 'base\n')
+  gitIn(dir, ['init', '-q'])
+  gitIn(dir, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+  gitIn(dir, ['add', 'file.txt'])
+  gitIn(dir, [...GIT_IDENTITY, 'commit', '-q', '-m', 'init'])
+
+  await store.createExclusive(blankTask('t1', { complexity: 'high' }))
+  const claimed = await claimTask(store, 't1', 'worker-a')
+  assert.equal(claimed.ok, true, claimed.message)
+  const workspace = claimed.workspace as string
+  assert.ok(workspace !== undefined && workspace.length > 0)
+
+  // Both sides rewrite the same line: the merge must stop with a conflict.
+  writeFileSync(join(workspace, 'file.txt'), 'isolated\n')
+  writeFileSync(join(dir, 'file.txt'), 'main\n')
+  gitIn(dir, ['add', 'file.txt'])
+  gitIn(dir, [...GIT_IDENTITY, 'commit', '-q', '-m', 'diverges'])
+  const headBefore = gitIn(dir, ['rev-parse', 'HEAD'])
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true)
+
+  assert.equal(outcome.code, 'blocked')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'blocked')
+  assert.equal(raw.failure_reason, 'Merge conflict')
+  assert.equal(raw.workspace, '')
+  // The isolated checkout is gone, the main tree was never merged, and no
+  // in-progress merge state was left behind.
+  assert.equal(existsSync(workspace), false)
+  assert.equal(gitIn(dir, ['rev-parse', 'HEAD']), headBefore)
+  const mergeHead = spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], {
+    cwd: dir, encoding: 'utf8', windowsHide: true,
+  })
+  assert.notEqual(mergeHead.status, 0)
+  assert.equal(readText(join(dir, 'file.txt')), 'main\n')
+})
+
+test('release clears the isolated workspace of a claimed high-complexity task', async () => {
+  writeFileSync(join(dir, 'file.txt'), 'base\n')
+  gitIn(dir, ['init', '-q'])
+  gitIn(dir, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+  gitIn(dir, ['add', 'file.txt'])
+  gitIn(dir, [...GIT_IDENTITY, 'commit', '-q', '-m', 'init'])
+
+  await store.createExclusive(blankTask('t1', { complexity: 'high' }))
+  const claimed = await claimTask(store, 't1', 'worker-a')
+  const workspace = claimed.workspace as string
+  assert.ok(workspace.length > 0)
+  writeFileSync(join(workspace, 'file.txt'), 'work in progress\n')
+
+  const released = await releaseTask(store, 't1', 'lead')
+
+  assert.equal(released.ok, true)
+  assert.equal(existsSync(workspace), false)
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'pending')
+  assert.equal(raw.workspace, '')
 })

@@ -3,8 +3,8 @@
 A production-ready, event-driven parallel coding scheduler for DSH.
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Tests](https://img.shields.io/badge/Tests-135%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Version](https://img.shields.io/badge/Version-1.1.0-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Tests](https://img.shields.io/badge/Tests-193%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Version](https://img.shields.io/badge/Version-1.4.0-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 [![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 
 ## Overview
@@ -22,11 +22,49 @@ Three properties make the parallelism safe rather than merely fast:
 - **The pool heals itself.** Abandoned claims are released, silent workers are flagged before they
   are killed, and a worker that cannot finish escalates instead of writing code it knows is wrong.
 
-Version 1.1.0 is the current production release: the six-state lifecycle, routing gates, watchdog,
-conflict checks, and the quality gate are covered by 135 automated tests, including a 400-claim
-concurrency stress with zero observed double-claims. v1.1.0 adds a **quality gate** — a deployment can
-make "done" a checked fact rather than a worker's claim — and a reproducible **benchmark** that
-measures capability routing against blind round-robin.
+Version 1.4.0 is the current production release: the six-state lifecycle, routing gates, watchdog,
+conflict checks, and the quality gate are covered by 193 automated tests, including a 400-claim
+concurrency stress with zero observed double-claims. v1.1.0 added the **quality gate** — a deployment
+can make "done" a checked fact rather than a worker's claim — and a reproducible **benchmark** that
+measures capability routing against blind round-robin; v1.2.0 added the anti-blockage protocol.
+**v1.4.0 adds the isolation and knowledge layer**: high-complexity work runs in a linked git worktree
+whose merge conflict blocks the task instead of damaging the main checkout, a task token budget that
+trips a circuit breaker, `needs_upgrade` escalation when a recorded model keeps failing, a
+non-interrupting **whisper inbox**, and **anchor recall** for finding earlier work. It also states,
+explicitly, the property the feature set was built to keep: **there is no hidden model downgrade —
+model control belongs to the developer.**
+
+## What's new in 1.4.0
+
+- **Worktree isolation and blocked merges.** A `high`-complexity claim creates a detached linked
+  worktree under `<tasksRoot>/.dsh-tasks/workspaces/<task_id>` and records its path in the task. Work happens
+  there; `swarm_complete` commits it on a temporary branch and merges it back with `git merge --no-ff`.
+  A conflict aborts the merge in the **main** worktree and records the task as `blocked` (`Merge
+  conflict`) — the main checkout's HEAD is left exactly where it was, and "completed" is never a lie.
+  Releases, escalations, reaps and failed claims all remove the checkout they abandon.
+- **Budget circuit breaker.** `max_budget_tokens` caps a task's tokens **across attempts**
+  (`tokens_used`). A success that would push the total past the ceiling is recorded as `blocked`
+  (`Budget exceeded`) rather than completed. Exactly at the ceiling is allowed — the comparison is
+  strictly greater. A failed attempt keeps its own retry accounting and is never rewritten as a
+  budget block.
+- **`needs_upgrade` escalation.** A task may record the `model` assigned to it. Two consecutive
+  failures on a task that has a model set `needs_upgrade: true`; a success resets the streak but does
+  **not** clear the flag. The flag is advisory: it tells the Lead the assignment should be replaced.
+  It never changes the six-state machine and it never swaps a model by itself.
+- **Whisper inbox.** `swarm_whisper` writes one short instruction (≤ 1000 chars) into
+  `.dsh-tasks/inbox/<worker_id>.json`; the worker drains it with `swarm_inbox`, ideally every three
+  steps and around each task. Delivery is durable — a whisper survives a busy, idle, or not-yet-spawned
+  worker — and reading is an **ack**: the file is renamed away first, so a second call returns only the
+  next batch, and a concurrent append is not lost. Use `send_message` when you need a turn to start;
+  use a whisper when you do not.
+- **Anchors and recall.** `swarm_plan` accepts `anchors` and `swarm_complete` attaches them; an anchor
+  is a durable pointer such as `src/core/task-store.ts:claimTask`, not a summary. `swarm_recall`
+  searches anchors, titles, descriptions and results (case-insensitive substring), ranks anchor hits
+  above title, description and result hits, breaks ties by task id, and reports which field matched.
+- **No hidden model downgrade.** The scheduler has no provider and no fallback. `model` is a recorded
+  assignment; `swarm_status` renders it as `[ROUTING] Task … on <model|inherit>` and will not choose,
+  swap, or silently downgrade one. "Model control belongs to the developer" is a guarantee enforced by
+  the absence of such a code path, not by configuration.
 
 ## Core Features
 
@@ -49,7 +87,22 @@ measures capability routing against blind round-robin.
   stale one with `hash_mismatch`.
 - **Escalation protocol** — `swarm_escalate` hands a task back as `blocked` with a reason instead of
   waiting for a timeout or shipping known-bad code. The tool replies with an explicit stop instruction,
-  so a worker that has just given up does not keep going.
+  so a worker that has just given up does not keep going. Since 1.4.0 there is a second, quieter
+  channel: a **whisper** into a worker's inbox steers it without starting a turn.
+- **Worktree isolation, with the main tree protected** — a `high`-complexity claim gets its own
+  detached git worktree, and the merge back is `--no-ff`. A conflict aborts in the main worktree and
+  blocks the task; the main HEAD is never left mid-merge. Isolation is best-effort: outside a git
+  repository the claim still succeeds and simply keeps `workspace: ''`, which is the pre-1.4.0
+  behaviour.
+- **Task-level token budget** — `max_budget_tokens` (0 = unlimited) is checked against `tokens_used`,
+  which accumulates across attempts. Crossing it on an otherwise-successful attempt records `blocked`
+  with `Budget exceeded` instead of `completed`; the claim lock is dropped with it.
+- **`needs_upgrade` from repeated failure** — two consecutive failed completions on a task with a
+  recorded `model` set the advisory flag; a success resets the streak, and the flag itself stays until
+  a person replaces the assignment. Nothing in the scheduler chooses or downgrades a model.
+- **Anchors and recall** — anchors are durable `file:line`/symbol pointers recorded at plan or
+  completion time; `swarm_recall` finds earlier work by anchor, title, description or result, with a
+  deterministic ranking (anchor > title > description > result, ties by task id).
 - **Anti-blockage: self-assessment and forced re-splitting** — the failure mode a scheduler fears is not
   a failed task but a task that quietly holds a slot and stalls its whole dependency chain. Workers are
   instructed to give up early — more than 3 files to touch, more than ~200 lines of logic, or two
@@ -66,9 +119,13 @@ measures capability routing against blind round-robin.
   runs that command, and a **non-zero exit turns the completion into a failure** (`retry_count + 1`,
   with the command's output quoted into `failure_reason`). A worker saying "done" is a claim, not a
   decision. Off by default: an empty command changes nothing.
-- **Test coverage** — 142 automated tests, including a claim-lock stress suite of 400 concurrent
-  claims (10 workers × 2 cases × 20 rounds) that produced zero double-claims, and a cross-process
-  case where two real OS processes race one lock file.
+- **Explicit non-feature: no model control** — the scheduler knows nothing about providers and has no
+  code path that selects, swaps, or downgrades a model. `model` is a recorded assignment, `needs_upgrade`
+  is a signal, and replacing either is an explicit Lead action. Model control belongs to the developer.
+- **Test coverage** — 193 automated tests, including a claim-lock stress suite of 400 concurrent
+  claims (10 workers × 2 cases × 20 rounds) that produced zero double-claims, a cross-process
+  case where two real OS processes race one lock file, and six real-git worktree cases covering
+  create/merge/conflict/remove.
 
 ## Installation
 
@@ -165,8 +222,10 @@ The minimal loop is three steps.
    `write_scopes` (declare it whenever tasks could touch the same directory — see the conflict note
    below), the routing fields `complexity`, `required_worker_tier`, `required_capabilities`,
    `estimated_tokens`, `max_cost_tokens`, plus `max_duration_ms` (marks the task `[OVERDUE]` in
-   `swarm_status` once a run exceeds it — a nudge, not a kill), `priority`, `required_files` and
-   `required_hashes`. An existing `task_id` is never overwritten: a repeat plan reports it as a
+   `swarm_status` once a run exceeds it — a nudge, not a kill), `model` (the recorded assignment;
+   informational, never a dispatch decision), `max_budget_tokens` (the task-wide token ceiling),
+   `anchors` (2–3 durable `file:line`/symbol pointers for `swarm_recall`), `priority`, `required_files`
+   and `required_hashes`. An existing `task_id` is never overwritten: a repeat plan reports it as a
    conflict, so re-running `swarm_plan` cannot silently reset finished work.
 2. **Wake the workers.** Spawn teammates with `spawn_teammate`, or reuse idle ones with
    `send_message`, and point them at the pool. A worker's loop is `swarm_ready` → `swarm_claim` →
@@ -187,17 +246,20 @@ small tasks are executed directly.
 
 | Tool | Purpose | Core parameters |
 |---|---|---|
-| `swarm_plan` | Create the task pool; one JSON file per task | `tasks[]`: `task_id`, `big_task_id`, `title`, `description`, `write_scopes`, `blocked_by`, `priority`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`, `max_cost_tokens`, `max_duration_ms`, `required_files`, `required_hashes` |
+| `swarm_plan` | Create the task pool; one JSON file per task | `tasks[]`: `task_id`, `big_task_id`, `title`, `description`, `write_scopes`, `blocked_by`, `priority`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`, `max_cost_tokens`, `max_duration_ms`, `model`, `max_budget_tokens`, `anchors`, `required_files`, `required_hashes` |
 | `swarm_ready` | List tasks a worker can start right now | `big_task_id` (optional filter) |
-| `swarm_claim` | Atomically claim one task for one worker | `task_id`, `claimed_by` |
+| `swarm_claim` | Atomically claim one task for one worker; a `high`-complexity claim also returns an isolated `workspace` path | `task_id`, `claimed_by` |
 | `swarm_start` | `claimed → running`; records start time and first heartbeat | `task_id`, `started_by` |
 | `swarm_heartbeat` | Renew the lease on a held task | `task_id`, `agent_id` |
-| `swarm_complete` | Record the outcome; `success=false` triggers retry logic; a configured quality gate can downgrade a success | `task_id`, `result`, `completed_by`, `success`, `actual_tokens`, `duration_ms` |
-| `swarm_release` | Return a claimed task to the pool, clearing its lock | `task_id`, `released_by` |
-| `swarm_reap` | Watchdog sweep: release, flag STALE, or fail stale tasks | none |
+| `swarm_complete` | Record the outcome; `success=false` triggers retry logic; a configured quality gate can downgrade a success; a workspace merge conflict or an exceeded budget blocks it | `task_id`, `result`, `completed_by`, `success`, `actual_tokens`, `duration_ms`, `anchors` |
+| `swarm_release` | Return a claimed task to the pool, clearing its lock and its worktree | `task_id`, `released_by` |
+| `swarm_reap` | Watchdog sweep: release, flag STALE, or fail stale tasks (and remove their worktrees) | none |
 | `swarm_escalate` | Hand a task back as `blocked` with a reason (Lead may force); replies with an explicit stop instruction | `task_id`, `agent_id`, `reason`, `force` |
 | `swarm_set_deps` | Lead-only: replace a task's `blocked_by` list | `task_id`, `blocked_by[]`, `updated_by` |
-| `swarm_status` | Report the whole pool and per-worker performance | `include_log` |
+| `swarm_status` | Report the whole pool and per-worker performance, with `[ROUTING]` and `[budget]` annotations | `include_log` |
+| `swarm_whisper` | Leave an instruction in a worker's inbox without starting its turn (≤ 1000 chars) | `worker_id`, `message`, `from` |
+| `swarm_inbox` | Drain a worker's inbox (ack semantics: reading clears the slot) | `worker_id` |
+| `swarm_recall` | Find tasks by anchor, title, description or result (case-insensitive substring) | `query`, `limit` |
 
 For refusal codes, routing gates, and transition rules in full, see `DESIGN.md`.
 
@@ -207,14 +269,16 @@ The codebase is split along one line: the core knows nothing about DSH, and exac
 about everything else.
 
 - **`src/core/`** — the pure layer. It depends only on Node built-ins: the state machine, scope
-  comparison, the atomic claim lock, the reaper, dependency resolution, and hash verification. It
-  takes a filesystem slice as a parameter rather than reaching for a Cordis context, which is what
+  comparison, the atomic claim lock, the reaper, dependency resolution, hash verification, git
+  worktree isolation (`workspace.ts`), the whisper inbox (`inbox.ts`), and anchor recall (`recall.ts`).
+  It takes a filesystem slice as a parameter rather than reaching for a Cordis context, which is what
   makes it testable in a plain `node --test` process with no host and no temporary host state.
 - **`src/tools-file.ts`** — the host adapter and the only module that knows about Cordis. It
-  registers the eleven tools and translates between tool arguments and core calls.
+  registers the fourteen tools and translates between tool arguments and core calls.
 - **Storage** — a plain file pool at `.dsh-tasks/<task_id>.json`, guarded by an atomic lock per task.
-  There is no database, no daemon, and no in-memory state that can diverge from disk: a restart
-  resumes from exactly what is on disk.
+  Per-worker whispers live in `.dsh-tasks/inbox/<worker_id>.json`, and isolated checkouts under
+  `<tasksRoot>/.dsh-tasks/workspaces/`. There is no database, no daemon, and no in-memory state that can diverge
+  from disk: a restart resumes from exactly what is on disk.
 
 ## Known Limitations
 
@@ -238,6 +302,23 @@ about everything else.
 5. **Filesystem access degrades to `node:fs`.** When `ctx.fs` is refused by the sandbox, the plugin
    continues through `node:fs` and reports the degradation on later results. Lock semantics remain
    correct in stress testing, but the degraded path is the one with the least production mileage.
+6. **Worktree isolation is git-only and best-effort.** It applies to `high`-complexity claims only
+   (medium and low work runs in the main checkout). Outside a git repository, or when `git worktree
+   add` fails, the claim still succeeds with `workspace: ''` — the pre-1.4.0 behaviour — so isolation
+   is a safety improvement, not a hard guarantee. A merge conflict blocks the task and removes the
+   checkout; resolving it needs a person or a fresh, smaller task, because the isolated attempt's
+   changes are deliberately not forced onto the main tree.
+7. **The budget breaker only fires at completion time.** `max_budget_tokens` cannot stop a run
+   mid-flight: it is evaluated when `swarm_complete` arrives, so an attempt can overshoot the ceiling
+   and only then be recorded as `blocked` (`Budget exceeded`). It is a checkpoint, not a kill switch.
+8. **Whisper and recall are advisory file channels.** A whisper is not a task description: the
+   inbox is capped at 1000 characters per message and drained on the worker's schedule, so a critical
+   instruction still belongs in `send_message`. Recall is case-insensitive substring matching with no
+   tokenizer or fuzzy distance — a deliberate refusal to guess — so imprecise anchors return nothing.
+9. **`model` is recorded, never applied.** The scheduler cannot verify that a named model exists,
+   cannot select one, and has no fallback path. Recording `model` affects only the `[ROUTING]`
+   annotation; `needs_upgrade` only advises. Any actual substitution is an explicit action by the
+   developer or the Lead.
 
 ## Testing
 
@@ -248,9 +329,10 @@ about everything else.
 stdio in a confined environment and fails with `spawn EPERM`. Single-process execution avoids that
 entirely. `npm run test:sandbox` is a retained alias for the same command.
 
-The suite contains **135 tests** covering the six-state lifecycle, retry and blocked transitions,
+The suite contains **193 tests** covering the six-state lifecycle, retry and blocked transitions,
 scope admission, hash verification, routing refusals, the two-phase STALE window, the quality gate,
-and concurrent races. Three cases deserve note:
+the token budget and `needs_upgrade` accounting, worktree create/merge/conflict/remove, the whisper
+inbox and its ack semantics, anchor recall, and concurrent races. Six cases deserve note:
 
 - `test/core/stress.test.ts` runs 10 workers against 50 tasks over 10 scopes and asserts every task
   is claimed exactly once and that no two overlapping scopes were ever held simultaneously.
@@ -260,6 +342,16 @@ and concurrent races. Three cases deserve note:
 - `test/core/concurrency.test.ts` adds the **cross-process** case: two real OS processes race one
   `openSync(path, 'wx')` lock file, five rounds, exactly one winner and one `EEXIST` each time — plus
   a later third process that must lose to the already-held lock.
+- `test/core/workspace.test.ts` drives **real `git`** in temporary repositories: a detached linked
+  worktree is created, edits are merged back with `--no-ff`, an unchanged workspace is a clean no-op,
+  a conflict is reported while the main HEAD stays untouched, and removal is idempotent.
+- `test/core/inbox.test.ts` pins delivery semantics: append keeps both whispers, drain is an ack (the
+  second read returns the second batch), a concurrent append during a drain survives, an invalid or
+  path-traversal worker id is refused, and a corrupt inbox file is consumed as empty rather than
+  blocking the worker.
+- `test/core/recall.test.ts` pins the ranking and the refusal to guess: anchor hits outrank title,
+  title outranks description and result, ties are stable by task id, the limit is honoured, an empty
+  query matches nothing, and matching is case-insensitive substring only.
 
 Stress cases use a **wider clock budget on Windows** than on Linux/CI, because local filesystem
 latency dominates their wall time. Every functional assertion is identical on all platforms; only the

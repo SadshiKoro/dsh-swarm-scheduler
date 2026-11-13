@@ -1,12 +1,15 @@
 /**
- * The file-driven tool surface: ten tools, all of them plain task-pool I/O.
+ * The file-driven tool surface: fourteen tools, all of them plain task-pool I/O.
  *
  * None of these touch a Cordis service beyond `ctx.fs` (through `TaskStore`),
  * because every richer service this plugin once relied on proved unreachable
  * from its fiber. Dispatch is therefore not this plugin's job any more: the Lead
  * reads `swarm_ready` and assigns work with its own kernel subagent tools, while
- * this layer owns only the durable record of what exists, what is taken and what
- * finished.
+ * this layer owns only the durable record of what exists, what is taken, what
+ * finished — and the two side channels that keep a dispatch cheap: `swarm_whisper`
+ * (a message that does not start a turn), `swarm_inbox` (its drain) and
+ * `swarm_recall` (finding an earlier attempt by its anchors instead of by
+ * re-reading a handoff).
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -31,6 +34,8 @@ import {
   type TaskView,
   type WorkerProfileInput,
 } from './core/task-store.js'
+import { appendInbox, inboxSize, readInbox } from './core/inbox.js'
+import { recallTasks, RECALL_LIMIT_DEFAULT } from './core/recall.js'
 
 const text = (value: string) => [{ type: 'text' as const, text: value }]
 
@@ -38,6 +43,14 @@ const text = (value: string) => [{ type: 'text' as const, text: value }]
 const MAX_PLAN_TASKS = 200
 /** Longest accepted compressed result; detail belongs in a handoff file. */
 const MAX_RESULT_CHARS = 4_000
+/**
+ * Longest accepted whisper.
+ *
+ * A whisper exists to steer, not to hand over: past a paragraph the right medium
+ * is a task description or a file. The limit is what keeps `swarm_whisper` from
+ * becoming a hidden second result channel.
+ */
+const MAX_WHISPER_CHARS = 1_000
 
 /** Compact token count for the status line: 50000 -> "50k". */
 function formatTokens(tokens: number): string {
@@ -124,7 +137,10 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       + 'each of those files to a sha256 digest, so a changed prerequisite refuses the claim with `hash_mismatch`. '
       + 'Routing fields: `complexity`, `required_worker_tier`, `required_capabilities` (worker must declare every '
       + 'tag), `estimated_tokens` (must fit the worker context window) and `max_cost_tokens` (budget ceiling; '
-      + 'a worker whose rate would exceed it is refused with `worker_too_expensive`).',
+      + 'a worker whose rate would exceed it is refused with `worker_too_expensive`), `max_duration_ms` '
+      + '(per-attempt wall clock, surfaced as [OVERDUE]), `model` (the recorded assignment; empty means inherit), '
+      + '`max_budget_tokens` (task-wide token ceiling; crossing it blocks the task instead of completing it) and '
+      + '`anchors` (2-3 durable file:line/symbol pointers, searchable through swarm_recall).',
     parameters: {
       tasks: {
         type: 'array',
@@ -153,6 +169,9 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
             estimated_tokens: { type: 'number', description: 'Rough input size in tokens; must fit the worker context window. 0 means not estimated.' },
             max_cost_tokens: { type: 'number', description: 'Budget ceiling for this task cost (rate × tokens/1000). 0 means no ceiling.' },
             max_duration_ms: { type: 'number', description: 'Wall-clock budget for one attempt in ms; 0 means no limit. When a running task exceeds it, swarm_status marks it [OVERDUE] so the Lead knows to step in. Nothing is killed.' },
+            model: { type: 'string', description: 'Model this task is assigned to, as the scheduler records it (a name, never a provider decision). Empty means "inherit from the worker/session" and swarm_status shows `on inherit`. There is no automatic downgrade: this field is informational unless the Lead changes it.' },
+            max_budget_tokens: { type: 'number', description: 'Token budget for the whole task across attempts; 0 means no ceiling. A successful completion that would push tokens_used past it is recorded as blocked (Budget exceeded), not completed.' },
+            anchors: { type: 'array', description: '2-3 durable anchors: workspace-relative file:line or symbol paths that let a later worker find this work again. Searched by swarm_recall.', items: { type: 'string' } },
           },
         },
       },
@@ -233,6 +252,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           estimated_tokens: Math.max(0, spec.estimated_tokens ?? 0),
           max_cost_tokens: Math.max(0, spec.max_cost_tokens ?? 0),
           max_duration_ms: Math.max(0, spec.max_duration_ms ?? 0),
+          // v1.4.0: the routing surface. `model` is a recorded assignment, never
+          // a dispatch decision — the scheduler has no provider and no fallback.
+          model: (spec.model ?? '').trim(),
+          max_budget_tokens: Math.max(0, spec.max_budget_tokens ?? 0),
+          anchors: (spec.anchors ?? []).map(anchor => anchor.trim()).filter(anchor => anchor.length > 0),
         })
         const written = await store.createExclusive(record)
         if (written.ok) created.push(taskId)
@@ -360,10 +384,14 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
           stale_lock_cleared: { type: 'boolean' },
+          workspace: { type: 'string' },
           degraded: { type: 'string' },
         },
       },
       render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.workspace !== undefined && value.workspace !== ''
+          ? `\n  workspace: ${value.workspace} — work inside it; swarm_complete merges it back`
+          : '')
         + (value.stale_lock_cleared === true ? '\n  note: a stale lock left by a dead holder was cleared' : '')
         + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
     },
@@ -377,6 +405,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         claimed_by: after.task?.claimed_by ?? '',
         claimed_at: after.task?.claimed_at ?? '',
         stale_lock_cleared: outcome.stale_lock_cleared === true,
+        // Isolation (v1.4.0): a high-complexity claim happens in a linked git
+        // worktree. The path is printed so the worker edits *there* — an edit in
+        // the main checkout while a worktree is claimed would be invisible to the
+        // merge that completes the task.
+        workspace: outcome.workspace ?? after.task?.workspace ?? '',
         degraded: outcome.degraded ?? store.degraded ?? '',
       }
     },
@@ -390,7 +423,9 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       + 'worker\'s behalf when it reported back. The result is the compressed outcome — paths, decisions, '
       + 'evidence. Use success=false to mark a failure (will retry up to max_retries, then become blocked). '
       + 'On success you may report actual_tokens and duration_ms: they feed the per-worker performance '
-      + 'averages shown by swarm_status. A second completion of the same task is refused rather than silently accepted. '
+      + 'averages shown by swarm_status. Attach 2-3 `anchors` (workspace-relative file:line or symbol paths) '
+      + 'when you finish: they are what swarm_recall searches, so they must point at the work, not at a summary. '
+      + 'A second completion of the same task is refused rather than silently accepted. '
       + 'If this deployment configured `quality_gate_command`, every success claim runs that command first: a '
       + 'non-zero exit turns the completion into a failure (retry_count + 1), so `success: true` is a claim, '
       + 'not a decision.',
@@ -401,6 +436,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       success: { type: 'boolean', description: 'Whether the task succeeded (default true). False triggers retry logic.' },
       actual_tokens: { type: 'number', description: 'Optional self-report: tokens consumed by this task' },
       duration_ms: { type: 'number', description: 'Optional self-report: wall time spent on this task, in milliseconds' },
+      anchors: { type: 'array', description: '2-3 durable pointers (workspace-relative file:line or symbol paths) that let a later worker find this work with swarm_recall.', items: { type: 'string' } },
     },
     output: {
       schema: {
@@ -430,6 +466,21 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       // decision and the failure semantics live in `completeTask`. An empty or
       // whitespace-only command is omitted entirely rather than sent as `''`, so
       // "not configured" is a distinct fact from "configured as empty".
+      // Anchors are attached *before* the transition, never after: `completeTask`
+      // spreads the record it read, so a post-completion patch would be a second
+      // write racing the first. Only a claimed/running task is patched here — a
+      // missing or finished task is `completeTask`'s verdict to give, not ours.
+      const anchors = (args.anchors ?? []).map(anchor => anchor.trim()).filter(anchor => anchor.length > 0)
+      if (anchors.length > 0) {
+        const current = await store.readOne(args.task_id)
+        const held = current.task
+        if (held !== undefined && (held.status === 'claimed' || held.status === 'running')) {
+          // Best-effort by design: failing to record an anchor must not turn a
+          // finished piece of work into a failed task. `completeTask` below is
+          // the authority on the outcome.
+          await store.writeExisting({ ...held, anchors })
+        }
+      }
       const gateCommand = quality_gate_command.trim()
       const outcome = await completeTask(
         store,
@@ -568,6 +619,17 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           line += ')'
         }
         line += ` — ${view.title}`
+        // v1.4.0 routing visibility. `model` is a *recorded* assignment, not a
+        // choice this layer makes: nothing here can downgrade a model, so an
+        // empty value renders as `inherit` and `needs_upgrade` is the only signal
+        // that the assignment should be replaced — by the Lead, deliberately.
+        line += ` [ROUTING] Task ${view.task_id} on ${view.model !== '' ? view.model : 'inherit'}`
+        if (view.needs_upgrade) line += ' ⚠ needs_upgrade'
+        // Budget is per task across attempts, so `used` can already be non-zero on
+        // a retry. No ceiling renders as ∞ rather than 0 — "unlimited", not "free".
+        if (view.tokens_used > 0 || view.max_budget_tokens > 0) {
+          line += ` [budget: ${formatTokens(view.tokens_used)}/${view.max_budget_tokens > 0 ? formatTokens(view.max_budget_tokens) : '∞'}]`
+        }
         // Routing profile, only when it differs from the defaults (medium/any),
         // so ordinary lines stay readable.
         if (view.complexity !== 'medium' || view.required_worker_tier !== 'any') {
@@ -908,6 +970,222 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         blocked_by: outcome.blocked_by,
         updated_by: outcome.updated_by,
         degraded: outcome.degraded ?? store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ----------------------------------------------------------- swarm_whisper ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_whisper',
+    description:
+      'Leave a short message in a worker\'s inbox instead of waking it. `send_message` starts a turn — the right '
+      + 'tool for "come back now", the wrong one for "when you next pick up work, start from max-4": a whisper '
+      + 'survives a worker that is busy, idle, or not spawned yet, and costs nothing until it asks for work. '
+      + 'The worker drains it with `swarm_inbox`. Keep it to one instruction (max 1000 chars); a handoff belongs '
+      + 'in the task description or a file, not here.',
+    parameters: {
+      worker_id: { type: 'string', required: true, description: 'Agent id that will read it, e.g. worker-code-2' },
+      message: { type: 'string', required: true, description: 'The instruction, one paragraph at most' },
+      from: { type: 'string', description: 'Who is speaking. Default lead.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['written', 'invalid_worker', 'too_long', 'empty_message', 'io_error'] },
+          message: { type: 'string' },
+          path: { type: 'string' },
+          queue_size: { type: 'integer' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.message ?? ''}`
+        + (value.ok === true && (value.queue_size ?? 0) > 0 ? `\n  ${value.queue_size} whisper(s) now waiting` : '')
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      const workerId = args.worker_id.trim()
+      const from = (args.from ?? 'lead').trim() || 'lead'
+      if (args.message.trim().length === 0) {
+        return {
+          ok: false, code: 'empty_message' as const, message: 'whisper text is empty',
+          path: '', queue_size: 0, degraded: '',
+        }
+      }
+      if (args.message.length > MAX_WHISPER_CHARS) {
+        return {
+          ok: false, code: 'too_long' as const,
+          message: `whisper is ${args.message.length} chars; keep it under ${MAX_WHISPER_CHARS} — put a handoff in the task description or a file`,
+          path: '', queue_size: 0, degraded: '',
+        }
+      }
+      const written = appendInbox(store, workerId, args.message, from)
+      if (!written.ok) {
+        const invalid = written.error !== undefined && written.error.startsWith('invalid worker id')
+        return {
+          ok: false,
+          code: invalid ? 'invalid_worker' as const : 'io_error' as const,
+          message: written.error ?? 'whisper not written',
+          path: written.path,
+          queue_size: 0,
+          degraded: store.degraded ?? '',
+        }
+      }
+      // Counted by reading, never by draining: `readInbox` is an ack, so peeking
+      // this way keeps the queue intact and does not restamp its entries.
+      const queue = inboxSize(store, workerId)
+      return {
+        ok: true,
+        code: 'written' as const,
+        message: `whisper delivered to ${workerId} from ${from}`,
+        path: written.path,
+        queue_size: queue,
+        degraded: store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ------------------------------------------------------------- swarm_inbox ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_inbox',
+    description:
+      'Drain a worker\'s inbox: return every whisper waiting for it, and clear the slot. This is an ack — the '
+      + 'same call twice returns the second batch, not the first. Workers should call it every few steps (the '
+      + 'dispatch protocol says every 3 steps) so a Lead instruction is not read only after the task is done. '
+      + 'The match is by `worker_id`: an id that was never whispered to returns an empty success, not an error.',
+    parameters: {
+      worker_id: { type: 'string', required: true, description: 'Agent id whose inbox to drain, e.g. worker-code-2' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['drained', 'empty', 'invalid_worker', 'io_error'] },
+          worker_id: { type: 'string' },
+          count: { type: 'integer' },
+          entries: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                ts: { type: 'string' },
+                from: { type: 'string' },
+                text: { type: 'string' },
+              },
+            },
+          },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const entries = value.entries ?? []
+        if (value.ok !== true) {
+          return text(`REJECTED ${value.code ?? '?'}: ${value.worker_id ?? ''}`
+            + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : ''))
+        }
+        if (entries.length === 0) {
+          return text(`OK inbox ${value.worker_id ?? ''}: empty`)
+        }
+        return text([`OK inbox ${value.worker_id ?? ''}: ${value.count ?? entries.length} whisper(s)`,
+          ...entries.map(entry => `  [${entry.ts ?? ''}] ${entry.from ?? ''}: ${entry.text ?? ''}`),
+          ...(value.degraded !== undefined && value.degraded !== '' ? [`  degraded: ${value.degraded}`] : [])].join('\n'))
+      },
+    },
+    async execute(args) {
+      const workerId = args.worker_id.trim()
+      const drained = readInbox(store, workerId)
+      if (!drained.ok) {
+        const invalid = drained.error !== undefined && drained.error.startsWith('invalid worker id')
+        return {
+          ok: false,
+          code: invalid ? 'invalid_worker' as const : 'io_error' as const,
+          worker_id: workerId,
+          count: 0,
+          entries: [],
+          degraded: drained.error ?? store.degraded ?? '',
+        }
+      }
+      return {
+        ok: true,
+        code: drained.entries.length > 0 ? 'drained' as const : 'empty' as const,
+        worker_id: workerId,
+        count: drained.entries.length,
+        entries: drained.entries,
+        degraded: store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ------------------------------------------------------------ swarm_recall ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_recall',
+    description:
+      'Find tasks in the pool whose anchors, title, description or result contain `query` (case-insensitive '
+      + 'substring). Use it before re-solving something: an anchor such as `src/core/task-store.ts:claimTask` '
+      + 'recalls every attempt that touched that code, with the field it matched and each task\'s status. '
+      + 'Anchors rank above titles, which rank above descriptions and results, and ties are ordered by task id, '
+      + 'so the same query returns the same shortlist twice. An empty query matches nothing.',
+    parameters: {
+      query: { type: 'string', required: true, description: 'Substring to look for, e.g. a path, symbol or decision id' },
+      limit: { type: 'number', description: `Maximum hits; default ${RECALL_LIMIT_DEFAULT}, 0 means no cap.` },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          query: { type: 'string' },
+          count: { type: 'integer' },
+          matches: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                task_id: { type: 'string' },
+                title: { type: 'string' },
+                status: { type: 'string' },
+                anchors: { type: 'array', items: { type: 'string' } },
+                matchedIn: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const matches = value.matches ?? []
+        if (value.ok !== true) {
+          return text(`REJECTED recall: ${value.degraded ?? 'pool unreadable'}`)
+        }
+        if (matches.length === 0) {
+          return text(`recall "${value.query ?? ''}": no match`)
+        }
+        return text([`recall "${value.query ?? ''}": ${value.count ?? matches.length} match(es)`,
+          ...matches.map(match => `  ${match.task_id} [${match.status ?? '?'}] ${match.title ?? ''}`
+            + ` — matched in ${(match.matchedIn ?? []).join(',')}`),
+          ...(value.degraded !== undefined && value.degraded !== '' ? [`  degraded: ${value.degraded}`] : [])].join('\n'))
+      },
+    },
+    async execute(args) {
+      // Read the pool here instead of calling `recall(store, …)`: the read's own
+      // `io` is the only way to tell "nothing matched" apart from "the pool could
+      // not be read", and reporting the second as the first is the kind of silent
+      // failure this codebase refuses elsewhere.
+      const all = await store.readAll()
+      const matches = all.io.ok ? recallTasks(all.tasks, args.query, args.limit ?? RECALL_LIMIT_DEFAULT) : []
+      return {
+        ok: all.io.ok,
+        query: args.query,
+        count: matches.length,
+        matches,
+        degraded: all.io.error ?? all.io.degraded ?? store.degraded ?? '',
       }
     },
   })))
