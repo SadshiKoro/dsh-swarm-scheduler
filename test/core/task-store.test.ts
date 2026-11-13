@@ -642,6 +642,13 @@ test('a required_hashes entry for a missing file is missing_dependencies', async
 // ---------------------------------------------------------- worker routing ---
 
 test('a standard worker cannot claim a premium-required high-complexity task', async () => {
+  // The premium worker's successful claim creates an isolated worktree, so the
+  // pool root must be a real git repository (v1.4.1 isolation requirement).
+  writeFileSync(join(dir, 'file.txt'), 'base\n')
+  gitIn(dir, ['init', '-q'])
+  gitIn(dir, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+  gitIn(dir, ['add', 'file.txt'])
+  gitIn(dir, [...GIT_IDENTITY, 'commit', '-q', '-m', 'init'])
   await store.createExclusive(blankTask('t1', { complexity: 'high', required_worker_tier: 'premium' }))
   const tiers = { 'worker-strong': 'premium' }
   const weak = await claimTask(store, 't1', 'worker-cheap', undefined, tiers)
@@ -1293,4 +1300,59 @@ test('release clears the isolated workspace of a claimed high-complexity task', 
   const raw = readRaw('t1')
   assert.equal(raw.status, 'pending')
   assert.equal(raw.workspace, '')
+})
+
+// ------------------------------------------------- v1.4.1 boundary fixes ---
+
+test('v1.4.1: a high-complexity claim in a non-git pool root is refused as isolation_unavailable', async () => {
+  // `dir` is a plain temp directory (not a git repository), so no worktree can
+  // be created. Refusing the claim beats running a "high-complexity" task in
+  // the main tree without the isolation the contract promises.
+  await store.createExclusive(blankTask('t1', { complexity: 'high' }))
+
+  const outcome = await claimTask(store, 't1', 'worker-a')
+
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'isolation_unavailable')
+  assert.equal(
+    outcome.message,
+    'Cannot claim high-complexity task. tasksRoot is not a git repository, Worktree isolation is unavailable.',
+  )
+  // The refused claim must be a no-op: nothing written, lock released.
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'pending')
+  assert.equal(raw.claimed_by, '')
+  assert.equal(raw.claimed_at, '')
+  assert.equal(raw.workspace, '')
+  assert.equal(existsSync(lockPath('t1')), false)
+})
+
+test('v1.4.1: a budget block with no quality gate carries no gate note', async () => {
+  await store.createExclusive(blankTask('t1', { max_budget_tokens: 100 }))
+  await claimTask(store, 't1', 'worker-a')
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true, { actual_tokens: 500 })
+
+  assert.equal(outcome.code, 'blocked')
+  assert.match(outcome.message, /Budget exceeded/)
+  // The v1.4.0 bug: a non-completed outcome was read as a gate failure even
+  // when no gate was configured, producing "quality gate command (``)".
+  assert.doesNotMatch(outcome.message, /quality gate/i)
+  assert.equal(outcome.gate_failed, undefined)
+  // The stored reason is still exactly the budget verdict.
+  assert.equal(readRaw('t1').failure_reason, 'Budget exceeded')
+})
+
+test('v1.4.1: a failing quality gate reports gate_failed instead of a generic downgrade', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true, undefined, {
+    qualityGate: { command: 'npm test', runner: () => ({ ok: false, output: 'red' }) },
+  })
+
+  assert.equal(outcome.code, 'failed')
+  assert.equal(outcome.gate_failed, true)
+  assert.match(outcome.message, /quality gate/i)
+  assert.match(readRaw('t1').failure_reason, /^Quality gate failed: /)
 })

@@ -379,7 +379,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'worker_unreliable', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'worker_unreliable', 'isolation_unavailable', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -497,7 +497,12 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       // A gate can turn a claimed success into a failure. Say so explicitly, so a
       // worker reading `failed` does not conclude its result was ignored: it was
       // submitted, and the workspace rejected it.
-      const gateDowngraded = (args.success ?? true) && outcome.code !== 'completed'
+      //
+      // Only an actual gate failure earns this note. Inferring it from
+      // `code !== 'completed'` was wrong (v1.4.1): budget and merge blocks are
+      // also non-completed outcomes, and appending "quality gate command (``)
+      // did not pass" to them reported a gate that was never configured.
+      const gateDowngraded = (args.success ?? true) && outcome.gate_failed === true
       const note = gateDowngraded
         ? `Your success claim was not accepted: the deployment's quality gate command `
           + `(\`${gateCommand}\`) did not pass. The task is recorded as ${outcome.code}, not completed. `

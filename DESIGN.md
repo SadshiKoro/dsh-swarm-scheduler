@@ -1,9 +1,9 @@
 # DSH Multi-Session Parallel Coding Scheduler Plugin — Complete Design Document
 
-- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.4.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
+- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.4.1**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
 - Target runtime: DeepSeek Harness `0.2.0-rc.2` (Cordis ~4.0.4)
-- Test suite: **193 automated tests** (`npm test`, single-process, sandbox-safe)
-- **Current architecture (v1.4.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
+- Test suite: **196 automated tests** (`npm test`, single-process, sandbox-safe)
+- **Current architecture (v1.4.1)**: a pure core with no DSH-host dependency, plus one thin host adapter.
   The task pool is a **file pool** at `.dsh-tasks/<task_id>.json` guarded by atomic lock files — *not*
   the kernel's `agentTeams` task board. See §1 for the current design; **§1.4–§1.6 are superseded
   early-draft sections kept for history.**
@@ -12,11 +12,13 @@
 > pool, won over the kernel task board) → §12.11–§12.13 (the v0.9.0 end-to-end stress report, the
 > v1.0.0 fix record, and the v1.1.0 quality gate + benchmark) → §12.14 (v1.2.0 anti-blockage) →
 > §12.15 (v1.4.0 isolation, budget, upgrade escalation, whisper inbox, anchor recall, and the
-> no-hidden-model-downgrade guarantee). Sections §0.1–§0.3 and §2–§11 are
+> no-hidden-model-downgrade guarantee) → §12.16 (v1.4.1: the two boundary fixes — worktree isolation
+> is now a hard claim requirement, and a gate note can no longer be invented for a gate that never
+> ran). Sections §0.1–§0.3 and §2–§11 are
 > **historical design notes from before the route-B decision**; they are useful as rationale, not as
 > a description of the shipped code.
 >
-> *Document revision: v2.4 (2026-11-13). Earlier revisions of this file recorded the pre-route-B design.*
+> *Document revision: v2.5 (2026-11-13). Earlier revisions of this file recorded the pre-route-B design.*
 
 ### Contents
 
@@ -34,6 +36,7 @@
 | §12.13 | **CURRENT** | v1.1.0: quality gate design, benchmark results, cross-process lock evidence |
 | §12.14 | **CURRENT** | v1.2.0: anti-blockage protocol (self-assessment escalation + forced re-splitting) |
 | §12.15 | **CURRENT** | v1.4.0: worktree isolation, budget circuit breaker, `needs_upgrade`, whisper inbox, anchor recall, and the no-hidden-model-downgrade guarantee |
+| §12.16 | **CURRENT** | v1.4.1: boundary fixes — `isolation_unavailable` (isolation failure refuses the claim) and `gate_failed` (no gate note without a real gate failure) |
 
 ---
 
@@ -2347,11 +2350,45 @@ v1.4.0 新增 **39** 个用例，全量 **193** 个全部通过（单进程、�
 ### 12.15.9 边界
 
 - **worktree 隔离仅覆盖 `high`**；`medium`/`low` 仍在主工作区顺序执行（它们本来就假定不会与别人撞车，且建 worktree 有真实成本）。
-- **隔离依赖 `git` 二进制与一个 git 仓库**；失败时静默降级为 `workspace: ''`，不阻止 claim。
+- **隔离依赖 `git` 二进制与一个 git 仓库**；失败时 claim 被拒为 `isolation_unavailable`，任务保持 `pending`（v1.4.0 曾静默降级为 `workspace: ''`，v1.4.1 修正，见 §12.16.1）。
 - **冲突不会被自动解决**：`blocked` + `Merge conflict` 等人（或拆小任务）处理；隔离分支的改动被丢弃，不会强行覆盖主树。
 - **预算不能中途刹车**，只能在完成记账时熔断；超支的产出不合并。
 - **whisper 不是交接通道**：≤1000 字符、按 Worker 的节奏取；关键指令仍应 `send_message`。
 - **recall 是子串匹配**：没有分词、同义、模糊；anchor 写得含糊就搜不到，这是刻意的「宁可没有，也不猜」。
+
+## 12.16 v1.4.1：两个边界修复（隔离失败即拒绝、空门禁不误报）
+
+v1.4.0 上线后暴露出两个只在**边界**出现的静默缺陷：一个是「该拒绝时放行」，一个是「没发生的事被写进消息」。两者都不改变正常路径，却会让调用方收到与事实不符的结论。
+
+### 12.16.1 `isolation_unavailable`：隔离无法建立时不再降级 claim
+
+- **缺陷**：`claimTask` 对 `complexity === 'high'` 的任务调用 `createWorkspace`，失败时把 `workspace` 留空并**照常写 claimed 状态**。后果是「高复杂度任务」在非 git 的 `tasksRoot` 里被派发到主工作区执行——隔离承诺被静默撤销，而调用方从 `workspace: ''` 无法分辨「该任务不需要隔离」与「隔离失败」。
+- **修复**：`createWorkspace` 返回 `!ok` 时不写任务，直接返回 `{ok:false, code:'isolation_unavailable', message:'Cannot claim high-complexity task. tasksRoot is not a git repository, Worktree isolation is unavailable.'}`。返回发生在锁内 `try` 中，`finally` 照常释放锁；任务保持 `pending`，`claimed_by` / `claimed_at` / `workspace` 均未被写入。
+- **为什么是拒绝而不是降级**：`high` 的隔离是任务契约的一部分（§12.15.2）；一份「要么隔离、要么失败」的契约一旦允许静默降级，就变成「可能隔离」。宁可让 Lead 看到明确原因（`tasksRoot` 不是 git 仓库），再决定换目录或改复杂度，也不要在主工作区里假装隔离成功。
+- `swarm_claim` 的输出枚举同步加入 `isolation_unavailable`，工具面不会把它当成未知 code。
+
+### 12.16.2 空门禁误报：`gate_failed` 取代「非 completed 即门禁失败」
+
+- **缺陷**：`src/tools-file.ts` 的 `gateDowngraded = (args.success ?? true) && outcome.code !== 'completed'` 把所有非 completed 的结果都当成门禁失败。v1.4.0 新增预算熔断与合并冲突两条 `blocked` 路径后，**未配置门禁**的部署也会在消息里追加：`Your success claim was not accepted: the deployment's quality gate command (``) did not pass.` 门禁命令是空的，却被报告为「不通过」；Worker 会因此去修一个不存在的门禁。
+- **修复**：`completeTask` 新增可选返回字段 `gate_failed?: boolean`，**仅当门禁真的运行且失败**（`gateFailure !== undefined`）时为 `true`；`tools-file` 用 `outcome.gate_failed === true` 判断是否追加门禁 note，不再从 `code` 反推。`gate_failed` 只描述门禁事实，不改变六态：预算超支仍是 `blocked` + `failure_reason='Budget exceeded'`，合并冲突仍是 `blocked` + `failure_reason='Merge conflict'`。
+- **保留的静默规则**：仅当 `outcome.ok && !gateDowngraded` 时附「不要通知 Lead」提示；预算/合并 `blocked` 属于 `ok: true`，仍保留静默提示，但消息里不再出现 `quality gate` 子串。
+
+### 12.16.3 测试与发布
+
+v1.4.1 新增 **3** 个用例，全量 **196** 个全部通过；同时把「premium 领取 high 任务」的既有用例改为在真实临时 git 仓库中运行（它现在会建 worktree）：
+
+| 新增用例 | 断言 |
+|---|---|
+| `v1.4.1: a high-complexity claim in a non-git pool root is refused as isolation_unavailable` | `code === 'isolation_unavailable'`、固定 message、任务仍 `pending`、锁已释放 |
+| `v1.4.1: a budget block with no quality gate carries no gate note` | `code === 'blocked'`、message 含 `Budget exceeded`、不含 `quality gate`、`gate_failed` 为 `undefined` |
+| `v1.4.1: a failing quality gate reports gate_failed instead of a generic downgrade` | `gate_failed === true`、message 含 `quality gate`、`failure_reason` 以 `Quality gate failed: ` 开头 |
+
+| 验证项 | 结果 |
+|---|---|
+| `npx tsc -p tsconfig.json --noEmit` | exit 0 |
+| `npm test` | 196 / 196 通过 |
+| `npx tsup` | 构建成功（`lib/`） |
+| `npm pack` | `dsh-swarm-scheduler-beta-1.4.1.tgz` |
 
 ## 13. References and evidence sources
 | Conclusion | Source |

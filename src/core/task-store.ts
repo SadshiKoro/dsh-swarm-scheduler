@@ -847,7 +847,7 @@ export async function claimTask(
   clock: Clock = defaultClock,
   workerTiers?: Readonly<Record<string, string>>,
   workerProfiles?: Readonly<Record<string, WorkerProfileInput>>,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean; workspace?: string }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'isolation_unavailable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean; workspace?: string }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -1004,13 +1004,23 @@ export async function claimTask(
       }
 
       // Isolation for high-complexity work: run the attempt in a linked
-      // worktree so a bad merge can never damage the main checkout. Best-effort:
-      // a workspace root that cannot host a worktree still gets the claim, and
-      // the record simply keeps `workspace: ''` (the pre-v1.4.0 behaviour).
+      // worktree so a bad merge can never damage the main checkout. Unlike the
+      // failure paths below, a worktree that cannot be created is decisive:
+      // without isolation a high-complexity task is refused rather than run in
+      // the main tree. Nothing is written, so the task stays `pending`, and the
+      // surrounding `finally` still releases the claim lock.
       let workspace = ''
       if (current.task.complexity === 'high') {
         const created = createWorkspace(store.workspacePath, TASKS_DIR, taskId)
-        if (created.ok) workspace = created.path
+        if (!created.ok) {
+          return {
+            ok: false,
+            code: 'isolation_unavailable',
+            message: 'Cannot claim high-complexity task. tasksRoot is not a git repository, Worktree isolation is unavailable.',
+            degraded: lock.degraded,
+          }
+        }
+        workspace = created.path
       }
 
       const next: TaskRecord = {
@@ -1397,7 +1407,7 @@ export async function completeTask(
   success: boolean = true,
   metrics?: CompletionMetrics,
   options?: CompleteTaskOptions,
-): Promise<{ ok: boolean; code: 'completed' | 'failed' | 'blocked' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string }> {
+): Promise<{ ok: boolean; code: 'completed' | 'failed' | 'blocked' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string; gate_failed?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
   if (found.task.status === 'completed') {
@@ -1479,7 +1489,7 @@ export async function completeTask(
       workspace: '',
     }
     code = 'blocked'
-    message = `${taskId} blocked — budget exceeded (${tokensUsed} > ${found.task.max_budget_tokens} tokens)`
+    message = `${taskId} blocked — Budget exceeded (${tokensUsed} > ${found.task.max_budget_tokens} tokens)`
   } else if (effectiveSuccess && workspaceFailure !== undefined) {
     next = {
       ...found.task,
@@ -1560,7 +1570,16 @@ export async function completeTask(
   // work did not survive the check, and letting it feed the success counters
   // would make a worker that ships broken code look reliable.
   await store.recordWorkerOutcome(completedBy, effectiveSuccess, effectiveSuccess ? metrics : undefined)
-  return { ok: true, code, message, degraded: written.degraded }
+  // `gate_failed` is the narrow fact the tool adapter needs: a non-completed
+  // outcome is *not* evidence of a gate failure (budget/merge blocks are not),
+  // so the caller must ask instead of inferring it from `code`.
+  return {
+    ok: true,
+    code,
+    message,
+    degraded: written.degraded,
+    ...gateFailure !== undefined ? { gate_failed: true } : {},
+  }
 }
 
 /** The reason a running task carries while it is only *warned* about, never reaped. */
