@@ -3,8 +3,8 @@
 A production-ready, event-driven parallel coding scheduler for DSH.
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Tests](https://img.shields.io/badge/Tests-193%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Version](https://img.shields.io/badge/Version-1.4.0-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Tests](https://img.shields.io/badge/Tests-196%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Version](https://img.shields.io/badge/Version-1.4.1-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 [![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 
 ## Overview
@@ -22,8 +22,8 @@ Three properties make the parallelism safe rather than merely fast:
 - **The pool heals itself.** Abandoned claims are released, silent workers are flagged before they
   are killed, and a worker that cannot finish escalates instead of writing code it knows is wrong.
 
-Version 1.4.0 is the current production release: the six-state lifecycle, routing gates, watchdog,
-conflict checks, and the quality gate are covered by 193 automated tests, including a 400-claim
+Version 1.4.1 is the current production release: the six-state lifecycle, routing gates, watchdog,
+conflict checks, and the quality gate are covered by 196 automated tests, including a 400-claim
 concurrency stress with zero observed double-claims. v1.1.0 added the **quality gate** — a deployment
 can make "done" a checked fact rather than a worker's claim — and a reproducible **benchmark** that
 measures capability routing against blind round-robin; v1.2.0 added the anti-blockage protocol.
@@ -33,6 +33,20 @@ trips a circuit breaker, `needs_upgrade` escalation when a recorded model keeps 
 non-interrupting **whisper inbox**, and **anchor recall** for finding earlier work. It also states,
 explicitly, the property the feature set was built to keep: **there is no hidden model downgrade —
 model control belongs to the developer.**
+
+## What's new in 1.4.1
+
+- **A high-complexity claim without a worktree is now refused, not silently downgraded.**
+  v1.4.0 treated a failed `git worktree add` as a warning and ran the task in the main checkout with
+  `workspace: ''`. That made isolation a *best-effort* promise while the whole point is a hard one.
+  `swarm_claim` now answers `REJECTED isolation_unavailable: Cannot claim high-complexity task.
+  tasksRoot is not a git repository, Worktree isolation is unavailable.` and the task stays `pending`.
+  Consequence for operators: to run `high` tasks, `tasksRoot` must be the git repository the work
+  belongs to; point it at a parent directory and those claims will be refused by design.
+- **No more phantom quality-gate note.** Blocked outcomes used to append "the quality gate command
+  (`` ) did not pass" because any non-completed result was read as a gate failure. `completeTask`
+  now returns `gate_failed`, and the note appears only when a gate actually ran and failed. Budget
+  blocks and merge conflicts report their own reason and nothing else.
 
 ## What's new in 1.4.0
 
@@ -91,9 +105,9 @@ model control belongs to the developer.**
   channel: a **whisper** into a worker's inbox steers it without starting a turn.
 - **Worktree isolation, with the main tree protected** — a `high`-complexity claim gets its own
   detached git worktree, and the merge back is `--no-ff`. A conflict aborts in the main worktree and
-  blocks the task; the main HEAD is never left mid-merge. Isolation is best-effort: outside a git
-  repository the claim still succeeds and simply keeps `workspace: ''`, which is the pre-1.4.0
-  behaviour.
+  blocks the task; the main HEAD is never left mid-merge. Since 1.4.1 isolation is **mandatory** for
+  `high` work: if the worktree cannot be created (for example because `tasksRoot` is not a git
+  repository), the claim is refused with `isolation_unavailable` and the task stays pending.
 - **Task-level token budget** — `max_budget_tokens` (0 = unlimited) is checked against `tokens_used`,
   which accumulates across attempts. Crossing it on an otherwise-successful attempt records `blocked`
   with `Budget exceeded` instead of `completed`; the claim lock is dropped with it.
@@ -122,7 +136,7 @@ model control belongs to the developer.**
 - **Explicit non-feature: no model control** — the scheduler knows nothing about providers and has no
   code path that selects, swaps, or downgrades a model. `model` is a recorded assignment, `needs_upgrade`
   is a signal, and replacing either is an explicit Lead action. Model control belongs to the developer.
-- **Test coverage** — 193 automated tests, including a claim-lock stress suite of 400 concurrent
+- **Test coverage** — 196 automated tests, including a claim-lock stress suite of 400 concurrent
   claims (10 workers × 2 cases × 20 rounds) that produced zero double-claims, a cross-process
   case where two real OS processes race one lock file, and six real-git worktree cases covering
   create/merge/conflict/remove.
@@ -302,12 +316,13 @@ about everything else.
 5. **Filesystem access degrades to `node:fs`.** When `ctx.fs` is refused by the sandbox, the plugin
    continues through `node:fs` and reports the degradation on later results. Lock semantics remain
    correct in stress testing, but the degraded path is the one with the least production mileage.
-6. **Worktree isolation is git-only and best-effort.** It applies to `high`-complexity claims only
-   (medium and low work runs in the main checkout). Outside a git repository, or when `git worktree
-   add` fails, the claim still succeeds with `workspace: ''` — the pre-1.4.0 behaviour — so isolation
-   is a safety improvement, not a hard guarantee. A merge conflict blocks the task and removes the
-   checkout; resolving it needs a person or a fresh, smaller task, because the isolated attempt's
-   changes are deliberately not forced onto the main tree.
+6. **Worktree isolation is git-only and now mandatory for `high` work.** It applies to
+   `high`-complexity claims only (medium and low work runs in the main checkout). If the worktree
+   cannot be created — `tasksRoot` is not a git repository, or `git worktree add` fails — the claim
+   is refused with `isolation_unavailable` and the task stays pending; there is no fallback to the main
+   checkout. A merge conflict blocks the task and removes the checkout; resolving it needs a person or a
+   fresh, smaller task, because the isolated attempt's changes are deliberately not forced onto the main
+   tree.
 7. **The budget breaker only fires at completion time.** `max_budget_tokens` cannot stop a run
    mid-flight: it is evaluated when `swarm_complete` arrives, so an attempt can overshoot the ceiling
    and only then be recorded as `blocked` (`Budget exceeded`). It is a checkpoint, not a kill switch.
@@ -329,7 +344,7 @@ about everything else.
 stdio in a confined environment and fails with `spawn EPERM`. Single-process execution avoids that
 entirely. `npm run test:sandbox` is a retained alias for the same command.
 
-The suite contains **193 tests** covering the six-state lifecycle, retry and blocked transitions,
+The suite contains **196 tests** covering the six-state lifecycle, retry and blocked transitions,
 scope admission, hash verification, routing refusals, the two-phase STALE window, the quality gate,
 the token budget and `needs_upgrade` accounting, worktree create/merge/conflict/remove, the whisper
 inbox and its ack semantics, anchor recall, and concurrent races. Six cases deserve note:
