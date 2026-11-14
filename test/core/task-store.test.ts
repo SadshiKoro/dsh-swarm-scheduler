@@ -1356,3 +1356,34 @@ test('v1.4.1: a failing quality gate reports gate_failed instead of a generic do
   assert.match(outcome.message, /quality gate/i)
   assert.match(readRaw('t1').failure_reason, /^Quality gate failed: /)
 })
+
+// ------------------------------------------------ v1.5.0 comment red line ---
+
+test('v1.5.0: two added inline comments block the completion', async () => {
+  writeFileSync(join(dir, 'source.ts'), 'export const base = 1\n')
+  gitIn(dir, ['init', '-q'])
+  gitIn(dir, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+  gitIn(dir, ['add', 'source.ts'])
+  gitIn(dir, [...GIT_IDENTITY, 'commit', '-q', '-m', 'init'])
+
+  await store.createExclusive(blankTask('t1', { write_scopes: ['source.ts'] }))
+  await claimTask(store, 't1', 'worker-a')
+  writeFileSync(join(dir, 'source.ts'), 'export const base = 1\n// first explanation\n// second explanation\n')
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true, undefined, {
+    commentAudit: { repoRoot: dir, workspace: '', scopes: ['source.ts'] },
+  })
+
+  assert.equal(outcome.code, 'blocked')
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'blocked')
+  assert.equal(
+    raw.failure_reason,
+    'Too many inline comments. Code must be self-explanatory. Move your design intent to anchors, or escalate if the task is too complex.',
+  )
+  assert.equal(raw.claimed_by, '')
+  assert.equal(existsSync(lockPath('t1')), false)
+  // The task must not have been completed on the way to being blocked.
+  assert.notEqual(raw.completed_at, '')
+  assert.equal(raw.result, 'done')
+})

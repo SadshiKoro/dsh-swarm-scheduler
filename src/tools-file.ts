@@ -33,6 +33,7 @@ import {
   type TaskRecord,
   type TaskView,
   type WorkerProfileInput,
+  type CompleteTaskOptions,
 } from './core/task-store.js'
 import { appendInbox, inboxSize, readInbox } from './core/inbox.js'
 import { recallTasks, RECALL_LIMIT_DEFAULT } from './core/recall.js'
@@ -100,6 +101,15 @@ export interface FileToolDeps {
    * of success is checked, not trusted" rule lives in exactly one place.
    */
   quality_gate_command: string
+  /**
+   * Enforce the v1.5.0 inline-comment red line on successful completions.
+   *
+   * When true, `swarm_complete` audits the task's declared `write_scopes` and a
+   * completion with two or more added inline comment lines is blocked. The audit
+   * itself lives in `src/core/comment-audit.ts`; this adapter only supplies the
+   * task's workspace and scopes.
+   */
+  forbid_inline_comments: boolean
   /** Collects every disposer from this registration, in one ownership list. */
   disposers: Array<() => void>
 }
@@ -123,7 +133,7 @@ function viewRow(view: TaskView): Record<string, unknown> {
   }
 }
 
-export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, worker_tiers, worker_profiles, quality_gate_command, disposers }: FileToolDeps): void {
+export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers, worker_tiers, worker_profiles, quality_gate_command, forbid_inline_comments, disposers }: FileToolDeps): void {
   // ------------------------------------------------------------- swarm_plan ---
   disposers.push(ctx.tools.register(defineTool({
     name: 'swarm_plan',
@@ -482,17 +492,34 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         }
       }
       const gateCommand = quality_gate_command.trim()
+      const successClaim = args.success ?? true
+      const options: CompleteTaskOptions = {}
+      if (gateCommand.length > 0) {
+        options.qualityGate = { command: gateCommand }
+        options.cwd = store.workspacePath
+      }
+      // Inline-comment red line (v1.5.0): a success claim is audited against the
+      // task's own `write_scopes`, in its isolated workspace when it has one.
+      // The audit is what the core records; the adapter only names the tree.
+      if (forbid_inline_comments && successClaim) {
+        const held = (await store.readOne(args.task_id)).task
+        if (held !== undefined) {
+          options.commentAudit = {
+            repoRoot: store.workspacePath,
+            workspace: held.workspace,
+            scopes: held.write_scopes,
+          }
+        }
+      }
       const outcome = await completeTask(
         store,
         args.task_id,
         args.result,
         args.completed_by,
         undefined,
-        args.success ?? true,
+        successClaim,
         { actual_tokens: args.actual_tokens, duration_ms: args.duration_ms },
-        gateCommand.length > 0
-          ? { qualityGate: { command: gateCommand }, cwd: store.workspacePath }
-          : undefined,
+        Object.keys(options).length > 0 ? options : undefined,
       )
       // A gate can turn a claimed success into a failure. Say so explicitly, so a
       // worker reading `failed` does not conclude its result was ignored: it was

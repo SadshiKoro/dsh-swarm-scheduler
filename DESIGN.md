@@ -1,9 +1,9 @@
 # DSH Multi-Session Parallel Coding Scheduler Plugin — Complete Design Document
 
-- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.4.1**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
+- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.5.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
 - Target runtime: DeepSeek Harness `0.2.0-rc.2` (Cordis ~4.0.4)
-- Test suite: **196 automated tests** (`npm test`, single-process, sandbox-safe)
-- **Current architecture (v1.4.1)**: a pure core with no DSH-host dependency, plus one thin host adapter.
+- Test suite: **203 automated tests** (`npm test`, single-process, sandbox-safe)
+- **Current architecture (v1.5.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
   The task pool is a **file pool** at `.dsh-tasks/<task_id>.json` guarded by atomic lock files — *not*
   the kernel's `agentTeams` task board. See §1 for the current design; **§1.4–§1.6 are superseded
   early-draft sections kept for history.**
@@ -14,11 +14,12 @@
 > §12.15 (v1.4.0 isolation, budget, upgrade escalation, whisper inbox, anchor recall, and the
 > no-hidden-model-downgrade guarantee) → §12.16 (v1.4.1: the two boundary fixes — worktree isolation
 > is now a hard claim requirement, and a gate note can no longer be invented for a gate that never
-> ran). Sections §0.1–§0.3 and §2–§11 are
+> ran) → §12.17 (v1.5.0: the inline-comment red line, its audit, and the `forbid_inline_comments`
+> switch). Sections §0.1–§0.3 and §2–§11 are
 > **historical design notes from before the route-B decision**; they are useful as rationale, not as
 > a description of the shipped code.
 >
-> *Document revision: v2.5 (2026-11-13). Earlier revisions of this file recorded the pre-route-B design.*
+> *Document revision: v2.6 (2026-11-14). Earlier revisions of this file recorded the pre-route-B design.*
 
 ### Contents
 
@@ -37,6 +38,7 @@
 | §12.14 | **CURRENT** | v1.2.0: anti-blockage protocol (self-assessment escalation + forced re-splitting) |
 | §12.15 | **CURRENT** | v1.4.0: worktree isolation, budget circuit breaker, `needs_upgrade`, whisper inbox, anchor recall, and the no-hidden-model-downgrade guarantee |
 | §12.16 | **CURRENT** | v1.4.1: boundary fixes — `isolation_unavailable` (isolation failure refuses the claim) and `gate_failed` (no gate note without a real gate failure) |
+| §12.17 | **CURRENT** | v1.5.0: the inline-comment red line — diff-based audit, hard block on two added comment lines, and the `forbid_inline_comments` switch |
 
 ---
 
@@ -2389,6 +2391,70 @@ v1.4.1 新增 **3** 个用例，全量 **196** 个全部通过；同时把「pre
 | `npm test` | 196 / 196 通过 |
 | `npx tsup` | 构建成功（`lib/`） |
 | `npm pack` | `dsh-swarm-scheduler-beta-1.4.1.tgz` |
+
+## 12.17 v1.5.0：无注释红线（注释不是文档，而是未被验证的断言）
+
+> **无法被执行的注释，就是未被验证的谎言。**
+
+v1.4.x 让"完成"变成可验证的事实（门禁、隔离回合并、预算）。v1.5.0 把同一条标准推向**代码里的散文**：注释不能被运行，因此没有任何测试能发现它过期；而并行 Worker 写的 `// 暂时这样`、`// TODO`、`// 这里可能有问题`，恰恰是"设计意图只存在于作者脑子里"的证据。设计意图必须进入 `anchors`（`swarm_recall` 可检索、随任务记录持久化），而不是散落在源码中等待腐烂。
+
+### 12.17.1 审计口径：只统计 Worker 新增的行
+
+新模块 `src/core/comment-audit.ts`（仅 Node 内置）提供：
+
+```ts
+export interface CommentAuditResult { ok: boolean; count: number; files: string[] }
+export function auditInlineComments(input: { repoRoot: string; workspace?: string; scopes: string[]; threshold?: number }): CommentAuditResult
+```
+
+- **只看 diff**：在 `workspace`（隔离 worktree，为空则 `repoRoot`）内对 `scopes` 命中的文件执行 `git diff --unified=0 HEAD`，只统计新增行（`+` 开头且非 `+++`）。仓库里既有的注释不是 Worker 写的，永远不算在它头上。
+- **行内注释判定**：`trim` 后以 `//` 开头，或包含 ` // `（排除 `://` scheme——URL 是字符串内容，不是解释）。`/^\s*(\/\*\*|\*|\*\/)/` 命中的 JSDoc/块注释行不计入。
+- **未跟踪文件全文统计**：新文件没有历史可减，因此整篇按新增行计算。
+- **目录 scope 递归**：只扫 `.ts/.tsx/.js/.mjs`，跳过 `node_modules` 与 `.git`。
+- **阈值**：默认 `2`（`count >= 2` 即失败）；显式 `threshold` 可移动这条线。
+
+### 12.17.2 执行位置：门禁之后、预算之前
+
+`completeTask` 新增 `options.commentAudit?: { repoRoot, workspace, scopes }`，顺序是**质量门禁 → 注释审计 → 预算熔断 → 隔离合并**。位置是设计的一部分：
+
+- 在合并之前：此时隔离区还保存着 Worker 的改动；合并后审的就是主树，`removeWorkspace` 后更是无物可审。
+- 在预算之前：注释红线是一次"能否算完成"的判定，不是资源记账；一旦命中，后续的合并与预算都不需要发生。
+- 只有 `success: true` 且门禁通过时才审；`success: false` 走普通失败/重试路径，审计不掩盖失败原因。
+
+命中时不写 `completed`，而写 `blocked`，`failure_reason` 固定为：
+
+```
+Too many inline comments. Code must be self-explanatory. Move your design intent to anchors, or escalate if the task is too complex.
+```
+
+并清空 `claimed_by`/`claimed_at`、删除 claim 锁、移除隔离 worktree（若存在）。`blocked` 而不是 `failed`：这是"需要重新组织任务"而不是"Worker 尝试后失败"，与 v0.9.0 的 escalation 语义一致。
+
+### 12.17.3 配置开关与协议文本
+
+- `config.forbid_inline_comments: boolean`（`Schema.boolean().default(true)`），由 `index.ts` 传给 `registerFileTools`；`swarm_complete` 在成功路径上以 `cwd = store.workspacePath`、`workspace = task.workspace`、`scopes = task.write_scopes` 构造 `commentAudit`。设为 `false` 可对"确实需要代码内散文"的仓库显式退回。
+- `PROTOCOL_TEXT` 新增第 16 条 **【代码洁净与无注释红线】**，四部分：① 严禁解释性/辩解性行内注释（`// TODO`、`// 暂时这样`、`// 这里可能有问题`）；② 代码自解释，设计意图写进 `swarm_complete` 的 `anchors`，不得写进代码文件；③ 只允许函数级标准 JSDoc 签名；④ 需要长注释才能看懂时立即 `swarm_escalate`，说明任务过大/拆解不彻底。
+- `README.md` 同时给出 `forbid_inline_comments` 的 YAML 示例与开关说明，并引用同一句话作为设计理由。
+
+### 12.17.4 测试与发布
+
+v1.5.0 新增 **7** 个用例（6 个审计单测 + 1 个 `completeTask` 集成），全量 **203** 个全部通过：
+
+| 新增用例 | 断言 |
+|---|---|
+| `one added inline comment is below the default threshold` | 新增 1 行行内注释 `ok === true`，URL 中的 `://` 不计入 |
+| `two added inline comments fail the audit` | 新增 2 行 → `count === 2`、`ok === false`、`files` 命中 |
+| `JSDoc and block-comment lines are exempt` | `/**`、`* ...`、`*/` 均不计入，`count === 0` |
+| `an untracked file is counted in full` | 未跟踪文件整篇统计，2 行注释 → 失败 |
+| `a directory scope recurses over source files only` | 目录 scope 递归，`.md` 不扫描，`.ts` 命中 |
+| `an explicit threshold moves the line` | `threshold: 1` 时 1 行即失败，默认 2 时通过 |
+| `v1.5.0: two added inline comments block the completion` | `code === 'blocked'`、固定 `failure_reason`、清 claim + 删锁、未 `completed` |
+
+| 验证项 | 结果 |
+|---|---|
+| `npx tsc -p tsconfig.json --noEmit` | exit 0 |
+| `npm test` | 203 / 203 通过 |
+| `npx tsup` | 构建成功（`lib/`） |
+| `npm pack` | `dsh-swarm-scheduler-beta-1.5.0.tgz` |
 
 ## 13. References and evidence sources
 | Conclusion | Source |
