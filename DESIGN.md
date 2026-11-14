@@ -1,9 +1,9 @@
 # DSH Multi-Session Parallel Coding Scheduler Plugin — Complete Design Document
 
-- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.5.1**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
+- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.6.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
 - Target runtime: DeepSeek Harness `0.2.0-rc.2` (Cordis ~4.0.4)
-- Test suite: **211 automated tests** (`npm test`, single-process, sandbox-safe)
-- **Current architecture (v1.5.1)**: a pure core with no DSH-host dependency, plus one thin host adapter.
+- Test suite: **227 automated tests** (`npm test`, single-process, sandbox-safe)
+- **Current architecture (v1.6.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
   The task pool is a **file pool** at `.dsh-tasks/<task_id>.json` guarded by atomic lock files — *not*
   the kernel's `agentTeams` task board. See §1 for the current design; **§1.4–§1.6 are superseded
   early-draft sections kept for history.**
@@ -15,12 +15,13 @@
 > no-hidden-model-downgrade guarantee) → §12.16 (v1.4.1: the two boundary fixes — worktree isolation
 > is now a hard claim requirement, and a gate note can no longer be invented for a gate that never
 > ran) → §12.17 (v1.5.0: the inline-comment red line, its audit, and the `forbid_inline_comments`
-> switch) → §12.18 (v1.5.1: three-case scope overlap and the inbox budget warning). Sections
-> §0.1–§0.3 and §2–§11 are
+> switch) → §12.18 (v1.5.1: three-case scope overlap and the inbox budget warning) → §12.19
+> (v1.6.0: task-result cache, health-based routing, tiered gates and the `pending_review` state).
+> Sections §0.1–§0.3 and §2–§11 are
 > **historical design notes from before the route-B decision**; they are useful as rationale, not as
 > a description of the shipped code.
 >
-> *Document revision: v2.7 (2026-11-14). Earlier revisions of this file recorded the pre-route-B design.*
+> *Document revision: v2.8 (2026-11-14). Earlier revisions of this file recorded the pre-route-B design.*
 
 ### Contents
 
@@ -41,6 +42,7 @@
 | §12.16 | **CURRENT** | v1.4.1: boundary fixes — `isolation_unavailable` (isolation failure refuses the claim) and `gate_failed` (no gate note without a real gate failure) |
 | §12.17 | **CURRENT** | v1.5.0: the inline-comment red line — diff-based audit, hard block on two added comment lines, and the `forbid_inline_comments` switch |
 | §12.18 | **CURRENT** | v1.5.1: three-case write-scope overlap (dir↔file admitted) and the inbox-time budget warning |
+| §12.19 | **CURRENT** | v1.6.0: advisory task-result cache, health-based claim preference, docs/test gate skipping, `pending_review` + reviewed finalisation |
 
 ---
 
@@ -2173,6 +2175,8 @@ Escalated successfully. The Lead has been notified. Stop working and remain sile
 
 **拆分时的硬约束**：新任务各自的 `write_scopes` 必须互不重叠，否则它们之间会立刻 `scope_conflict`（§12.11.2 已记录过的陷阱）。
 
+> **v1.5.1 追加**：Lead 侧还有一条与「拆分」并列的强制约束——建池后与出现新 ready 任务时必须 `list_agents` 唤醒 inactive Worker，并把任务分给下一个空闲 Worker，严禁连续塞给同一个 Worker。见 §12.18.4《负载均衡与强制唤醒铁律》。
+
 ### 12.14.4 配套：`max_duration_ms` 超时高亮
 
 `TaskRecord` 新增可选字段 `max_duration_ms: number`（默认 0 = 不限），`swarm_plan` 接受传入。
@@ -2513,6 +2517,106 @@ v1.5.1 新增 **8** 个用例（6 个 scope 单测 + 2 个 inbox 预算用例）
 | `npm test` | 211 / 211 通过 |
 | `npx tsup` | 构建成功（`lib/`） |
 | `npm pack` | `dsh-swarm-scheduler-beta-1.5.1.tgz` |
+
+### 12.18.4 协议补充（v1.5.1）：负载均衡与强制唤醒铁律
+
+§12.14 解决了「一个任务卡死拖垮依赖链」；但调度还有另一个更隐蔽的单点：**Lead 把所有任务都塞给同一个 Worker**。此时 Worker 池看起来存在，实际却退化成单线程；其余 Worker 全程 `inactive`，并行度归零，而 `swarm_status` 只会显示「有一个很忙的 Worker」，不会报错。
+
+因此在 PROTOCOL_TEXT 的《动态拆分与防阻塞协议》之后新增《负载均衡与强制唤醒铁律》，向 Lead 发出五条硬约束：
+
+1. 通过 `swarm_plan` 建池后，或池中出现新的 `ready` 任务时，严禁放任不管；
+2. 必须调用 `list_agents` 检查所有 Worker 状态；
+3. 只要有 `inactive` Worker 且池中有 `ready` 任务，必须立刻 `send_message` 唤醒它去 `swarm_ready` 领任务；
+4. 严禁把多个任务连续派给同一个 Worker：某个 Worker `running` 时，下一个 `ready` 任务必须交给下一个 `inactive` Worker；
+5. 唤醒后若 Worker 因能力不匹配被拒，立刻检查 `worker_profiles` 配置或任务的 `required_capabilities`，不要重复重试同一指派。
+
+**为什么写成「铁律」而不是「建议」**：协议的其余条款约束的是「任务粒度」与「失败处理」，却没有任何一条约束「负载分布」。缺了这条，Lead 的最短路径就是「找一个已经醒着的 Worker 继续派」，因为它不需要唤醒成本——从单次派发看是最优，从整池看是灾难。把唤醒写成强制动作，等于把「并行」从一句口号变成每次派发都要执行的前置检查。
+
+**与静默原则的关系**：唤醒 Worker 的 `send_message` 是 Lead 主动发起的派发，不受「完成后不要通知 Lead」的静默规则限制；后者约束的是 Worker → Lead 的方向。两条规则方向相反，互不冲突。
+
+**验证**：协议文本是纯提示词，无运行时行为，因此没有新增单测；`npm test` 保持 211 全绿，`tsup`/`npm pack` 重新产出 `dsh-swarm-scheduler-beta-1.5.1.tgz`。协议在激活时写入 prompt section，**必须重启 DSH 才会生效**（本插件无热重载，见 README 安装第 4 步）。
+
+## 12.19 v1.6.0：极速提效（缓存、健康路由、分级门禁）
+
+> **安全是为了保障交付，效率是调度器的生命线。** 通过缓存复用与分级门禁，实现安全前提下的极速吞吐。
+
+v1.5.x 把「完成」做成可验证的事实；代价是每次完成都重新思考、重新写代码、重新跑整套门禁。v1.6.0 不削减任何安全机制，而是从三个方向把重复成本拿掉：**能复用的不再重做（缓存）、该谁做就让谁做（健康路由）、能合并的门禁合并（分级门禁）**。
+
+### 12.19.1 任务结果缓存（`src/core/similarity.ts`）
+
+`findCachedSolution(completedTasks, candidate, threshold = 0.9)` 在 `swarm_plan` 创建任务时做**建议性**比对：
+
+```
+text  = Jaccard(tokenize(title + description))
+caps  = Jaccard(required_capabilities)
+score = 0.6 * text + 0.4 * caps
+```
+
+- 只复用 `status === 'completed'` 且 `result !== ''` 的任务；pending/failed 没有可复用的结论。
+- 达到 `0.9` 才给出 `cache_hint: { task_id, cached_task_id, similarity, result, anchors }`，`swarm_plan` 的 render 增加一行 `[cache] <task> ~ <cached> (98%): reuse or plan the delta`。
+- **永远只是提示**：插件不会用缓存结果代替任务记录，Lead 决定「直接复用」还是「只派增量」。
+- 中文按字切 token（`tokenize` 对 CJK run 逐字展开），否则无空格的中文句子会变成单个 token，相似度失真。
+
+### 12.19.2 Worker 健康度路由（`workerHealth` / `workerPreferenceRefusal`）
+
+`workerHealth(stats, id)` 返回 `{attempts, rate, avgMs}`：
+
+- `attempts = success_count + failed_count`
+- `rate = success_count / attempts`（无样本时 0）
+- `avgMs = total_task_time_ms / time_sample_count`（无计时样本时 `undefined`，不伪造成 0ms）
+
+`claimTask` 对 `complexity === 'high'` 增加**偏好门禁**：
+
+- 本 worker `attempts >= 3` 且 `rate < 0.5`；
+- 且 stats 中存在另一个 worker `attempts >= 2` 且 `rate > 0.7`；
+- 两者同时成立 → 拒绝 `worker_not_preferred`，message 点名更健康的候选。
+
+设计边界：这是拉取模型，插件无法「把任务推给」某个 Worker，所以绝不硬性改派；无足够样本不做猜测；`low`/`medium` 不做硬拒（Worker 需要练手才能恢复记录）。`swarm_status` 的 workers 行渲染 `[health: <rate>% · <avg>]`，avg 无样本时显示 `n/a`。
+
+### 12.19.3 分级门禁与 `pending_review`
+
+1. **增量门禁**：`gateNeededFor(scopes)` 在全部 scope 都是 `.md`/`.mdx` 文件，或位于 `test/`、`tests/`、`docs/` 下时返回 `false`，`completeTask` 跳过 quality gate（空 scopes 视为「无法证明轻量」，仍跑门禁）。
+2. **最终门禁替代**：`swarm_complete(skip_local_gate: true)` 不跑本地门禁，成功结果写成第七状态 **`pending_review`**：
+   - 不属于 ready/claim：`claimTask` 对 `pending_review` 返回 `invalid_state`；
+   - 不满足依赖：`blocked_by` 只认 `completed`，下游任务保持等待；
+   - `swarm_status` 单独计数并标注 "awaiting final gate"。
+3. **Lead 收口**：全部任务完成后，Lead 在主工作区跑一次最严格的全局门禁；通过后对每个 `pending_review` 任务调用 `swarm_complete(..., reviewed: true)` → `completed`。`reviewed` 之外的状态调用会被拒绝（`invalid_state`）。
+
+`completeTask` 的执行顺序不变：质量门禁（或跳过）→ 注释红线（v1.5.0，仍生效）→ 预算熔断 → 隔离合并 → 状态落盘；`skip_local_gate` 只影响「成功」最终落在 `completed` 还是 `pending_review`。
+
+### 12.19.4 心跳与 Context（核对结论）
+
+`swarm_heartbeat` 与 `auto-reap` 的返回值都是**定长的小对象/日志行**：心跳只回 `{ok, code, message, heartbeat_at, degraded}`，auto-reap 只写池内日志，二者都不调用 `send_message`、不携带对话历史。v1.6.0 对此没有代码改动，仅以本节与 §12.19.5 的测试固定契约，防止未来把「心跳」做成上下文事件。
+
+### 12.19.5 测试与发布
+
+v1.6.0 新增 **16** 个用例（6 个 `similarity.test.ts` + 10 个 `task-store.test.ts`），全量 **227** 个全部通过：
+
+| 新增用例 | 断言 |
+|---|---|
+| `identical tasks score 1 and produce a cache hint with result and anchors` | 完全一致 → similarity 1，携带 result/anchors |
+| `the same wording with a different capability contract is not a hit` | 文本相同但能力不同 → 0.6，不命中 |
+| `unrelated work never produces a hint` | 无关任务无 hint |
+| `only completed tasks with a result are reusable` | pending / 空 result 不复用 |
+| `the best of several completed matches wins` | 多命中取最高分 |
+| `tokenization splits CJK runs and Jaccard stays symmetric` | 中文逐字 token、Jaccard 对称 |
+| `workerHealth derives attempts, success rate and mean duration from samples` | attempts/rate/avgMs 推导与缺省 |
+| `a proven-weak worker is refused high-complexity work when a healthier worker exists` | `worker_not_preferred`，点名候选，任务仍 pending |
+| `the same weak worker may still claim low-complexity work` | low 不硬拒 |
+| `without a healthier candidate the weak worker is not refused` | 无更优候选放行 |
+| `gateNeededFor skips documentation and test-tree scopes only` | .md/docs/test 跳过，src/ 不跳，空 scopes 跑 |
+| `a docs-only completion skips the configured quality gate` | runner 未被调用且消息含 skipped |
+| `skip_local_gate parks a success in pending_review and reviewed finalises it` | pending_review → 不可 claim → reviewed → completed |
+| `pending_review is not completed without reviewed: true` | 缺 reviewed 拒绝 |
+| `pending_review does not satisfy a dependency` | 下游仍不可 ready |
+| `a plain success still completes (skip_local_gate defaults to false)` | 默认行为不变 |
+
+| 验证项 | 结果 |
+|---|---|
+| `npx tsc -p tsconfig.json --noEmit` | exit 0 |
+| `npm test` | 227 / 227 通过 |
+| `npx tsup` | 构建成功（`lib/`） |
+| `npm pack` | `dsh-swarm-scheduler-beta-1.6.0.tgz` |
 
 ## 13. References and evidence sources
 | Conclusion | Source |

@@ -1,7 +1,7 @@
 {
   "name": "dsh-swarm-scheduler-beta",
-  "version": "1.5.1",
-  "description": "Parallel coding scheduler for DSH with six-state lifecycle, priority scheduling, multidimensional worker routing (tier, capabilities, context, cost budget), dynamic reliability gating, task performance feedback, a worker escalation protocol, event-driven automatic deadlock recovery, git-worktree isolation with merge-conflict blocking, a task token-budget circuit breaker, needs_upgrade escalation, an inline-comment red line, a whisper inbox with an inbox-time budget warning, anchor recall, three-case scope conflict prevention, dependency/hash pre-checks, concurrency ceiling, heartbeat lease renewal, and a DSH-independent core.",
+  "version": "1.6.0",
+  "description": "Parallel coding scheduler for DSH with seven-state lifecycle (incl. pending_review), priority scheduling, multidimensional worker routing (tier, capabilities, context, cost budget) with health-based preference, dynamic reliability gating, a task-result cache, task performance feedback, a worker escalation protocol, event-driven automatic deadlock recovery, git-worktree isolation with merge-conflict blocking, a task token-budget circuit breaker, needs_upgrade escalation, an inline-comment red line, a whisper inbox with an inbox-time budget warning, anchor recall, three-case scope conflict prevention, tiered quality gates, dependency/hash pre-checks, concurrency ceiling, heartbeat lease renewal, and a DSH-independent core.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

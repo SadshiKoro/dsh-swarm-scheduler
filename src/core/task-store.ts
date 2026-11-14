@@ -841,6 +841,103 @@ export function profileRefusal(
   return undefined
 }
 
+/** One worker's measured health, derived from `worker_stats.json` (v1.6.0). */
+export interface WorkerHealth {
+  /** Successes plus failures recorded for this worker. */
+  attempts: number
+  /** Successful attempts divided by all attempts; `0` when there are none. */
+  rate: number
+  /** Mean successful-attempt duration in ms; `undefined` without timing samples. */
+  avgMs: number | undefined
+}
+
+function statsEntry(
+  stats: WorkerStatsMap | WorkerStats | undefined,
+  id: string | undefined,
+): WorkerStats | undefined {
+  if (stats === undefined) return undefined
+  if (id !== undefined) return (stats as WorkerStatsMap)[id]
+  return stats as WorkerStats
+}
+
+/**
+ * Compute one worker's health from its counters.
+ *
+ * `avgMs` divides by the number of timing samples, not by success count: an
+ * attempt that reported no duration is not a zero-second attempt, so calling it
+ * one would make silent workers look impossibly fast.
+ */
+export function workerHealth(
+  stats: WorkerStatsMap | WorkerStats | undefined,
+  id?: string,
+): WorkerHealth {
+  const entry = statsEntry(stats, id)
+  const success = entry?.success_count ?? 0
+  const failed = entry?.failed_count ?? 0
+  const attempts = success + failed
+  const rate = attempts > 0 ? success / attempts : 0
+  const samples = entry?.time_sample_count ?? 0
+  const avgMs = entry !== undefined && samples > 0 ? entry.total_task_time_ms / samples : undefined
+  return { attempts, rate, avgMs }
+}
+
+/**
+ * High-complexity routing preference (v1.6.0).
+ *
+ * The pull model cannot push work to a worker, so this is deliberately narrow: a
+ * worker with a **proven** weak record is refused a `high` task when a
+ * **proven** healthier worker exists in the stats file. Nothing is reassigned
+ * automatically — the refusal names the better candidate and the Lead dispatches
+ * there. Untested workers (fewer than 3 attempts here, or fewer than 2 for the
+ * candidate) are never blocked on speculation.
+ */
+export function workerPreferenceRefusal(
+  agentId: string,
+  stats: WorkerStatsMap,
+): string | undefined {
+  const mine = workerHealth(stats, agentId)
+  if (mine.attempts < 3 || mine.rate >= 0.5) return undefined
+  let best: { id: string; health: WorkerHealth } | undefined
+  for (const [id] of Object.entries(stats)) {
+    if (id === agentId) continue
+    const health = workerHealth(stats, id)
+    if (health.attempts < 2 || health.rate <= 0.7) continue
+    if (best === undefined || health.rate > best.health.rate) best = { id, health }
+  }
+  if (best === undefined) return undefined
+  const minePercent = Math.round(mine.rate * 100)
+  const bestPercent = Math.round(best.health.rate * 100)
+  return `${agentId} has a ${minePercent}% success rate over ${mine.attempts} attempts; `
+    + `${best.id} is healthier (${bestPercent}% over ${best.health.attempts}). `
+    + 'High-complexity work prefers the healthier worker; low and medium tasks remain claimable.'
+}
+
+/**
+ * Whether the configured quality gate must run for these write scopes (v1.6.0).
+ *
+ * A change confined to documentation (`.md` / `.mdx`) or the test/doc trees
+ * cannot break the build gate in a way the gate is meant to catch, so running
+ * `tsc`/`npm test` for it is pure waiting. Empty scopes are **not** provably
+ * light, so the gate still runs there.
+ */
+export function gateNeededFor(scopes: readonly string[]): boolean {
+  if (scopes.length === 0) return true
+  for (const scope of scopes) {
+    const normalized = scope
+      .trim()
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '')
+      .replace(/\/+$/, '')
+      .toLowerCase()
+    if (normalized.length === 0) return true
+    if (normalized.endsWith('.md') || normalized.endsWith('.mdx')) continue
+    if (normalized === 'test' || normalized === 'tests' || normalized === 'docs') continue
+    if (normalized.startsWith('test/') || normalized.startsWith('tests/') || normalized.startsWith('docs/')) continue
+    return true
+  }
+  return false
+}
+
 export async function claimTask(
   store: TaskStore,
   taskId: string,
@@ -848,7 +945,7 @@ export async function claimTask(
   clock: Clock = defaultClock,
   workerTiers?: Readonly<Record<string, string>>,
   workerProfiles?: Readonly<Record<string, WorkerProfileInput>>,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'isolation_unavailable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean; workspace?: string }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'worker_not_preferred' | 'isolation_unavailable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean; workspace?: string }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -867,6 +964,13 @@ export async function claimTask(
       message: `${taskId} is ${found.task.status}; retry it with swarm_start or release it back to pending`,
     }
   }
+  if (found.task.status === 'pending_review') {
+    return {
+      ok: false,
+      code: 'invalid_state',
+      message: `${taskId} is pending_review; the Lead finalises it with swarm_complete(..., reviewed: true)`,
+    }
+  }
 
   // Routing gates: tier, then capability tags, context size, cost budget and —
   // for high-complexity work only — the worker's own failure record. All run
@@ -878,10 +982,20 @@ export async function claimTask(
   }
   // Reliability is only consulted for high-complexity blocks; low/medium never
   // pay for a bad record (see profileRefusal).
-  const workerStats = found.task.complexity === 'high' ? (await store.readWorkerStats())[claimedBy] : undefined
+  const statsMap: WorkerStatsMap = found.task.complexity === 'high' ? await store.readWorkerStats() : {}
+  const workerStats = statsMap[claimedBy]
   const profileMiss = profileRefusal(found.task, claimedBy, profile, workerStats)
   if (profileMiss !== undefined) {
     return { ok: false, code: profileMiss.code, message: profileMiss.message }
+  }
+  // v1.6.0 health preference: a proven-weak worker is refused `high` work while a
+  // proven-stronger worker exists. Low/medium work stays open (a worker needs
+  // work to recover its record, and the pull model has no way to push it).
+  if (found.task.complexity === 'high') {
+    const preference = workerPreferenceRefusal(claimedBy, statsMap)
+    if (preference !== undefined) {
+      return { ok: false, code: 'worker_not_preferred', message: `${taskId} refused: ${preference}` }
+    }
   }
 
   // Context-integrity pre-check: a task that names prerequisite files must not
@@ -1392,6 +1506,18 @@ export interface CompleteTaskOptions {
     workspace: string
     scopes: string[]
   }
+  /**
+   * Defer the local quality gate (v1.6.0): when true a successful completion is
+   * recorded as `pending_review` instead of `completed`. The Lead runs the final
+   * strict gate once, in the main workspace, and then finalises the task with
+   * `reviewed: true`.
+   */
+  skipLocalGate?: boolean
+  /**
+   * Finalise a `pending_review` task (v1.6.0): only the Lead calls this, after
+   * the global gate passed. It moves the record to `completed`.
+   */
+  reviewed?: boolean
 }
 
 /** Exact `failure_reason` written when the v1.5.0 inline-comment audit fails. */
@@ -1422,11 +1548,35 @@ export async function completeTask(
   success: boolean = true,
   metrics?: CompletionMetrics,
   options?: CompleteTaskOptions,
-): Promise<{ ok: boolean; code: 'completed' | 'failed' | 'blocked' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string; gate_failed?: boolean }> {
+): Promise<{ ok: boolean; code: 'completed' | 'failed' | 'blocked' | 'pending_review' | 'not_found' | 'invalid_state' | 'io_error'; message: string; degraded?: string; gate_failed?: boolean }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
+  const stamp = clock().toISOString()
   if (found.task.status === 'completed') {
     return { ok: false, code: 'invalid_state', message: `${taskId} is already completed` }
+  }
+  if (found.task.status === 'pending_review') {
+    if (options?.reviewed !== true) {
+      return {
+        ok: false,
+        code: 'invalid_state',
+        message: `${taskId} is pending_review; pass reviewed: true to finalise it after the global gate`,
+      }
+    }
+    const reviewed: TaskRecord = {
+      ...found.task,
+      status: 'completed',
+      completed_at: stamp,
+      claimed_by: '',
+      claimed_at: '',
+      result: result.length > 0 ? result : found.task.result,
+    }
+    const written = await store.writeExisting(reviewed)
+    if (!written.ok) {
+      return { ok: false, code: 'io_error', message: `review not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
+    }
+    await logTransition(store, taskId, 'review:completed', completedBy)
+    return { ok: true, code: 'completed', message: `${taskId} completed (reviewed)`, degraded: written.degraded }
   }
   if (found.task.status !== 'claimed' && found.task.status !== 'running') {
     return {
@@ -1435,23 +1585,30 @@ export async function completeTask(
       message: `${taskId} is ${found.task.status}; only a claimed or running task can be completed`,
     }
   }
-  const stamp = clock().toISOString()
 
   // --- quality gate -------------------------------------------------------
   // Judged before any state is written, so a gate failure takes the ordinary
   // failure path (one code path for retry accounting) instead of a second one.
   let gateFailure: string | undefined
+  let gateRan = false
+  let gateSkipped = false
   const gate = options?.qualityGate
+  const skipLocalGate = options?.skipLocalGate === true
   if (success && gate !== undefined && gate.command.trim().length > 0) {
-    const runner = gate.runner ?? qualityGateRunner
-    // The workspace, not `store.dirPath`: the pool directory is `<workspace>/.dsh-tasks`,
-    // which contains the task files but no project, so a gate run there would
-    // check a directory with no source and fail for the wrong reason. Not
-    // `process.cwd()` either — in this deployment that is the profile directory.
-    const cwd = options?.cwd ?? store.workspacePath
-    const outcome = runner(gate.command, cwd)
-    if (!outcome.ok) {
-      gateFailure = truncateGateOutput(outcome.output)
+    if (skipLocalGate || !gateNeededFor(found.task.write_scopes)) {
+      gateSkipped = true
+    } else {
+      const runner = gate.runner ?? qualityGateRunner
+      // The workspace, not `store.dirPath`: the pool directory is `<workspace>/.dsh-tasks`,
+      // which contains the task files but no project, so a gate run there would
+      // check a directory with no source and fail for the wrong reason. Not
+      // `process.cwd()` either — in this deployment that is the profile directory.
+      const cwd = options?.cwd ?? store.workspacePath
+      gateRan = true
+      const outcome = runner(gate.command, cwd)
+      if (!outcome.ok) {
+        gateFailure = truncateGateOutput(outcome.output)
+      }
     }
   }
   // A gate failure is a failure with a reason: same retry path as below.
@@ -1506,7 +1663,7 @@ export async function completeTask(
   }
 
   let next: TaskRecord
-  let code: 'completed' | 'failed' | 'blocked'
+  let code: 'completed' | 'failed' | 'blocked' | 'pending_review'
   let message: string
   if (effectiveSuccess && commentFailure !== undefined) {
     next = {
@@ -1550,6 +1707,20 @@ export async function completeTask(
     }
     code = 'blocked'
     message = `${taskId} blocked — ${workspaceFailure}`
+  } else if (effectiveSuccess && skipLocalGate) {
+    next = {
+      ...found.task,
+      status: 'pending_review',
+      claimed_by: '',
+      claimed_at: '',
+      completed_at: stamp,
+      result,
+      tokens_used: tokensUsed,
+      consecutive_failures: 0,
+      workspace: '',
+    }
+    code = 'pending_review'
+    message = `${taskId} pending_review (local gate skipped; Lead must run the final gate and finalise it)`
   } else if (effectiveSuccess) {
     next = {
       ...found.task,
@@ -1564,8 +1735,10 @@ export async function completeTask(
     }
     code = 'completed'
     message = `${taskId} ${code}`
-    if (gate !== undefined && gate.command.trim().length > 0) {
+    if (gateRan) {
       message += ' (quality gate passed)'
+    } else if (gateSkipped) {
+      message += ' (quality gate skipped: docs/tests only)'
     }
   } else {
     const reason = gateFailure !== undefined

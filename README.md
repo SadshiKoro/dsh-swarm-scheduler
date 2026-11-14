@@ -3,8 +3,8 @@
 A production-ready, event-driven parallel coding scheduler for DSH.
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Tests](https://img.shields.io/badge/Tests-211%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Version](https://img.shields.io/badge/Version-1.5.1-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Tests](https://img.shields.io/badge/Tests-227%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Version](https://img.shields.io/badge/Version-1.6.0-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 [![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 
 ## Overview
@@ -22,8 +22,8 @@ Three properties make the parallelism safe rather than merely fast:
 - **The pool heals itself.** Abandoned claims are released, silent workers are flagged before they
   are killed, and a worker that cannot finish escalates instead of writing code it knows is wrong.
 
-Version 1.5.1 is the current production release: the six-state lifecycle, routing gates, watchdog,
-conflict checks, the quality gate and the inline-comment red line are covered by 211 automated tests,
+Version 1.6.0 is the current production release: the seven-state lifecycle, routing gates, watchdog,
+conflict checks, the quality gate and the inline-comment red line are covered by 227 automated tests,
 including a 400-claim concurrency stress with zero observed double-claims. v1.1.0 added the **quality
 gate** — a deployment can make "done" a checked fact rather than a worker's claim — and a reproducible
 **benchmark** that measures capability routing against blind round-robin; v1.2.0 added the anti-blockage
@@ -40,6 +40,35 @@ that was never verified). Design intent belongs in `anchors`, where `swarm_recal
 **v1.5.1 refines two edges**: write-scope overlap is now three-case (directory↔file is allowed, and
 `src/` no longer matches `src2/`), and `swarm_inbox` delivers a `[SYSTEM]` budget warning the moment a
 worker's held task is already over `max_budget_tokens`.
+**v1.6.0 is the speed release**: a **task-result cache** turns completed work into advisory reuse hints,
+**health-based routing** keeps proven-weak workers off high-complexity tasks, and **tiered gates**
+(skip docs-only changes, defer the local gate with `pending_review` and run one global gate at the end)
+remove the repeated CPU and waiting that dominated completion time. The safety mechanisms are
+unchanged; the wins come from caching, routing and batching.
+> **安全是为了保障交付，效率是调度器的生命线。** Security is what protects delivery; efficiency is
+> the scheduler's lifeblood. Caching, routing and tiered gates buy throughput *without* lowering the
+> bar.
+
+## What's new in 1.6.0
+
+- **Task-result cache (advisory).** `swarm_plan` compares each incoming task's title/description and
+  `required_capabilities` against completed tasks (`0.6 × text Jaccard + 0.4 × capability Jaccard`)
+  and reports a `cache_hint` — the earlier `result` and its `anchors` — at ≥ 90% similarity. The cache
+  never reuses anything automatically: the Lead decides to reuse the result or dispatch only the
+  delta. This is the cheapest token saving in the plugin: the work is not re-thought and not
+  re-written.
+- **Health-based routing.** `workerHealth` derives `{attempts, rate, avgMs}` from `worker_stats.json`.
+  A worker with ≥ 3 attempts and a success rate below 50% is refused **high-complexity** claims when
+  another worker has ≥ 2 attempts and a rate above 70% (`worker_not_preferred`, naming the healthier
+  candidate) — retrying bad work costs more than choosing the better worker. Low/medium work stays
+  open to that worker so it can recover, and `swarm_status` shows
+  `[health: <rate>% · <avg>]` per worker.
+- **Tiered gates.** A change confined to `.md`/`.mdx` files or the `test/`, `tests/`, `docs/` trees no
+  longer runs the heavy quality gate (`gateNeededFor`). With `swarm_complete(..., skip_local_gate:
+  true)` the local gate is deferred entirely: the task parks in the new `pending_review` state
+  (seventh state — not claimable, not counted as done, does not satisfy dependencies), and the Lead
+  runs the strict global gate once in the main workspace before finalising each task with
+  `swarm_complete(..., reviewed: true)`.
 
 ## What's new in 1.5.1
 
@@ -55,6 +84,11 @@ worker's held task is already over `max_budget_tokens`.
   success: false.` The append happens before the read, so the warning is returned by the same drain.
   Residual risk: `tokens_used` accrues only when a completion is recorded, so this is a cross-attempt
   reminder, not live metering — the completion-time breaker remains the enforcement point.
+- **Load-balancing clause in the dispatch protocol.** A new section right after the anti-blockage
+  rules makes the Lead check `list_agents` after `swarm_plan` (and whenever new `ready` work appears),
+  wake every `inactive` Worker with `send_message` while `ready` tasks exist, and stop piling tasks
+  onto a single running Worker. When a woken Worker is refused for capability reasons, the fix is
+  `worker_profiles` or the task's `required_capabilities`, not another retry.
 
 ## What's new in 1.5.0
 
@@ -161,6 +195,24 @@ worker's held task is already over `max_budget_tokens`.
   `Task too large, needs decomposition` instead of grinding. A `blocked` task carrying that reason may
   **not** be re-dispatched as-is: the Lead must split it into 2–4 smaller tasks with dependencies wired
   before waking anyone.
+- **Load balancing and forced wake-up** — the protocol forbids serialising the pool through one Worker.
+  After planning, and whenever new `ready` work appears, the Lead must call `list_agents`; any
+  `inactive` Worker plus a `ready` task means an immediate `send_message` telling it to claim from
+  `swarm_ready`. Tasks are not piled onto a Worker that is already running while another sits idle, and
+  a capability refusal after a wake-up sends the Lead to `worker_profiles` / `required_capabilities`
+  instead of a retry loop.
+- **Task-result cache (v1.6.0)** — `swarm_plan` scores each new task against completed results
+  (`0.6 × text Jaccard + 0.4 × capability Jaccard`) and emits a `cache_hint` (result + anchors) at
+  ≥ 90% similarity. Reuse stays a Lead decision; the plugin never substitutes a cached result for the
+  task record.
+- **Health-based routing (v1.6.0)** — `workerHealth` records success rate and mean attempt duration.
+  A proven-weak worker (≥ 3 attempts, rate < 50%) cannot claim `high` work while a proven-stronger
+  worker exists (`worker_not_preferred`, naming the candidate); low/medium work remains open so the
+  worker can recover. `swarm_status` renders `[health: <rate>% · <avg>]`.
+- **Tiered gates (v1.6.0)** — documentation/test-only changes skip the heavy quality gate, and
+  `skip_local_gate: true` parks a success in `pending_review` for one strict global gate at the end,
+  finalised by `swarm_complete(..., reviewed: true)`. That removes repeated per-task CPU and model
+  waiting without removing the check.
 - **Deadline highlighting** — a task may declare `max_duration_ms`. `swarm_status` marks a `running`
   task `[OVERDUE]` once it exceeds that budget. This is deliberately *not* a kill: nothing is
   reclaimed. `STALE` asks "is anyone alive?", `OVERDUE` asks "is this taking longer than planned?" — a
@@ -310,21 +362,29 @@ large, multi-file request switches to dispatch mode on its own: it decomposes, p
 workers, and reports progress, without being told to do so. The protocol coexists with normal work —
 small tasks are executed directly.
 
+The protocol carries a **load-balancing and forced wake-up rule** (placed right after the anti-blockage
+rules): after `swarm_plan`, and whenever new `ready` work appears, the Lead must call `list_agents`. If
+any Worker is `inactive` while the pool has `ready` tasks, it **must** `send_message` that Worker and
+have it claim from `swarm_ready`. Piling several tasks onto one running Worker while others sit idle is
+forbidden — the next ready task goes to the next `inactive` Worker. If a woken Worker is then refused
+for capability reasons, the Lead fixes `worker_profiles` (or the task's `required_capabilities`)
+instead of retrying the same assignment.
+
 ## Tools Reference
 
 | Tool | Purpose | Core parameters |
 |---|---|---|
-| `swarm_plan` | Create the task pool; one JSON file per task | `tasks[]`: `task_id`, `big_task_id`, `title`, `description`, `write_scopes`, `blocked_by`, `priority`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`, `max_cost_tokens`, `max_duration_ms`, `model`, `max_budget_tokens`, `anchors`, `required_files`, `required_hashes` |
+| `swarm_plan` | Create the task pool; one JSON file per task; returns advisory `cache_hints` (completed result + anchors) for ≥90% similar work | `tasks[]`: `task_id`, `big_task_id`, `title`, `description`, `write_scopes`, `blocked_by`, `priority`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`, `max_cost_tokens`, `max_duration_ms`, `model`, `max_budget_tokens`, `anchors`, `required_files`, `required_hashes` |
 | `swarm_ready` | List tasks a worker can start right now | `big_task_id` (optional filter) |
-| `swarm_claim` | Atomically claim one task for one worker; a `high`-complexity claim also returns an isolated `workspace` path | `task_id`, `claimed_by` |
+| `swarm_claim` | Atomically claim one task for one worker; a `high`-complexity claim also returns an isolated `workspace` path, and refuses `worker_not_preferred` when a healthier worker exists | `task_id`, `claimed_by` |
 | `swarm_start` | `claimed → running`; records start time and first heartbeat | `task_id`, `started_by` |
 | `swarm_heartbeat` | Renew the lease on a held task | `task_id`, `agent_id` |
-| `swarm_complete` | Record the outcome; `success=false` triggers retry logic; a configured quality gate can downgrade a success; a workspace merge conflict or an exceeded budget blocks it | `task_id`, `result`, `completed_by`, `success`, `actual_tokens`, `duration_ms`, `anchors` |
+| `swarm_complete` | Record the outcome; `success=false` triggers retry logic; a configured quality gate can downgrade a success; merge conflicts/budget blocks apply; `skip_local_gate: true` parks a success in `pending_review`; `reviewed: true` finalises it | `task_id`, `result`, `completed_by`, `success`, `actual_tokens`, `duration_ms`, `anchors`, `skip_local_gate`, `reviewed` |
 | `swarm_release` | Return a claimed task to the pool, clearing its lock and its worktree | `task_id`, `released_by` |
 | `swarm_reap` | Watchdog sweep: release, flag STALE, or fail stale tasks (and remove their worktrees) | none |
 | `swarm_escalate` | Hand a task back as `blocked` with a reason (Lead may force); replies with an explicit stop instruction | `task_id`, `agent_id`, `reason`, `force` |
 | `swarm_set_deps` | Lead-only: replace a task's `blocked_by` list | `task_id`, `blocked_by[]`, `updated_by` |
-| `swarm_status` | Report the whole pool and per-worker performance, with `[ROUTING]` and `[budget]` annotations | `include_log` |
+| `swarm_status` | Report the whole pool and per-worker performance (seven states incl. `pending_review`), with `[ROUTING]`, `[budget]` and `[health: rate% · avg]` annotations | `include_log` |
 | `swarm_whisper` | Leave an instruction in a worker's inbox without starting its turn (≤ 1000 chars) | `worker_id`, `message`, `from` |
 | `swarm_inbox` | Drain a worker's inbox (ack semantics: reading clears the slot); appends a `[SYSTEM]` budget warning when a held task has spent its ceiling | `worker_id` |
 | `swarm_recall` | Find tasks by anchor, title, description or result (case-insensitive substring) | `query`, `limit` |
@@ -405,11 +465,12 @@ about everything else.
 stdio in a confined environment and fails with `spawn EPERM`. Single-process execution avoids that
 entirely. `npm run test:sandbox` is a retained alias for the same command.
 
-The suite contains **211 tests** covering the six-state lifecycle, retry and blocked transitions,
+The suite contains **227 tests** covering the seven-state lifecycle, retry and blocked transitions,
 scope admission, hash verification, routing refusals, the two-phase STALE window, the quality gate,
 the token budget and `needs_upgrade` accounting, worktree create/merge/conflict/remove, the
 inline-comment audit, the whisper inbox and its ack semantics (including the budget warning), anchor
-recall, and concurrent races. Seven cases deserve note:
+recall, the v1.6.0 task cache/health routing/tiered gates, and concurrent races. Eight cases deserve
+note:
 
 - `test/core/stress.test.ts` runs 10 workers against 50 tasks over 10 scopes and asserts every task
   is claimed exactly once and that no two overlapping scopes were ever held simultaneously.
@@ -434,6 +495,9 @@ recall, and concurrent races. Seven cases deserve note:
 - `test/core/recall.test.ts` pins the ranking and the refusal to guess: anchor hits outrank title,
   title outranks description and result, ties are stable by task id, the limit is honoured, an empty
   query matches nothing, and matching is case-insensitive substring only.
+- `test/core/similarity.test.ts` pins the v1.6.0 cache contract: identical work scores 1 and returns
+  the historical result/anchors, the same prose with a different capability set is not a hit,
+  pending/unresolved tasks are never reused, and CJK tokenization keeps Jaccard meaningful.
 
 Stress cases use a **wider clock budget on Windows** than on Linux/CI, because local filesystem
 latency dominates their wall time. Every functional assertion is identical on all platforms; only the

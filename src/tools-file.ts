@@ -30,6 +30,7 @@ import {
   missingRequiredFiles,
   hashMismatches,
   viewsOf,
+  workerHealth,
   type TaskRecord,
   type TaskView,
   type WorkerProfileInput,
@@ -37,6 +38,7 @@ import {
 } from './core/task-store.js'
 import { appendInbox, inboxSize, readInbox } from './core/inbox.js'
 import { recallTasks, RECALL_LIMIT_DEFAULT } from './core/recall.js'
+import { findCachedSolution, type CacheHint } from './core/similarity.js'
 
 const text = (value: string) => [{ type: 'text' as const, text: value }]
 
@@ -150,7 +152,9 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       + 'a worker whose rate would exceed it is refused with `worker_too_expensive`), `max_duration_ms` '
       + '(per-attempt wall clock, surfaced as [OVERDUE]), `model` (the recorded assignment; empty means inherit), '
       + '`max_budget_tokens` (task-wide token ceiling; crossing it blocks the task instead of completing it) and '
-      + '`anchors` (2-3 durable file:line/symbol pointers, searchable through swarm_recall).',
+      + '`anchors` (2-3 durable file:line/symbol pointers, searchable through swarm_recall). '
+      + 'A task whose title/description/capabilities match a completed task at >=90% returns a `cache_hint` '
+      + 'carrying that result and its anchors; reuse is advisory, never automatic.',
     parameters: {
       tasks: {
         type: 'array',
@@ -195,6 +199,20 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           conflicts: { type: 'array', items: { type: 'string' } },
           errors: { type: 'array', items: { type: 'string' } },
           warnings: { type: 'array', items: { type: 'string' } },
+          cache_hints: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                task_id: { type: 'string' },
+                cached_task_id: { type: 'string' },
+                similarity: { type: 'number' },
+                result: { type: 'string' },
+                anchors: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
           dir: { type: 'string' },
           degraded: { type: 'string' },
         },
@@ -204,9 +222,16 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         const conflicts = value.conflicts ?? []
         const errors = value.errors ?? []
         const warnings = value.warnings ?? []
+        const cacheHints = value.cache_hints ?? []
         const lines = [`pool: ${created.length} created, ${conflicts.length} conflict(s), ${errors.length} error(s)`]
         if (created.length > 0) lines.push(`  created: ${created.join(', ')}`)
         if (conflicts.length > 0) lines.push(`  already present (not overwritten): ${conflicts.join(', ')}`)
+        if (cacheHints.length > 0) {
+          lines.push(...cacheHints.map(hint =>
+            `  [cache] ${hint.task_id ?? '?'} ~ ${hint.cached_task_id ?? '?'} `
+            + `(${Math.round((hint.similarity ?? 0) * 100)}%): reuse or plan the delta`,
+          ))
+        }
         if (warnings.length > 0) lines.push(...warnings.map(line => `  ⚠ ${line}`))
         if (errors.length > 0) lines.push(...errors.map(line => `  ! ${line}`))
         if (value.degraded !== undefined && value.degraded !== '') lines.push(`  degraded: ${value.degraded}`)
@@ -218,12 +243,16 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       const conflicts: string[] = []
       const errors: string[] = []
       const warnings: string[] = []
+      const cacheHints: CacheHint[] = []
       const incoming = args.tasks ?? []
       if (incoming.length > MAX_PLAN_TASKS) {
-        return { created, conflicts, errors: [`${incoming.length} tasks exceeds the ${MAX_PLAN_TASKS} limit for one call`], warnings, dir: TASKS_DIR, degraded: '' }
+        return { created, conflicts, errors: [`${incoming.length} tasks exceeds the ${MAX_PLAN_TASKS} limit for one call`], warnings, cache_hints: cacheHints, dir: TASKS_DIR, degraded: '' }
       }
       const ensured = await store.ensureDir()
       if (!ensured.ok) errors.push(`pool directory unavailable: ${ensured.error ?? 'unknown'}`)
+      // Cache lookup happens before creation: the pool's completed results are the
+      // evidence, and a plan may not cite a task it is creating in the same call.
+      const completedTasks = (await store.readAll()).tasks
 
       const seen = new Set<string>()
       for (const spec of incoming) {
@@ -269,8 +298,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           anchors: (spec.anchors ?? []).map(anchor => anchor.trim()).filter(anchor => anchor.length > 0),
         })
         const written = await store.createExclusive(record)
-        if (written.ok) created.push(taskId)
-        else if ((written.error ?? '').includes('already exists')) conflicts.push(taskId)
+        if (written.ok) {
+          created.push(taskId)
+          const hint = findCachedSolution(completedTasks, record)
+          if (hint !== undefined) cacheHints.push(hint)
+        } else if ((written.error ?? '').includes('already exists')) conflicts.push(taskId)
         else errors.push(`${taskId}: ${written.error ?? 'write failed'}`)
       }
       return {
@@ -278,6 +310,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         conflicts,
         errors,
         warnings,
+        cache_hints: cacheHints,
         dir: TASKS_DIR,
         degraded: ensured.degraded ?? store.degraded ?? '',
       }
@@ -389,7 +422,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'worker_unreliable', 'isolation_unavailable', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'worker_unreliable', 'worker_not_preferred', 'isolation_unavailable', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -438,7 +471,9 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       + 'A second completion of the same task is refused rather than silently accepted. '
       + 'If this deployment configured `quality_gate_command`, every success claim runs that command first: a '
       + 'non-zero exit turns the completion into a failure (retry_count + 1), so `success: true` is a claim, '
-      + 'not a decision.',
+      + 'not a decision. Set `skip_local_gate: true` to defer that command: the task is recorded as '
+      + '`pending_review` and the Lead runs the final gate once. Pass `reviewed: true` (Lead only) to finalise '
+      + 'a `pending_review` task after that global gate.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'Task that finished' },
       result: { type: 'string', required: true, description: 'Compressed outcome: files, decisions, evidence' },
@@ -447,6 +482,8 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       actual_tokens: { type: 'number', description: 'Optional self-report: tokens consumed by this task' },
       duration_ms: { type: 'number', description: 'Optional self-report: wall time spent on this task, in milliseconds' },
       anchors: { type: 'array', description: '2-3 durable pointers (workspace-relative file:line or symbol paths) that let a later worker find this work with swarm_recall.', items: { type: 'string' } },
+      skip_local_gate: { type: 'boolean', description: 'Defer the local quality gate (v1.6.0): a successful completion becomes pending_review instead of completed. Default false.' },
+      reviewed: { type: 'boolean', description: 'Lead-only (v1.6.0): finalise a pending_review task as completed after the global gate passed.' },
     },
     output: {
       schema: {
@@ -454,7 +491,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['completed', 'failed', 'blocked', 'not_found', 'invalid_state', 'io_error', 'result_too_long'] },
+          code: { type: 'string', enum: ['completed', 'failed', 'blocked', 'pending_review', 'not_found', 'invalid_state', 'io_error', 'result_too_long'] },
           message: { type: 'string' },
           completed_at: { type: 'string' },
           degraded: { type: 'string' },
@@ -493,11 +530,15 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       }
       const gateCommand = quality_gate_command.trim()
       const successClaim = args.success ?? true
+      const skipLocalGate = args.skip_local_gate === true
+      const reviewed = args.reviewed === true
       const options: CompleteTaskOptions = {}
       if (gateCommand.length > 0) {
         options.qualityGate = { command: gateCommand }
         options.cwd = store.workspacePath
       }
+      if (skipLocalGate) options.skipLocalGate = true
+      if (reviewed) options.reviewed = true
       // Inline-comment red line (v1.5.0): a success claim is audited against the
       // task's own `write_scopes`, in its isolated workspace when it has one.
       // The audit is what the core records; the adapter only names the tree.
@@ -544,7 +585,14 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       const silence = outcome.ok && !gateDowngraded
         ? 'Result saved to pool. Do not send_message to Lead. You are now idle.'
         : ''
-      const parts = [outcome.message, note, silence].filter(part => part.length > 0)
+      // v1.6.0: a deferred local gate parks the task for one global check instead
+      // of running the command per completion. The worker must say so plainly, or
+      // "done" would read as completed while nothing has passed yet.
+      const pendingReview = outcome.ok && outcome.code === 'pending_review'
+      const reviewNote = pendingReview
+        ? 'Recorded as pending_review: the Lead runs the final global gate once and finalises it with reviewed: true.'
+        : ''
+      const parts = [outcome.message, note, reviewNote, silence].filter(part => part.length > 0)
       const after = outcome.ok ? await store.readOne(args.task_id) : { task: undefined }
       return {
         ok: outcome.ok,
@@ -560,11 +608,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
   disposers.push(ctx.tools.register(defineTool({
     name: 'swarm_status',
     description:
-      'Report the whole pool in one call: how many tasks exist in each of the six states (pending, claimed, '
-      + 'running, completed, failed, blocked), how many are ready to start, how many are still blocked, and a '
-      + 'compact line per task. A claim/running older than `staleAssignmentSec` is marked STALE — a suspicion '
-      + 'that its worker died mid-task. Release such a task with swarm_release if you agree it is abandoned; '
-      + 'or use swarm_reap to automatically recover stale tasks. Use this to decide whether to plan more, '
+      'Report the whole pool in one call: how many tasks exist in each of the seven states (pending, claimed, '
+      + 'running, completed, failed, blocked, pending_review), how many are ready to start, how many are still '
+      + 'blocked, and a compact line per task. A claim/running older than `staleAssignmentSec` is marked STALE — a '
+      + 'suspicion that its worker died mid-task. Release such a task with swarm_release if you agree it is '
+      + 'abandoned; or use swarm_reap to automatically recover stale tasks. Use this to decide whether to plan more, '
       + 'assign more, or stop. Pass include_log=true to see the last 5 log lines per task.',
     parameters: {
       include_log: { type: 'boolean', description: 'Include last 5 log lines per task' },
@@ -582,6 +630,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           completed: { type: 'integer' },
           failed: { type: 'integer' },
           blocked: { type: 'integer' },
+          pending_review: { type: 'integer' },
           ready: { type: 'integer' },
           stale: { type: 'integer' },
           stale_after_sec: { type: 'integer' },
@@ -599,6 +648,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         const head = `pool ${value.dir ?? TASKS_DIR}: total ${value.total ?? 0} · pending ${value.pending ?? 0}`
           + ` · claimed ${value.claimed ?? 0} · running ${value.running ?? 0}${stale > 0 ? ` (${stale} stale)` : ''}`
           + ` · completed ${value.completed ?? 0} · failed ${value.failed ?? 0} · blocked ${value.blocked ?? 0}`
+          + ` · pending_review ${value.pending_review ?? 0}`
           + ` · ready ${value.ready ?? 0}`
         const overdue = value.overdue ?? 0
         const hint = [
@@ -625,6 +675,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       const completed = views.filter(view => view.status === 'completed').length
       const failed = views.filter(view => view.status === 'failed').length
       const blocked = views.filter(view => view.status === 'blocked').length
+      const pendingReview = views.filter(view => view.status === 'pending_review').length
       const ready = views.filter(view => view.ready).length
       const stale = views.filter(view => view.stale).length
       const overdue = views.filter(view => view.overdue).length
@@ -649,6 +700,9 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           line += ` (retry ${view.retry_count}/${view.max_retries}`
           if (view.failure_reason) line += `, reason: ${view.failure_reason}`
           line += ')'
+        }
+        if (view.status === 'pending_review') {
+          line += ' (awaiting final gate: finalise with swarm_complete reviewed:true)'
         }
         line += ` — ${view.title}`
         // v1.4.0 routing visibility. `model` is a *recorded* assignment, not a
@@ -701,6 +755,13 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([id, entry]) => {
           let line = `${id}: ${entry.success_count} success, ${entry.failed_count} failed`
+          // v1.6.0 health badge: success rate and mean attempt duration. The mean
+          // comes from the recorded samples only, so a worker that reported no
+          // durations shows n/a instead of a fabricated 0ms.
+          const health = workerHealth(stats, id)
+          const ratePercent = Math.round(health.rate * 100)
+          const avg = health.avgMs !== undefined ? formatAge(health.avgMs / 1000) : 'n/a'
+          line += ` [health: ${ratePercent}% · ${avg}]`
           // Averages divide by the number of *samples*, not by success_count: a
           // completion that reported no metrics is not a 0-token completion, and
           // showing it as one would invent performance data out of silence.
@@ -726,6 +787,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         completed,
         failed,
         blocked,
+        pending_review: pendingReview,
         ready,
         stale,
         stale_after_sec: staleAssignmentSec,

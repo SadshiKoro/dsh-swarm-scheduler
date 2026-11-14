@@ -1,5 +1,5 @@
 /**
- * Unit tests for the task store — the pool's core logic.
+ * Unit tests for the task store 鈥?the pool's core logic.
  *
  * These run on Node's built-in test runner with Node's native TypeScript type
  * stripping, so they add **no dependency**: `npm test` is `node --test test/`.
@@ -37,8 +37,11 @@ import {
   reapTask,
   readLog,
   viewsOf,
+  viewOf,
   findScopeConflict,
   scopesOverlap,
+  gateNeededFor,
+  workerHealth,
   missingRequiredFiles,
   type TaskRecord,
 } from '../../src/core/task-store.ts'
@@ -743,7 +746,7 @@ test('a worker above the task cost budget is refused', async () => {
   const outcome = await claimTask(store, 't1', 'worker-pricey', undefined, undefined, profiles)
   assert.equal(outcome.ok, false)
   assert.equal(outcome.code, 'worker_too_expensive')
-  // 0.01/1k × 50k = 0.5, above the 0.1 ceiling; both numbers must be visible.
+  // 0.01/1k 脳 50k = 0.5, above the 0.1 ceiling; both numbers must be visible.
   assert.match(outcome.message, /0\.5/)
   assert.match(outcome.message, /0\.1/)
   assert.equal(readRaw('t1').status, 'pending')
@@ -914,7 +917,7 @@ test('a metric-free success followed by a measured one averages only the measure
   const entry = (await store.readWorkerStats())['worker-a']
   assert.ok(entry)
   assert.equal(entry.success_count, 2)
-  // Dividing by success_count would give 600 tokens / 22.5s — exactly the
+  // Dividing by success_count would give 600 tokens / 22.5s 鈥?exactly the
   // "fake zero" the fix removes.
   assert.equal(entry.tokens_sample_count, 1)
   assert.equal(entry.time_sample_count, 1)
@@ -972,7 +975,7 @@ test('a legacy worker_stats.json without the sample counters reads as zero sampl
  * pins the decision without touching `execSync`. A test that really ran
  * `npm test` would be slow, platform-dependent and recursive.
  *
- * A counting fake makes "the runner was not called" a first-class assertion —
+ * A counting fake makes "the runner was not called" a first-class assertion 鈥?
  * for `success=false` the gate must not run at all, and for the default
  * no-command path it must not run either.
  */
@@ -1392,4 +1395,162 @@ test('v1.5.0: two added inline comments block the completion', async () => {
   // The task must not have been completed on the way to being blocked.
   assert.notEqual(raw.completed_at, '')
   assert.equal(raw.result, 'done')
+})
+
+// ------------------------------------------- v1.6.0 health-based routing ---
+
+function seedV16WorkerStats(entries: Record<string, unknown>): void {
+  writeFileSync(join(dir, TASKS_DIR, 'worker_stats.json'), JSON.stringify(entries, null, 2), 'utf8')
+}
+
+test('workerHealth derives attempts, success rate and mean duration from samples', () => {
+  const stats = {
+    'worker-a': {
+      success_count: 3,
+      failed_count: 1,
+      total_task_time_ms: 8_000,
+      total_tokens_consumed: 100,
+      time_sample_count: 2,
+      tokens_sample_count: 2,
+    },
+  }
+
+  const health = workerHealth(stats, 'worker-a')
+
+  assert.equal(health.attempts, 4)
+  assert.equal(health.rate, 0.75)
+  assert.equal(health.avgMs, 4_000)
+  assert.deepEqual(workerHealth(undefined, 'ghost'), { attempts: 0, rate: 0, avgMs: undefined })
+})
+
+test('a proven-weak worker is refused high-complexity work when a healthier worker exists', async () => {
+  seedV16WorkerStats({
+    'worker-weak': { success_count: 1, failed_count: 3, total_task_time_ms: 0, total_tokens_consumed: 0 },
+    'worker-strong': { success_count: 2, failed_count: 0, total_task_time_ms: 0, total_tokens_consumed: 0 },
+  })
+  await store.createExclusive(blankTask('t1', { complexity: 'high' }))
+
+  const outcome = await claimTask(store, 't1', 'worker-weak')
+
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'worker_not_preferred')
+  assert.match(outcome.message, /worker-strong/)
+  assert.equal(readRaw('t1').status, 'pending')
+})
+
+test('the same weak worker may still claim low-complexity work', async () => {
+  seedV16WorkerStats({
+    'worker-weak': { success_count: 1, failed_count: 3, total_task_time_ms: 0, total_tokens_consumed: 0 },
+    'worker-strong': { success_count: 2, failed_count: 0, total_task_time_ms: 0, total_tokens_consumed: 0 },
+  })
+  await store.createExclusive(blankTask('t1', { complexity: 'low' }))
+
+  const outcome = await claimTask(store, 't1', 'worker-weak')
+
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})
+
+test('without a healthier candidate the weak worker is not refused', async () => {
+  seedV16WorkerStats({
+    'worker-weak': { success_count: 1, failed_count: 3, total_task_time_ms: 0, total_tokens_consumed: 0 },
+  })
+  await store.createExclusive(blankTask('t1', { complexity: 'high' }))
+
+  const outcome = await claimTask(store, 't1', 'worker-weak')
+
+  assert.notEqual(outcome.code, 'worker_not_preferred')
+})
+
+// ------------------------------------------------- v1.6.0 tiered gates ---
+
+test('gateNeededFor skips documentation and test-tree scopes only', () => {
+  assert.equal(gateNeededFor(['README.md']), false)
+  assert.equal(gateNeededFor(['docs/guide.md', 'docs/other.mdx']), false)
+  assert.equal(gateNeededFor(['test/core/x.test.ts', 'tests/helpers/y.ts']), false)
+  assert.equal(gateNeededFor(['docs/']), false)
+  assert.equal(gateNeededFor(['src/core/x.ts']), true)
+  assert.equal(gateNeededFor(['README.md', 'src/core/x.ts']), true)
+  assert.equal(gateNeededFor([]), true)
+})
+
+test('a docs-only completion skips the configured quality gate', async () => {
+  await store.createExclusive(blankTask('t1', { write_scopes: ['README.md'] }))
+  await claimTask(store, 't1', 'worker-a')
+  const calls: string[] = []
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a', undefined, true, undefined, {
+    qualityGate: {
+      command: 'npm test',
+      runner: () => {
+        calls.push('called')
+        return { ok: false, output: 'should never run' }
+      },
+    },
+  })
+
+  assert.equal(outcome.code, 'completed')
+  assert.equal(calls.length, 0)
+  assert.match(outcome.message, /quality gate skipped/)
+})
+
+test('skip_local_gate parks a success in pending_review and reviewed finalises it', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+  const calls: string[] = []
+
+  const parked = await completeTask(store, 't1', 'done', 'worker-a', undefined, true, undefined, {
+    skipLocalGate: true,
+    qualityGate: {
+      command: 'npm test',
+      runner: () => {
+        calls.push('called')
+        return { ok: false, output: 'red' }
+      },
+    },
+  })
+
+  assert.equal(parked.ok, true)
+  assert.equal(parked.code, 'pending_review')
+  assert.equal(calls.length, 0)
+  const raw = readRaw('t1')
+  assert.equal(raw.status, 'pending_review')
+  assert.equal(raw.claimed_by, '')
+
+  const claimAfter = await claimTask(store, 't1', 'worker-b')
+  assert.equal(claimAfter.ok, false)
+  assert.equal(claimAfter.code, 'invalid_state')
+
+  const reviewed = await completeTask(store, 't1', 'reviewed', 'lead', undefined, true, undefined, { reviewed: true })
+  assert.equal(reviewed.code, 'completed')
+  const finalRaw = readRaw('t1')
+  assert.equal(finalRaw.status, 'completed')
+  assert.equal(finalRaw.result, 'reviewed')
+})
+
+test('pending_review is not completed without reviewed: true', async () => {
+  await store.createExclusive(blankTask('t1', { status: 'pending_review' }))
+
+  const outcome = await completeTask(store, 't1', 'x', 'worker-a', undefined, true)
+
+  assert.equal(outcome.code, 'invalid_state')
+  assert.match(outcome.message, /reviewed: true/)
+})
+
+test('pending_review does not satisfy a dependency', () => {
+  const blocker = blankTask('a', { status: 'pending_review' })
+  const task = blankTask('b', { blocked_by: ['a'] })
+  const map = new Map([blocker, task].map(entry => [entry.task_id, entry] as const))
+
+  assert.equal(viewOf(task, map).ready, false)
+})
+
+test('a plain success still completes (skip_local_gate defaults to false)', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await claimTask(store, 't1', 'worker-a')
+
+  const outcome = await completeTask(store, 't1', 'done', 'worker-a')
+
+  assert.equal(outcome.code, 'completed')
+  assert.equal(readRaw('t1').status, 'completed')
 })

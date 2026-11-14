@@ -199,6 +199,8 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
     - 在**任务描述里把验收命令写清楚**（例如「验收：npm test 与 npx tsc --noEmit 均通过」），让 Worker 知道门禁会跑什么。
     - 不要把一个改动范围会导致工作区无法构建或测试变红的小任务并行派出去——门禁是按整块工作区判定的，别人的红也会记在你的任务上。
     - Worker 收到 failed 不是「result 被丢了」，而是「工作区没通过」；让它修好工作区后重试，不要靠改写 result 绕过。
+    - **分级门禁（v1.6.0）**：只改 .md/.mdx 或 test/、tests/、docs/ 下的文件时，本地门禁自动跳过；需要把多次本地门禁合并成一次全局检查时，Worker 可传 skip_local_gate:true，任务进入 pending_review（第七状态，不可认领）。全部任务完成后由 Lead 在主工作区跑一次最严格的全局门禁，再对每个 pending_review 任务调 swarm_complete(..., reviewed:true) 落为 completed。
+    - **建池先看缓存（v1.6.0）**：swarm_plan 返回的 cache_hints 携带历史完成任务的 result 与 anchors（相似度 >=90%）。能复用就直接复用，或只派增量任务，不要重复造轮子。
 
 12. **【动态拆分与防阻塞协议】——Worker 的自我评估呼救 + Lead 的强制拆分。**
     调度器最怕的不是任务失败，而是**一个任务闷头占着 slot 把整条依赖链拖死**。解耦办法是让 Worker 自己认输，让 Lead 被迫重拆。
@@ -219,22 +221,30 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
 
     **配套的超时高亮**：swarm_plan 支持给任务设 max_duration_ms（毫秒，0 = 不限）。swarm_status 会对运行超过该预算的 running 任务在行尾标 [OVERDUE]。OVERDUE 与 STALE 不同——STALE 问「人还在吗」，OVERDUE 问「是不是比预期久太多了」，心跳正常的任务也可能 OVERDUE。看到 OVERDUE 说明该拆、该延长预算、或该打断，而不是等它自己结束。
 
-13. **【Whisper 信箱】——不打断的调度通道。**
+13. **【负载均衡与强制唤醒铁律】。**
+    这是 Lead 的单点故障防线：多 Agent 并行的意义是**并行**；把一个 Worker 塞满、让其他 Worker 全程 inactive，等于把调度器退化回单线程。
+    1. 作为 Lead，在通过 swarm_plan 建池后，或者池子中有新的 ready 任务时，你严禁直接放任不管。
+    2. 必须调用 list_agents 检查当前所有 Worker 的状态。
+    3. 只要有处于 inactive 状态的 Worker，且池中有 ready 任务，你**必须立刻调用 send_message 唤醒它们**，让它们去 swarm_ready 领任务。
+    4. 严禁将多个任务连续派给同一个 Worker。如果一个 Worker 正在 running，而池子里还有 ready 任务，你必须把它派给下一个 inactive 的 Worker。
+    5. 如果你发现唤醒了 Worker，但它们没有领到任务（因为能力不匹配被拒），请立刻检查 worker_profiles 配置，或者调整任务的 required_capabilities。
+
+14. **【Whisper 信箱】——不打断的调度通道。**
     - 想给某个 Worker 追加指示、又不想打断它当前轮次时，用 swarm_whisper(worker_id, message, from) 把话写进池子的 inbox/<worker_id>.json，而不是 send_message。一条 whisper ≤ 1000 字符：它是「下次开工先看一眼」，不是第二份任务书。
     - Worker **每 3 步（以及每个任务开始前后）调一次 swarm_inbox(worker_id)** 检查信箱。它是 **ack 语义**：读一次即清空，第二次读只会返回新写入的那批；不要把重复读取当成确认。
     - 需要**立刻唤醒、改派或中断**，仍然用 send_message；whisper 只在「不该叫醒的时候」使用。
 
-14. **【提交规范】——产物落盘，摘要 10 字。**
+15. **【提交规范】——产物落盘，摘要 10 字。**
     - **严禁用 send_message 发送长代码或长报告**：代码和文档写进仓库文件，结论写进 swarm_complete(result=...)，≤4000 字符，理想是 10 字左右的一句话 + 关键路径。
     - 调用 swarm_complete 时附 **2-3 个 anchors**（例如 dsh-swarm-scheduler/src/core/task-store.ts:claimTask）：锚点必须是能被 swarm_recall 命中的持久定位符，不能是「已完成」这类描述。写任务前先 swarm_recall(锚点/关键词)，别重复解决别人已经解决过的问题。
     - 长交接（表格、权衡、被否掉的方案）放进仓库里的 handoff 文件，并在 result 里写它的路径。
 
-15. **【派发与知识边界】。**
+16. **【派发与知识边界】。**
     - 派发消息**不带主会话历史**：Worker 看不到你这一轮的上下文，所以消息必须自包含（任务 id、写范围、验收命令、依赖关系）。
     - Worker 不确定某个 API/字段存不存在时，**直接读源码**（src/core/*.ts 与工具定义），不要猜；猜出来的字段会让 tsc 或测试变红。
     - **不存在任何自动模型降级/自动换模型**：调度器不认识 provider，也不会自作主张换模型。swarm_status 行尾的 [ROUTING] Task X on <model|inherit> 只是**记录**；同一任务连续失败两次会置 needs_upgrade=true，而「换成一个更强的模型/Worker」是 **Lead 唯一允许的替换动作**，必须由你显式执行——它绝不会自动发生。
 
-16. **【代码洁净与无注释红线】。**
+17. **【代码洁净与无注释红线】。**
     这是硬门禁（配置项 forbid_inline_comments，默认开启）：每次成功完成会审计 write_scopes 内**新增**的行，新增行内注释达到 2 行即打回 blocked。
     - 严禁解释性/辩解性行内注释：「// TODO」「// 暂时这样」「// 这里可能有问题」一律不允许。注释无法被执行，因此无法被验证——**无法被执行的注释，就是未被验证的谎言。**
     - 代码必须自解释：命名与结构能表达清楚的，就不要写注释；设计意图必须写进 swarm_complete 的 anchors，不得写进代码文件。

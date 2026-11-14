@@ -1,5 +1,5 @@
 /**
- * Pure task-state model: the six-state machine, record shapes, and the derived
+ * Pure task-state model: the task lifecycle, record shapes, and the derived
  * views callers schedule on.
  *
  * Depends on **Node built-ins only** — no `@deepseek-ai/*` import anywhere in
@@ -11,15 +11,21 @@
  *
  *   pending ──claim──▶ claimed ──start──▶ running ──complete(success)──▶ completed
  *      ▲                  │                  │
- *      │                  │                  └─complete(!success)──▶ failed ──retry▶ (start again)
- *      │                  │                                             │
- *      └──release─────────┘                                             └─retry_count >= max_retries──▶ blocked
+ *      │                  │                  ├─complete(!success)──▶ failed ──retry▶ (start again)
+ *      │                  │                  │                          │
+ *      │                  │                  │                          └─retry_count >= max_retries──▶ blocked
+ *      │                  │                  └─complete(skip_local_gate)──▶ pending_review ──reviewed──▶ completed
+ *      └──release─────────┘
+ *
+ * `pending_review` (v1.6.0) is a **queue**, not a grant: it is not claimable, it
+ * does not satisfy a `blocked_by` dependency, and only a Lead's reviewed
+ * completion moves it to `completed`.
  */
 
 /** Workspace-relative directory holding one JSON file per task. */
 export const TASKS_DIR = '.dsh-tasks'
 
-export type TaskStatus = 'pending' | 'claimed' | 'running' | 'completed' | 'failed' | 'blocked'
+export type TaskStatus = 'pending' | 'claimed' | 'running' | 'completed' | 'failed' | 'blocked' | 'pending_review'
 
 /** How hard a block is, used only for worker routing. */
 export type Complexity = 'low' | 'medium' | 'high'
@@ -193,7 +199,7 @@ export function coerceTask(value: unknown, fallbackId: string): TaskRecord | und
   const raw = value as Record<string, unknown>
   const taskId = typeof raw.task_id === 'string' && raw.task_id.length > 0 ? raw.task_id : fallbackId
   if (taskId.length === 0) return undefined
-  const validStatuses: TaskStatus[] = ['pending', 'claimed', 'running', 'completed', 'failed', 'blocked']
+  const validStatuses: TaskStatus[] = ['pending', 'claimed', 'running', 'completed', 'failed', 'blocked', 'pending_review']
   const status = validStatuses.includes(raw.status as TaskStatus) ? (raw.status as TaskStatus) : 'pending'
   const strings = (input: unknown): string[] =>
     Array.isArray(input) ? input.filter((item): item is string => typeof item === 'string') : []
