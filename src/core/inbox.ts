@@ -23,11 +23,22 @@
  * must not be able to fail the claim or the plan that triggered it.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** Directory under the task pool that holds one JSON file per worker. */
 export const INBOX_DIR = 'inbox'
+
+/**
+ * The system line appended when a worker holds a task that has spent its whole
+ * token budget.
+ *
+ * It is deliberately an instruction, not a status report: the protocol's only
+ * sanctioned way to stop is `swarm_complete` with `success: false`, and a
+ * worker that keeps going after reading this has ignored a direct order.
+ */
+export const BUDGET_LIMIT_EXCEEDED_MESSAGE =
+  '[SYSTEM] Budget limit exceeded. Stop working immediately and call swarm_complete with success: false.'
 
 /** Suffix of the temporary copy a drain reads from (see `readInbox`). */
 const ACK_SUFFIX = '.ack'
@@ -152,24 +163,82 @@ export function readInbox(store: InboxStore, workerId: string): InboxReadResult 
   if (path === undefined) {
     return { ok: false, entries: [], error: `invalid worker id "${workerId}"` }
   }
-  if (!existsSync(path)) return { ok: true, entries: [] }
-  const acked = `${path}.${process.pid}${ACK_SUFFIX}`
-  try {
-    renameSync(path, acked)
-  } catch (error) {
-    // ENOENT here means another drain won the race and already took the file.
-    if (errorCode(error) === 'ENOENT') return { ok: true, entries: [] }
-    return { ok: false, entries: [], error: messageOf(error) }
+  let entries: InboxEntry[] = []
+  if (existsSync(path)) {
+    const acked = `${path}.${process.pid}${ACK_SUFFIX}`
+    try {
+      renameSync(path, acked)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return budgetAwareResult(store, workerId, [])
+      return { ok: false, entries: [], error: messageOf(error) }
+    }
+    entries = readEntries(acked)
+    try {
+      rmSync(acked, { force: true })
+    } catch (error) {
+      return { ok: false, entries, error: `inbox drained but not removed: ${messageOf(error)}` }
+    }
   }
-  const entries = readEntries(acked)
+  return budgetAwareResult(store, workerId, entries)
+}
+
+/**
+ * Task ids held by `workerId` that have already reached their token ceiling.
+ *
+ * The lookup reads the pool's own task files, so the inbox keeps its structural
+ * store contract (`dirPath` only). A malformed or unreadable file is skipped:
+ * the budget watch must never be able to break a drain.
+ */
+export function overBudgetHeldTaskIds(store: InboxStore, workerId: string): string[] {
+  let names: string[]
   try {
-    rmSync(acked, { force: true })
-  } catch (error) {
-    // The batch is already in hand; reporting the failed cleanup keeps the
-    // caller honest about the file being still on disk (it will be re-read).
-    return { ok: false, entries, error: `inbox drained but not removed: ${messageOf(error)}` }
+    names = readdirSync(store.dirPath)
+  } catch {
+    return []
   }
-  return { ok: true, entries }
+  const out: string[] = []
+  for (const name of names) {
+    if (!name.endsWith('.json') || name === 'worker_stats.json') continue
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(readFileSync(join(store.dirPath, name), 'utf8')) as unknown
+    } catch {
+      continue
+    }
+    if (typeof parsed !== 'object' || parsed === null) continue
+    const task = parsed as {
+      task_id?: unknown
+      status?: unknown
+      claimed_by?: unknown
+      max_budget_tokens?: unknown
+      tokens_used?: unknown
+    }
+    if (task.claimed_by !== workerId) continue
+    if (task.status !== 'claimed' && task.status !== 'running') continue
+    const limit = task.max_budget_tokens
+    const used = task.tokens_used
+    if (typeof limit !== 'number' || typeof used !== 'number') continue
+    if (limit <= 0 || used < limit) continue
+    if (typeof task.task_id === 'string' && task.task_id.length > 0) out.push(task.task_id)
+  }
+  return out
+}
+
+/**
+ * Append the budget warning (when one is owed) and deliver it with this drain.
+ *
+ * The append happens before the read so the warning cannot be missed by the
+ * call that discovered it. It stays queued as well: while the task remains
+ * over budget, every read reports it again, which is idempotent by design and
+ * is exactly what a worker that has not stopped yet needs to see.
+ */
+function budgetAwareResult(store: InboxStore, workerId: string, entries: InboxEntry[]): InboxReadResult {
+  if (overBudgetHeldTaskIds(store, workerId).length === 0) return { ok: true, entries }
+  appendInbox(store, workerId, BUDGET_LIMIT_EXCEEDED_MESSAGE, 'system')
+  const path = inboxPathOf(store, workerId)
+  if (path === undefined) return { ok: true, entries }
+  const queued = readEntries(path).filter(entry => entry.text === BUDGET_LIMIT_EXCEEDED_MESSAGE)
+  return { ok: true, entries: queued.length > 0 ? [...entries, queued[0] as InboxEntry] : entries }
 }
 
 /** Count of whispers waiting, without draining them. */

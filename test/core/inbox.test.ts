@@ -13,6 +13,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  BUDGET_LIMIT_EXCEEDED_MESSAGE,
   appendInbox,
   inboxDirOf,
   inboxPathOf,
@@ -189,6 +190,73 @@ test('a whisper appended during a drain survives it', () => {
     assert.deepEqual(readdirSync(inboxDirOf(store)), ['worker-a.json'])
 
     assert.deepEqual(readInbox(store, 'worker-a').entries.map(entry => entry.text), ['arrived during the drain'])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an over-budget held task appends a system warning the same drain returns', () => {
+  const { store, root } = makeStore()
+  try {
+    mkdirSync(store.dirPath, { recursive: true })
+    writeFileSync(join(store.dirPath, 'max-9.json'), JSON.stringify({
+      task_id: 'max-9',
+      status: 'running',
+      claimed_by: 'worker-code',
+      max_budget_tokens: 100,
+      tokens_used: 150,
+    }), 'utf8')
+    writeFileSync(join(store.dirPath, 'max-10.json'), JSON.stringify({
+      task_id: 'max-10',
+      status: 'claimed',
+      claimed_by: 'worker-code',
+      max_budget_tokens: 5,
+      tokens_used: 5,
+    }), 'utf8')
+
+    const drained = readInbox(store, 'worker-code')
+
+    assert.equal(drained.ok, true, drained.error)
+    assert.deepEqual(drained.entries.map(entry => entry.text), [BUDGET_LIMIT_EXCEEDED_MESSAGE])
+    assert.equal(drained.entries[0]?.from, 'system')
+    const path = inboxPathOf(store, 'worker-code') as string
+    assert.match(readFileSync(path, 'utf8'), /Budget limit exceeded/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('no budget warning for under-budget, pending, or another worker task', () => {
+  const { store, root } = makeStore()
+  try {
+    mkdirSync(store.dirPath, { recursive: true })
+    writeFileSync(join(store.dirPath, 'under.json'), JSON.stringify({
+      task_id: 'under',
+      status: 'running',
+      claimed_by: 'worker-code',
+      max_budget_tokens: 100,
+      tokens_used: 99,
+    }), 'utf8')
+    writeFileSync(join(store.dirPath, 'pending.json'), JSON.stringify({
+      task_id: 'pending',
+      status: 'pending',
+      claimed_by: '',
+      max_budget_tokens: 1,
+      tokens_used: 999,
+    }), 'utf8')
+    writeFileSync(join(store.dirPath, 'other.json'), JSON.stringify({
+      task_id: 'other',
+      status: 'running',
+      claimed_by: 'worker-other',
+      max_budget_tokens: 1,
+      tokens_used: 999,
+    }), 'utf8')
+
+    const drained = readInbox(store, 'worker-code')
+
+    assert.equal(drained.ok, true)
+    assert.deepEqual(drained.entries, [])
+    assert.equal(existsSync(inboxPathOf(store, 'worker-code') as string), false)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

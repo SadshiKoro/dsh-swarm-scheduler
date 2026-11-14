@@ -5,6 +5,7 @@
  * from the task store because these rules are pure and are the ones most worth
  * testing in isolation.
  */
+import { statSync } from 'node:fs'
 import type { TaskRecord } from './state-machine.ts'
 
 /**
@@ -24,20 +25,48 @@ export function normalizeScope(raw: string): string {
 }
 
 /**
- * Whether two scopes overlap, meaning a single-file write could land in both.
+ * Whether one write scope names a directory.
  *
- * Equal scopes overlap, and so do ancestor/descendant pairs: a task owning
- * `src` and a task owning `src/api` can edit the same file. The comparison is
- * therefore **directory-granular, not file-granular** — two tasks that both
- * declare `src/` are refused even when they would touch different files in it.
- * That is the intended trade: a false refusal costs one serialisation step,
- * while a false admission costs a silently overwritten file.
+ * Two markers count: a trailing separator (`src/`, `src\\`), and a path that
+ * currently exists as a directory. Anything else is treated as a file. The
+ * distinction is what keeps a directory scope from swallowing the files inside
+ * it: `src/` and `src/api.ts` are allowed to coexist, while `src/` and
+ * `src/utils/` still serialise.
+ */
+function isDirectoryScope(raw: string): boolean {
+  const trimmed = raw.trim().replace(/\\/g, '/')
+  if (trimmed.length === 0) return false
+  if (trimmed.endsWith('/')) return true
+  try {
+    return statSync(trimmed).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether two scopes overlap, meaning one task's edit can land in the other's.
+ *
+ * Three cases, each decided by what the two scopes *are*:
+ *
+ *   - **file ↔ file**: only the identical normalized path conflicts. Two
+ *     different files never do, no matter how close their names are.
+ *   - **directory ↔ directory**: the same directory, or one is an ancestor of
+ *     the other, conflicts (`src/` vs `src/utils/`). The comparison is
+ *     segment-aware, so `src/` never matches `src2/`.
+ *   - **directory ↔ file** (either direction): allowed. The file task owns one
+ *     file; the directory task may in principle touch it, but a claim-time
+ *     refusal here would serialise every task under a directory against every
+ *     file scope, which is the blanket rule v1.5.1 removes.
+ *
+ * Normalization keeps `src\\api` and `src/api/` the same scope, as before.
  */
 export function scopesOverlap(a: string, b: string): boolean {
   const left = normalizeScope(a)
   const right = normalizeScope(b)
   if (left.length === 0 || right.length === 0) return false
   if (left === right) return true
+  if (!isDirectoryScope(a) || !isDirectoryScope(b)) return false
   return left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
 }
 

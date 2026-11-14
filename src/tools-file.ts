@@ -1086,7 +1086,9 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
       'Drain a worker\'s inbox: return every whisper waiting for it, and clear the slot. This is an ack — the '
       + 'same call twice returns the second batch, not the first. Workers should call it every few steps (the '
       + 'dispatch protocol says every 3 steps) so a Lead instruction is not read only after the task is done. '
-      + 'The match is by `worker_id`: an id that was never whispered to returns an empty success, not an error.',
+      + 'The match is by `worker_id`: an id that was never whispered to returns an empty success, not an error. '
+      + 'This is also the budget checkpoint (v1.5.1): when the worker holds a task whose `tokens_used` has '
+      + 'reached `max_budget_tokens`, the drain appends and returns a [SYSTEM] budget warning telling it to stop.',
     parameters: {
       worker_id: { type: 'string', required: true, description: 'Agent id whose inbox to drain, e.g. worker-code-2' },
     },

@@ -271,33 +271,39 @@ test('setDependencies rejects a self-reference as the shortest cycle', async () 
 
 // ------------------------------------------------------ write_scopes overlap ---
 
-test('scopesOverlap treats equal, nested and slash-variant paths as overlapping', () => {
-  assert.equal(scopesOverlap('src', 'src'), true)
-  assert.equal(scopesOverlap('src', 'src/api'), true)
-  assert.equal(scopesOverlap('src/api', 'src'), true)
+test('scopesOverlap uses the v1.5.1 three-case rule', () => {
+  assert.equal(scopesOverlap('src/', 'src/'), true)
+  assert.equal(scopesOverlap('src/', 'src/api/'), true)
+  assert.equal(scopesOverlap('src/api/', 'src/'), true)
   assert.equal(scopesOverlap('./src/', 'src'), true)
   assert.equal(scopesOverlap('src\\api', 'src/api'), true)
-  assert.equal(scopesOverlap('src', 'test'), false)
+  assert.equal(scopesOverlap('src/', 'test/'), false)
   // A shared prefix that is not a path segment must not count.
-  assert.equal(scopesOverlap('src', 'src2'), false)
-  assert.equal(scopesOverlap('', 'src'), false)
+  assert.equal(scopesOverlap('src/', 'src2/'), false)
+  assert.equal(scopesOverlap('', 'src/'), false)
+  // A directory scope no longer serialises against a file inside it.
+  assert.equal(scopesOverlap('src/', 'src/api.ts'), false)
+  assert.equal(scopesOverlap('src/api.ts', 'src/'), false)
+  // Two different files never conflict; the identical path always does.
+  assert.equal(scopesOverlap('src/a.ts', 'src/b.ts'), false)
+  assert.equal(scopesOverlap('src/a.ts', 'src/a.ts'), true)
 })
 
 test('findScopeConflict reports the conflicting task and scope pair', async () => {
-  await store.createExclusive(blankTask('a', { write_scopes: ['src'] }))
-  await store.createExclusive(blankTask('b', { write_scopes: ['src/api'] }))
+  await store.createExclusive(blankTask('a', { write_scopes: ['src/'] }))
+  await store.createExclusive(blankTask('b', { write_scopes: ['src/api/'] }))
   await claimTask(store, 'a', 'worker-a')
   const all = (await store.readAll()).tasks
   const conflict = findScopeConflict(all.find(t => t.task_id === 'b') as TaskRecord, all)
   assert.notEqual(conflict, undefined)
   assert.equal(conflict?.task_id, 'a')
-  assert.equal(conflict?.scope, 'src/api')
-  assert.equal(conflict?.other_scope, 'src')
+  assert.equal(conflict?.scope, 'src/api/')
+  assert.equal(conflict?.other_scope, 'src/')
 })
 
 test('claimTask refuses a task whose write_scopes overlap a claimed task', async () => {
-  await store.createExclusive(blankTask('a', { write_scopes: ['src'] }))
-  await store.createExclusive(blankTask('b', { write_scopes: ['src/api'] }))
+  await store.createExclusive(blankTask('a', { write_scopes: ['src/'] }))
+  await store.createExclusive(blankTask('b', { write_scopes: ['src/api/'] }))
   assert.equal((await claimTask(store, 'a', 'worker-a')).ok, true)
   const second = await claimTask(store, 'b', 'worker-b')
   assert.equal(second.ok, false)
@@ -310,8 +316,8 @@ test('claimTask refuses a task whose write_scopes overlap a claimed task', async
 })
 
 test('claimTask admits two tasks whose write_scopes do not overlap', async () => {
-  await store.createExclusive(blankTask('a', { write_scopes: ['src'] }))
-  await store.createExclusive(blankTask('b', { write_scopes: ['test'] }))
+  await store.createExclusive(blankTask('a', { write_scopes: ['src/'] }))
+  await store.createExclusive(blankTask('b', { write_scopes: ['test/'] }))
   assert.equal((await claimTask(store, 'a', 'worker-a')).ok, true)
   assert.equal((await claimTask(store, 'b', 'worker-b')).ok, true)
   assert.equal(readRaw('a').claimed_by, 'worker-a')
@@ -319,8 +325,8 @@ test('claimTask admits two tasks whose write_scopes do not overlap', async () =>
 })
 
 test('claimTask ignores a completed task when judging scope conflicts', async () => {
-  await store.createExclusive(blankTask('a', { write_scopes: ['src'] }))
-  await store.createExclusive(blankTask('b', { write_scopes: ['src'] }))
+  await store.createExclusive(blankTask('a', { write_scopes: ['src/'] }))
+  await store.createExclusive(blankTask('b', { write_scopes: ['src/'] }))
   // `a` finishes, so its scope is free again.
   await claimTask(store, 'a', 'worker-a')
   await completeTask(store, 'a', 'done', 'worker-a')

@@ -1,9 +1,9 @@
 # DSH Multi-Session Parallel Coding Scheduler Plugin — Complete Design Document
 
-- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.5.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
+- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.5.1**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
 - Target runtime: DeepSeek Harness `0.2.0-rc.2` (Cordis ~4.0.4)
-- Test suite: **203 automated tests** (`npm test`, single-process, sandbox-safe)
-- **Current architecture (v1.5.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
+- Test suite: **211 automated tests** (`npm test`, single-process, sandbox-safe)
+- **Current architecture (v1.5.1)**: a pure core with no DSH-host dependency, plus one thin host adapter.
   The task pool is a **file pool** at `.dsh-tasks/<task_id>.json` guarded by atomic lock files — *not*
   the kernel's `agentTeams` task board. See §1 for the current design; **§1.4–§1.6 are superseded
   early-draft sections kept for history.**
@@ -15,11 +15,12 @@
 > no-hidden-model-downgrade guarantee) → §12.16 (v1.4.1: the two boundary fixes — worktree isolation
 > is now a hard claim requirement, and a gate note can no longer be invented for a gate that never
 > ran) → §12.17 (v1.5.0: the inline-comment red line, its audit, and the `forbid_inline_comments`
-> switch). Sections §0.1–§0.3 and §2–§11 are
+> switch) → §12.18 (v1.5.1: three-case scope overlap and the inbox budget warning). Sections
+> §0.1–§0.3 and §2–§11 are
 > **historical design notes from before the route-B decision**; they are useful as rationale, not as
 > a description of the shipped code.
 >
-> *Document revision: v2.6 (2026-11-14). Earlier revisions of this file recorded the pre-route-B design.*
+> *Document revision: v2.7 (2026-11-14). Earlier revisions of this file recorded the pre-route-B design.*
 
 ### Contents
 
@@ -39,6 +40,7 @@
 | §12.15 | **CURRENT** | v1.4.0: worktree isolation, budget circuit breaker, `needs_upgrade`, whisper inbox, anchor recall, and the no-hidden-model-downgrade guarantee |
 | §12.16 | **CURRENT** | v1.4.1: boundary fixes — `isolation_unavailable` (isolation failure refuses the claim) and `gate_failed` (no gate note without a real gate failure) |
 | §12.17 | **CURRENT** | v1.5.0: the inline-comment red line — diff-based audit, hard block on two added comment lines, and the `forbid_inline_comments` switch |
+| §12.18 | **CURRENT** | v1.5.1: three-case write-scope overlap (dir↔file admitted) and the inbox-time budget warning |
 
 ---
 
@@ -2455,6 +2457,62 @@ v1.5.0 新增 **7** 个用例（6 个审计单测 + 1 个 `completeTask` 集成�
 | `npm test` | 203 / 203 通过 |
 | `npx tsup` | 构建成功（`lib/`） |
 | `npm pack` | `dsh-swarm-scheduler-beta-1.5.0.tgz` |
+
+## 12.18 v1.5.1：两个边界优化（三态 scope、信箱预算熔断）
+
+v1.5.0 已经能挡住「不该完成的完成」。v1.5.1 修的是两个方向相反的边界：一个**放得太宽**（目录 scope 吞掉所有文件 scope），一个**提醒得太晚**（预算只在完成记账时才熔断）。
+
+### 12.18.1 三态 scope 冲突：目录不再吞掉文件
+
+旧规则把所有 scope 都当目录前缀比较：`src/` 与 `src/api.ts` 冲突。这保证了不误放，但代价是只要有一个目录级 scope，目录下所有文件级任务都被串行化——实际上两者并不共享同一个文件。
+
+v1.5.1 按「scope 本身是什么」判定三态：
+
+| 组合 | 判定 |
+|---|---|
+| 文件 ↔ 文件 | 仅规范化后路径相同才冲突；不同文件（哪怕名字接近）放行 |
+| 目录 ↔ 目录 | 相同或一个是另一个的祖先目录时冲突；段级比较，`src/` 不会匹配 `src2/` |
+| 目录 ↔ 文件（双向） | **放行** |
+
+目录判定使用两个标记：结尾分隔符（`src/`、`src\`）或该路径当前确实是目录（`statSync`）。规范化仍把 `src\api` 与 `./src/api/` 视为同一个 scope。
+
+**残留风险（写进 README）**：目录任务仍可能改动文件任务正持有的那个文件。claim 时放行意味着粒度是一种「Worker 自觉遵守的承诺」，不是强制锁；两个任务真可能撞车时，必须声明到具体文件。
+
+### 12.18.2 信箱准实时预算熔断：swarm_inbox 成为预算检查点
+
+旧规则的缺陷在 §12.15/§12.17 之外的 Known Limitation 7：`max_budget_tokens` 只在 `swarm_complete` 落盘时判定，长任务可以一路超支。v1.5.1 让 **`swarm_inbox` 读取时**顺便做一次预算检查：
+
+1. 先按 ack 语义正常 drain 原有 whisper；
+2. 扫描池内任务（`<task>.json`），找 `claimed_by === worker_id` 且 `status ∈ {claimed, running}`、`max_budget_tokens > 0` 且 `tokens_used >= max_budget_tokens` 的任务；
+3. 命中则**先 append 再 read**：向该 worker 信箱追加一条 `from: 'system'` 的消息，内容固定为
+   `[SYSTEM] Budget limit exceeded. Stop working immediately and call swarm_complete with success: false.`
+4. 该消息随本次读取返回；由于 append 后读取用非破坏性读取，消息同时留在信箱里，任务仍超额时后续每次读取都会再次返回它（幂等可接受）。
+
+实现放在 `src/core/inbox.ts`（`readInbox` + `overBudgetHeldTaskIds`），因此不经工具层、直接调用 `readInbox` 的测试也能验证；`src/tools-file.ts` 同步更新 `swarm_inbox` 的描述，说明它同时是预算检查点。
+
+**残留风险（写进 README）**：`tokens_used` 只在完成时累加，所以这条警告依据的是**上一次尝试**的记账，看不到当前尝试正在消耗的 token；它不是 kill switch，中途不会杀进程，完成时的 `Budget exceeded` 熔断仍是执行点。它是**跨尝试的提醒**，不是实时计量。
+
+### 12.18.3 测试与发布
+
+v1.5.1 新增 **8** 个用例（6 个 scope 单测 + 2 个 inbox 预算用例），并更新 `task-store.test.ts` 中依赖旧前缀语义的用例（目录 scope 改为带 `/`），全量 **211** 个全部通过：
+
+| 新增用例 | 断言 |
+|---|---|
+| `directory scopes conflict on the same or an ancestor directory, segment-aware` | `src/`～`src/utils/` 冲突；`src/` vs `src2/` 放行 |
+| `file scopes conflict only on the identical normalized path` | 同文件冲突；不同文件、`.bak` 变体放行；反斜杠归一化等价 |
+| `a directory scope and a file scope are allowed together` | 双向放行 |
+| `a path that exists as a directory is classified as one` | 已存在目录按目录处理；其下文件不冲突 |
+| `normalization keeps slash and dot variants of one scope equal` | `./src/api/` 与 `src/api` 归一 |
+| `findScopeConflict admits a file held inside another task directory scope` | 目录任务与文件任务不冲突；目录与目录仍冲突 |
+| `an over-budget held task appends a system warning the same drain returns` | 返回固定 `[SYSTEM]` 文案、`from === 'system'`，信箱文件含该文本 |
+| `no budget warning for under-budget, pending, or another worker task` | 未超额/未持有/他人任务不产生警告 |
+
+| 验证项 | 结果 |
+|---|---|
+| `npx tsc -p tsconfig.json --noEmit` | exit 0 |
+| `npm test` | 211 / 211 通过 |
+| `npx tsup` | 构建成功（`lib/`） |
+| `npm pack` | `dsh-swarm-scheduler-beta-1.5.1.tgz` |
 
 ## 13. References and evidence sources
 | Conclusion | Source |

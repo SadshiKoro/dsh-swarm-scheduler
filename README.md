@@ -3,8 +3,8 @@
 A production-ready, event-driven parallel coding scheduler for DSH.
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Tests](https://img.shields.io/badge/Tests-203%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Version](https://img.shields.io/badge/Version-1.5.0-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Tests](https://img.shields.io/badge/Tests-211%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Version](https://img.shields.io/badge/Version-1.5.1-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 [![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 
 ## Overview
@@ -22,8 +22,8 @@ Three properties make the parallelism safe rather than merely fast:
 - **The pool heals itself.** Abandoned claims are released, silent workers are flagged before they
   are killed, and a worker that cannot finish escalates instead of writing code it knows is wrong.
 
-Version 1.5.0 is the current production release: the six-state lifecycle, routing gates, watchdog,
-conflict checks, the quality gate and the inline-comment red line are covered by 203 automated tests,
+Version 1.5.1 is the current production release: the six-state lifecycle, routing gates, watchdog,
+conflict checks, the quality gate and the inline-comment red line are covered by 211 automated tests,
 including a 400-claim concurrency stress with zero observed double-claims. v1.1.0 added the **quality
 gate** — a deployment can make "done" a checked fact rather than a worker's claim — and a reproducible
 **benchmark** that measures capability routing against blind round-robin; v1.2.0 added the anti-blockage
@@ -37,6 +37,24 @@ model control belongs to the developer.**
 **v1.5.0 adds the comment red line**: a completion that adds two or more inline comment lines is
 blocked, because *无法被执行的注释，就是未被验证的谎言。* (a comment that cannot be executed is a lie
 that was never verified). Design intent belongs in `anchors`, where `swarm_recall` can find it.
+**v1.5.1 refines two edges**: write-scope overlap is now three-case (directory↔file is allowed, and
+`src/` no longer matches `src2/`), and `swarm_inbox` delivers a `[SYSTEM]` budget warning the moment a
+worker's held task is already over `max_budget_tokens`.
+
+## What's new in 1.5.1
+
+- **Three-case scope overlap.** `scopesOverlap` decides by kind, not by string prefix: file↔file
+  conflicts only on the identical normalized path, directory↔directory conflicts on the same or an
+  ancestor directory (segment-aware, so `src/` never matches `src2/`), and directory↔file is allowed
+  in either direction. Normalization still treats `src\api` and `./src/api/` as one scope. Residual
+  risk: a directory task may still edit the file a file task holds — the claim is admitted, so
+  granularity remains a promise, not an enforced lock.
+- **Budget warning at inbox time.** `swarm_inbox` now looks for tasks held by that worker
+  (`claimed`/`running`) whose `tokens_used` has reached `max_budget_tokens` and appends the exact
+  system line `[SYSTEM] Budget limit exceeded. Stop working immediately and call swarm_complete with
+  success: false.` The append happens before the read, so the warning is returned by the same drain.
+  Residual risk: `tokens_used` accrues only when a completion is recorded, so this is a cross-attempt
+  reminder, not live metering — the completion-time breaker remains the enforcement point.
 
 ## What's new in 1.5.0
 
@@ -308,7 +326,7 @@ small tasks are executed directly.
 | `swarm_set_deps` | Lead-only: replace a task's `blocked_by` list | `task_id`, `blocked_by[]`, `updated_by` |
 | `swarm_status` | Report the whole pool and per-worker performance, with `[ROUTING]` and `[budget]` annotations | `include_log` |
 | `swarm_whisper` | Leave an instruction in a worker's inbox without starting its turn (≤ 1000 chars) | `worker_id`, `message`, `from` |
-| `swarm_inbox` | Drain a worker's inbox (ack semantics: reading clears the slot) | `worker_id` |
+| `swarm_inbox` | Drain a worker's inbox (ack semantics: reading clears the slot); appends a `[SYSTEM]` budget warning when a held task has spent its ceiling | `worker_id` |
 | `swarm_recall` | Find tasks by anchor, title, description or result (case-insensitive substring) | `query`, `limit` |
 
 For refusal codes, routing gates, and transition rules in full, see `DESIGN.md`.
@@ -332,10 +350,13 @@ about everything else.
 
 ## Known Limitations
 
-1. **Write-conflict detection is file/directory level, not AST level.** Two tasks that both declare
-   `src/` are refused at claim time even if one edits `src/a.ts` and the other `src/b.ts`. There is no
-   function-level analysis and no write interception — deliberately, because a false admission would
-   silently overwrite a file. Declare the narrowest scope that is correct (`src/api/routes.ts`).
+1. **Write-conflict detection is three-case at the path level, not AST level (optimized in 1.5.1).**
+   File↔file conflicts only on the identical normalized path; directory↔directory still conflicts on
+   the same or an ancestor directory (segment-aware, so `src/` never matches `src2/`); directory↔file
+   is allowed in either direction. **Residual risk:** a directory task may still edit the very file a
+   file task holds — the claim is admitted, so granularity remains a promise the workers keep rather
+   than an enforced lock. Declare the narrowest file scopes wherever two tasks really can collide
+   (`src/api/routes.ts`).
 2. **Members cannot be deleted.** DSH's `agentTeams` exposes no delete API, so the roster only grows;
    it is cleared only when the Lead session ends. The protocol therefore prefers **reusing idle
    workers** over spawning new ones, and a long dispatch run can accumulate teammates.
@@ -359,9 +380,13 @@ about everything else.
    checkout. A merge conflict blocks the task and removes the checkout; resolving it needs a person or a
    fresh, smaller task, because the isolated attempt's changes are deliberately not forced onto the main
    tree.
-7. **The budget breaker only fires at completion time.** `max_budget_tokens` cannot stop a run
-   mid-flight: it is evaluated when `swarm_complete` arrives, so an attempt can overshoot the ceiling
-   and only then be recorded as `blocked` (`Budget exceeded`). It is a checkpoint, not a kill switch.
+7. **The budget warning is quasi-real-time and cross-attempt, not a kill switch (optimized in
+   1.5.1).** `swarm_inbox` looks for tasks held by that worker whose `tokens_used` has reached
+   `max_budget_tokens` and appends a `[SYSTEM]` message telling it to stop and call
+   `swarm_complete` with `success: false`. **Residual risk:** `tokens_used` only advances when a
+   completion is recorded, so the warning reflects the previous attempt's accounting and cannot see
+   the current attempt's spend; nothing kills a run mid-flight, and the completion-time breaker
+   (`Budget exceeded`) remains the enforcement point.
 8. **Whisper and recall are advisory file channels.** A whisper is not a task description: the
    inbox is capped at 1000 characters per message and drained on the worker's schedule, so a critical
    instruction still belongs in `send_message`. Recall is case-insensitive substring matching with no
@@ -380,11 +405,11 @@ about everything else.
 stdio in a confined environment and fails with `spawn EPERM`. Single-process execution avoids that
 entirely. `npm run test:sandbox` is a retained alias for the same command.
 
-The suite contains **203 tests** covering the six-state lifecycle, retry and blocked transitions,
+The suite contains **211 tests** covering the six-state lifecycle, retry and blocked transitions,
 scope admission, hash verification, routing refusals, the two-phase STALE window, the quality gate,
 the token budget and `needs_upgrade` accounting, worktree create/merge/conflict/remove, the
-inline-comment audit, the whisper inbox and its ack semantics, anchor recall, and concurrent races.
-Six cases deserve note:
+inline-comment audit, the whisper inbox and its ack semantics (including the budget warning), anchor
+recall, and concurrent races. Seven cases deserve note:
 
 - `test/core/stress.test.ts` runs 10 workers against 50 tasks over 10 scopes and asserts every task
   is claimed exactly once and that no two overlapping scopes were ever held simultaneously.
@@ -399,8 +424,13 @@ Six cases deserve note:
   a conflict is reported while the main HEAD stays untouched, and removal is idempotent.
 - `test/core/inbox.test.ts` pins delivery semantics: append keeps both whispers, drain is an ack (the
   second read returns the second batch), a concurrent append during a drain survives, an invalid or
-  path-traversal worker id is refused, and a corrupt inbox file is consumed as empty rather than
-  blocking the worker.
+  path-traversal worker id is refused, a corrupt inbox file is consumed as empty rather than
+  blocking the worker, and an over-budget task held by the worker appends and returns the exact
+  `[SYSTEM]` budget warning while under-budget or unheld tasks do not.
+- `test/core/scope.test.ts` pins the v1.5.1 three-case rule: directory↔directory still conflicts on
+  the same or an ancestor directory (segment-aware, `src/` never matches `src2/`), file↔file only on
+  the identical normalized path, directory↔file is admitted, and slash/dot variants normalize to one
+  scope.
 - `test/core/recall.test.ts` pins the ranking and the refusal to guess: anchor hits outrank title,
   title outranks description and result, ties are stable by task id, the limit is honoured, an empty
   query matches nothing, and matching is case-insensitive substring only.
