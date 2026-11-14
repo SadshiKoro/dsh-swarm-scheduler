@@ -40,6 +40,40 @@ export const INBOX_DIR = 'inbox'
 export const BUDGET_LIMIT_EXCEEDED_MESSAGE =
   '[SYSTEM] Budget limit exceeded. Stop working immediately and call swarm_complete with success: false.'
 
+/** Maximum characters a dispatch message may carry before truncation (v1.7.0). */
+export const DISPATCH_MESSAGE_LIMIT = 500
+
+/** Appended to a dispatch whose message was clipped to save context tokens. */
+export const DISPATCH_TRUNCATION_NOTICE =
+  '[SYSTEM] Message truncated to save tokens. Instruct the worker to read the task pool for full context.'
+
+/** Result of composing one dispatch instruction. */
+export interface DispatchText {
+  text: string
+  truncated: boolean
+}
+
+/**
+ * Compose the text written by `swarm_dispatch` (v1.7.0).
+ *
+ * Long requirement prose in a dispatch is exactly the context duplication the
+ * protocol forbids: the task pool already holds the description, so a message
+ * past 500 characters is clipped and the truncation notice explicitly tells the
+ * worker to read the pool instead. A `task_id` prepends a short standard
+ * instruction so the worker knows which pool entry to pull.
+ */
+export function buildDispatchText(message: string, taskId?: string): DispatchText {
+  const id = taskId?.trim() ?? ''
+  const instruction = id.length > 0 ? `去任务池领取任务 ${id}，自己读 description。` : ''
+  const body = message.trim()
+  const truncated = body.length > DISPATCH_MESSAGE_LIMIT
+  const clipped = truncated ? body.slice(0, DISPATCH_MESSAGE_LIMIT) : body
+  const text = [instruction, clipped, truncated ? DISPATCH_TRUNCATION_NOTICE : '']
+    .filter(part => part.length > 0)
+    .join('\n\n')
+  return { text, truncated }
+}
+
 /** Suffix of the temporary copy a drain reads from (see `readInbox`). */
 const ACK_SUFFIX = '.ack'
 

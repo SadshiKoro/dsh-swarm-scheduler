@@ -913,6 +913,56 @@ export function workerPreferenceRefusal(
 }
 
 /**
+ * The first configured standard worker with a usable record (v1.7.0).
+ *
+ * "Configured" means it appears in `worker_profiles` with a non-premium tier, or
+ * in the legacy `worker_tiers` map as anything other than `premium`. "Usable"
+ * means at least one recorded attempt and a success rate of at least 50% — the
+ * same bar the low-tier routing rule states, so a standard worker with no
+ * history never outranks a premium worker by speculation.
+ */
+export function standardWorkerWithRecord(
+  excludeId: string,
+  profiles: Readonly<Record<string, WorkerProfileInput>> | undefined,
+  tiers: Readonly<Record<string, string>> | undefined,
+  stats: WorkerStatsMap,
+): string | undefined {
+  const configured = new Set<string>()
+  for (const [id, profile] of Object.entries(profiles ?? {})) {
+    if (profile.tier !== 'premium') configured.add(id)
+  }
+  for (const [id, tier] of Object.entries(tiers ?? {})) {
+    if (tier !== 'premium') configured.add(id)
+  }
+  for (const id of configured) {
+    if (id === excludeId) continue
+    const health = workerHealth(stats, id)
+    if (health.attempts >= 1 && health.rate >= 0.5) return id
+  }
+  return undefined
+}
+
+/**
+ * The exact pool-idle warning rendered by `swarm_status` (v1.7.0).
+ *
+ * The warning is an approximation, not telemetry: the plugin cannot see DSH
+ * teammate state, so "workers are idle" is inferred from the pool itself — ready
+ * work exists, nothing is claimed/running, and the deployment has configured
+ * workers. That is the signature of a pool nobody was woken for.
+ */
+export const IDLE_POOL_WARNING = '[WARNING] Idle workers available. Please send_message to wake them up.'
+
+/** Whether the pool currently matches the idle-worker signature (v1.7.0). */
+export function idlePoolWarning(
+  readyCount: number,
+  activeCount: number,
+  configuredWorkers: number,
+): string | undefined {
+  if (readyCount > 0 && activeCount === 0 && configuredWorkers > 0) return IDLE_POOL_WARNING
+  return undefined
+}
+
+/**
  * Whether the configured quality gate must run for these write scopes (v1.6.0).
  *
  * A change confined to documentation (`.md` / `.mdx`) or the test/doc trees
@@ -945,7 +995,7 @@ export async function claimTask(
   clock: Clock = defaultClock,
   workerTiers?: Readonly<Record<string, string>>,
   workerProfiles?: Readonly<Record<string, WorkerProfileInput>>,
-): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'worker_not_preferred' | 'isolation_unavailable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean; workspace?: string }> {
+): Promise<{ ok: boolean; code: 'claimed' | 'already_claimed' | 'not_found' | 'invalid_state' | 'scope_conflict' | 'missing_dependencies' | 'hash_mismatch' | 'worker_too_weak' | 'worker_lacks_capability' | 'worker_context_too_small' | 'worker_too_expensive' | 'worker_unreliable' | 'worker_not_preferred' | 'worker_busy' | 'isolation_unavailable' | 'io_error'; message: string; degraded?: string; stale_lock_cleared?: boolean; workspace?: string }> {
   const found = await store.readOne(taskId)
   if (found.task === undefined) {
     return { ok: false, code: 'not_found', message: `no task ${taskId} in ${TASKS_DIR}` }
@@ -981,8 +1031,11 @@ export async function claimTask(
     return { ok: false, code: 'worker_too_weak', message: refusal }
   }
   // Reliability is only consulted for high-complexity blocks; low/medium never
-  // pay for a bad record (see profileRefusal).
-  const statsMap: WorkerStatsMap = found.task.complexity === 'high' ? await store.readWorkerStats() : {}
+  // pay for a bad record (see profileRefusal). A premium worker claiming `low`
+  // work also needs the full map to prove a standard worker is available.
+  const needsStats = found.task.complexity === 'high'
+    || (found.task.complexity === 'low' && profile.tier === 'premium')
+  const statsMap: WorkerStatsMap = needsStats ? await store.readWorkerStats() : {}
   const workerStats = statsMap[claimedBy]
   const profileMiss = profileRefusal(found.task, claimedBy, profile, workerStats)
   if (profileMiss !== undefined) {
@@ -995,6 +1048,19 @@ export async function claimTask(
     const preference = workerPreferenceRefusal(claimedBy, statsMap)
     if (preference !== undefined) {
       return { ok: false, code: 'worker_not_preferred', message: `${taskId} refused: ${preference}` }
+    }
+  }
+  // v1.7.0 low-tier routing: `low` work belongs to a fast standard worker when one
+  // is configured and has a usable record. A premium worker keeps it only when no
+  // such candidate exists (capacity beats purity), so this never starves the pool.
+  if (found.task.complexity === 'low' && profile.tier === 'premium') {
+    const standardCandidate = standardWorkerWithRecord(claimedBy, workerProfiles, workerTiers, statsMap)
+    if (standardCandidate !== undefined) {
+      return {
+        ok: false,
+        code: 'worker_not_preferred',
+        message: `${taskId} is low complexity; prefer the standard/faster worker ${standardCandidate} over premium ${claimedBy}`,
+      }
     }
   }
 
@@ -1049,6 +1115,19 @@ export async function claimTask(
         return { ok: false, code: 'already_claimed', message: `${taskId} is ${current.task.status}` }
       }
 
+      // Worker busy guard (v1.7.0): one running task per worker. `claimed` is
+      // not busy — a claim is a reservation, not execution. The full pool scan is
+      // the same read the scope check below needs, so this guard costs nothing.
+      const allNow = await store.readAll()
+      if (allNow.tasks.some(task => task.status === 'running' && task.claimed_by === claimedBy)) {
+        return {
+          ok: false,
+          code: 'worker_busy',
+          message: `${claimedBy} already has a running task; finish or escalate it before claiming another`,
+          degraded: lock.degraded,
+        }
+      }
+
       // Re-check under the lock: a prerequisite could have been deleted between
       // the pre-flight probe and this point. Same rule, same code.
       const missingNow = missingRequiredFiles(store, current.task)
@@ -1075,10 +1154,9 @@ export async function claimTask(
       }
 
       // Second scope conflict check: another concurrent claim may have claimed
-      // an overlapping task between our initial check and now. Re-read all tasks
-      // and check again under the lock. Also check for in-progress claims
-      // (lock files) on overlapping tasks.
-      const allNow = await store.readAll()
+      // an overlapping task between our initial check and now. `allNow` was read
+      // once above for the busy guard; reuse it. Also check for in-progress
+      // claims (lock files) on overlapping tasks.
       const conflictNow = findScopeConflict(current.task, allNow.tasks)
       if (conflictNow !== undefined) {
         const holder = conflictNow.claimed_by.length > 0 ? conflictNow.claimed_by : 'another agent'

@@ -14,7 +14,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   BUDGET_LIMIT_EXCEEDED_MESSAGE,
+  DISPATCH_MESSAGE_LIMIT,
+  DISPATCH_TRUNCATION_NOTICE,
   appendInbox,
+  buildDispatchText,
   inboxDirOf,
   inboxPathOf,
   inboxSize,
@@ -257,6 +260,55 @@ test('no budget warning for under-budget, pending, or another worker task', () =
     assert.equal(drained.ok, true)
     assert.deepEqual(drained.entries, [])
     assert.equal(existsSync(inboxPathOf(store, 'worker-code') as string), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ------------------------------------------- v1.7.0 dispatch truncation ---
+
+test('a short dispatch instruction passes through unchanged', () => {
+  const built = buildDispatchText('pick up max-1 next', undefined)
+
+  assert.equal(built.truncated, false)
+  assert.equal(built.text, 'pick up max-1 next')
+})
+
+test('a dispatch longer than 500 characters is clipped with the exact notice', () => {
+  const body = `${'x'.repeat(DISPATCH_MESSAGE_LIMIT)}TAIL`
+  const built = buildDispatchText(body, undefined)
+
+  assert.equal(built.truncated, true)
+  assert.equal(built.text, `${'x'.repeat(DISPATCH_MESSAGE_LIMIT)}\n\n${DISPATCH_TRUNCATION_NOTICE}`)
+  assert.match(DISPATCH_TRUNCATION_NOTICE, /\[SYSTEM\] Message truncated to save tokens\./)
+  assert.equal(built.text.includes('TAIL'), false)
+})
+
+test('a task_id adds the standard pull instruction and still truncates', () => {
+  const short = buildDispatchText('go', 'max-42')
+  assert.match(short.text, /max-42/)
+  assert.match(short.text, /description/)
+  assert.equal(short.truncated, false)
+
+  const long = buildDispatchText('y'.repeat(DISPATCH_MESSAGE_LIMIT + 50), 'max-42')
+  assert.equal(long.truncated, true)
+  assert.match(long.text, /max-42/)
+  assert.ok(long.text.endsWith(DISPATCH_TRUNCATION_NOTICE))
+  assert.equal(long.text.includes('y'.repeat(DISPATCH_MESSAGE_LIMIT + 1)), false)
+})
+
+test('the built dispatch text lands in the worker inbox intact', () => {
+  const { store, root } = makeStore()
+  try {
+    const built = buildDispatchText('z'.repeat(800), 'max-7')
+    const written = appendInbox(store, 'worker-code', built.text, 'lead')
+    assert.equal(written.ok, true, written.error)
+
+    const drained = readInbox(store, 'worker-code')
+    assert.equal(drained.entries.length, 1)
+    assert.equal(drained.entries[0]?.text, built.text)
+    assert.match(drained.entries[0]?.text ?? '', /max-7/)
+    assert.match(drained.entries[0]?.text ?? '', /\[SYSTEM\] Message truncated to save tokens\./)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

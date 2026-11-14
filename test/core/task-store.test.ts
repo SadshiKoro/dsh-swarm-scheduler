@@ -42,6 +42,8 @@ import {
   scopesOverlap,
   gateNeededFor,
   workerHealth,
+  idlePoolWarning,
+  IDLE_POOL_WARNING,
   missingRequiredFiles,
   type TaskRecord,
 } from '../../src/core/task-store.ts'
@@ -1553,4 +1555,89 @@ test('a plain success still completes (skip_local_gate defaults to false)', asyn
 
   assert.equal(outcome.code, 'completed')
   assert.equal(readRaw('t1').status, 'completed')
+})
+
+// --------------------------------------------- v1.7.0 worker_busy guard ---
+
+test('a worker with a running task cannot claim another one', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await store.createExclusive(blankTask('t2'))
+  await claimTask(store, 't1', 'worker-a')
+  await startTask(store, 't1', 'worker-a')
+
+  const blocked = await claimTask(store, 't2', 'worker-a')
+
+  assert.equal(blocked.ok, false)
+  assert.equal(blocked.code, 'worker_busy')
+  assert.match(blocked.message, /already has a running task/)
+  assert.equal(readRaw('t2').status, 'pending')
+  assert.equal((await claimTask(store, 't2', 'worker-b')).ok, true)
+})
+
+test('a merely claimed task does not make its worker busy', async () => {
+  await store.createExclusive(blankTask('t1'))
+  await store.createExclusive(blankTask('t2'))
+  await claimTask(store, 't1', 'worker-a')
+
+  const second = await claimTask(store, 't2', 'worker-a')
+
+  assert.equal(second.ok, true)
+  assert.equal(second.code, 'claimed')
+})
+
+// ------------------------------------------ v1.7.0 low-tier routing ---
+
+test('low work prefers a standard worker that has a usable record', async () => {
+  seedV16WorkerStats({
+    'worker-std': { success_count: 1, failed_count: 0, total_task_time_ms: 0, total_tokens_consumed: 0 },
+  })
+  const profiles = {
+    'worker-std': { tier: 'standard', capabilities: ['code', 'test'], max_context_tokens: 32_000, cost_per_1k_tokens: 0.01 },
+    'worker-premium': { tier: 'premium', capabilities: ['code', 'test'], max_context_tokens: 32_000, cost_per_1k_tokens: 0.05 },
+  }
+  await store.createExclusive(blankTask('t1', { complexity: 'low' }))
+
+  const outcome = await claimTask(store, 't1', 'worker-premium', undefined, undefined, profiles)
+
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.code, 'worker_not_preferred')
+  assert.match(outcome.message, /worker-std/)
+})
+
+test('a premium worker keeps low work when no standard worker has a record', async () => {
+  const profiles = {
+    'worker-std': { tier: 'standard', capabilities: ['code', 'test'], max_context_tokens: 32_000, cost_per_1k_tokens: 0.01 },
+    'worker-premium': { tier: 'premium', capabilities: ['code', 'test'], max_context_tokens: 32_000, cost_per_1k_tokens: 0.05 },
+  }
+  await store.createExclusive(blankTask('t1', { complexity: 'low' }))
+
+  const outcome = await claimTask(store, 't1', 'worker-premium', undefined, undefined, profiles)
+
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.code, 'claimed')
+})
+
+test('a standard worker without recorded attempts does not take low work from premium', async () => {
+  seedV16WorkerStats({
+    'worker-std': { success_count: 0, failed_count: 0, total_task_time_ms: 0, total_tokens_consumed: 0 },
+  })
+  const profiles = {
+    'worker-std': { tier: 'standard', capabilities: ['code', 'test'], max_context_tokens: 32_000, cost_per_1k_tokens: 0.01 },
+    'worker-premium': { tier: 'premium', capabilities: ['code', 'test'], max_context_tokens: 32_000, cost_per_1k_tokens: 0.05 },
+  }
+  await store.createExclusive(blankTask('t1', { complexity: 'low' }))
+
+  const outcome = await claimTask(store, 't1', 'worker-premium', undefined, undefined, profiles)
+
+  assert.equal(outcome.ok, true)
+})
+
+// ---------------------------------------------- v1.7.0 idle warning ---
+
+test('the idle warning fires only for ready work with no active workers and configured workers', () => {
+  assert.equal(idlePoolWarning(2, 0, 2), IDLE_POOL_WARNING)
+  assert.match(IDLE_POOL_WARNING, /^\[WARNING\] Idle workers available\. Please send_message to wake them up\.$/)
+  assert.equal(idlePoolWarning(0, 0, 2), undefined)
+  assert.equal(idlePoolWarning(2, 1, 2), undefined)
+  assert.equal(idlePoolWarning(2, 0, 0), undefined)
 })

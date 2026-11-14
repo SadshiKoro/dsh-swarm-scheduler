@@ -31,12 +31,13 @@ import {
   hashMismatches,
   viewsOf,
   workerHealth,
+  idlePoolWarning,
   type TaskRecord,
   type TaskView,
   type WorkerProfileInput,
   type CompleteTaskOptions,
 } from './core/task-store.js'
-import { appendInbox, inboxSize, readInbox } from './core/inbox.js'
+import { appendInbox, buildDispatchText, inboxSize, readInbox } from './core/inbox.js'
 import { recallTasks, RECALL_LIMIT_DEFAULT } from './core/recall.js'
 import { findCachedSolution, type CacheHint } from './core/similarity.js'
 
@@ -422,7 +423,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
-          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'worker_unreliable', 'worker_not_preferred', 'isolation_unavailable', 'io_error'] },
+          code: { type: 'string', enum: ['claimed', 'already_claimed', 'not_found', 'invalid_state', 'scope_conflict', 'missing_dependencies', 'hash_mismatch', 'worker_too_weak', 'worker_lacks_capability', 'worker_context_too_small', 'worker_too_expensive', 'worker_unreliable', 'worker_not_preferred', 'worker_busy', 'isolation_unavailable', 'io_error'] },
           message: { type: 'string' },
           claimed_by: { type: 'string' },
           claimed_at: { type: 'string' },
@@ -638,6 +639,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           big_tasks: { type: 'array', items: { type: 'string' } },
           tasks: { type: 'array', items: { type: 'string' } },
           workers: { type: 'array', items: { type: 'string' } },
+          warning: { type: 'string' },
           degraded: { type: 'string' },
         },
       },
@@ -662,8 +664,10 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         const workerLines = workers.length > 0
           ? ['  workers:', ...workers.map(line => `    ${line}`)]
           : []
+        const warningLine = value.warning !== undefined && value.warning !== '' ? [value.warning] : []
         return text([head, ...hint, ...tasks.map(line => `  ${line}`), ...workerLines,
-          ...(value.degraded !== undefined && value.degraded !== '' ? [`  degraded: ${value.degraded}`] : [])].join('\n'))
+          ...(value.degraded !== undefined && value.degraded !== '' ? [`  degraded: ${value.degraded}`] : []),
+          ...warningLine].join('\n'))
       },
     },
     async execute(args) {
@@ -778,6 +782,11 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
           }
           return line
         })
+      // v1.7.0 idle watermark: the plugin cannot read DSH teammate status, so it
+      // reports the *pool* signature of a dispatch nobody woke — ready work with
+      // zero active workers while the deployment has configured workers. It is an
+      // approximation and is documented as one; the protocol still owns waking.
+      const warning = idlePoolWarning(ready, claimed + running, Object.keys(worker_profiles).length)
       return {
         dir: TASKS_DIR,
         total: views.length,
@@ -795,6 +804,7 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         big_tasks: bigTasks,
         tasks: taskLines,
         workers: workerLines,
+        warning: warning ?? '',
         degraded: (degraded + logOutput).trim(),
       }
     },
@@ -1213,6 +1223,55 @@ export function registerFileTools({ ctx, store, staleAssignmentSec, max_workers,
         count: drained.entries.length,
         entries: drained.entries,
         degraded: store.degraded ?? '',
+      }
+    },
+  })))
+
+  // ---------------------------------------------------------- swarm_dispatch ---
+  disposers.push(ctx.tools.register(defineTool({
+    name: 'swarm_dispatch',
+    description:
+      'Send one worker a short dispatch instruction with the context-stripping red line built in (v1.7.0). '
+      + 'The instruction lands in the worker\'s whisper inbox, never in a long conversation: requirement prose '
+      + 'belongs in the pool task `description`, not in the message. A message longer than 500 characters is '
+      + 'truncated to 500 and a [SYSTEM] notice tells the worker to read the pool for full context. With '
+      + '`task_id`, a short standard instruction names the task to pull.',
+    parameters: {
+      worker_id: { type: 'string', required: true, description: 'Agent id to dispatch to, e.g. worker-code' },
+      message: { type: 'string', required: true, description: 'Short instruction; truncated above 500 chars' },
+      task_id: { type: 'string', description: 'Optional task id to put in the standard claim instruction' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          code: { type: 'string', enum: ['dispatched', 'invalid_worker', 'io_error'] },
+          worker_id: { type: 'string' },
+          final_text: { type: 'string' },
+          truncated: { type: 'boolean' },
+          chars: { type: 'integer' },
+          degraded: { type: 'string' },
+        },
+      },
+      render: (_args, value) => text(`${value.ok === true ? 'OK' : 'REJECTED'} ${value.code ?? '?'}: ${value.worker_id ?? ''}`
+        + ` (${value.chars ?? 0} chars${value.truncated === true ? ', truncated' : ''})`
+        + (value.degraded !== undefined && value.degraded !== '' ? `\n  degraded: ${value.degraded}` : '')),
+    },
+    async execute(args) {
+      const workerId = args.worker_id.trim()
+      const built = buildDispatchText(args.message, args.task_id)
+      const written = appendInbox(store, workerId, built.text, 'lead')
+      const invalid = written.error !== undefined && written.error.startsWith('invalid worker id')
+      return {
+        ok: written.ok,
+        code: written.ok ? 'dispatched' as const : invalid ? 'invalid_worker' as const : 'io_error' as const,
+        worker_id: workerId,
+        final_text: built.text,
+        truncated: built.truncated,
+        chars: built.text.length,
+        degraded: written.error ?? store.degraded ?? '',
       }
     },
   })))

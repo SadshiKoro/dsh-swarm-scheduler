@@ -3,8 +3,8 @@
 A production-ready, event-driven parallel coding scheduler for DSH.
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Tests](https://img.shields.io/badge/Tests-227%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Version](https://img.shields.io/badge/Version-1.6.0-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Tests](https://img.shields.io/badge/Tests-237%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Version](https://img.shields.io/badge/Version-1.7.0-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 [![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 
 ## Overview
@@ -22,8 +22,8 @@ Three properties make the parallelism safe rather than merely fast:
 - **The pool heals itself.** Abandoned claims are released, silent workers are flagged before they
   are killed, and a worker that cannot finish escalates instead of writing code it knows is wrong.
 
-Version 1.6.0 is the current production release: the seven-state lifecycle, routing gates, watchdog,
-conflict checks, the quality gate and the inline-comment red line are covered by 227 automated tests,
+Version 1.7.0 is the current production release: the seven-state lifecycle, routing gates, watchdog,
+conflict checks, the quality gate and the inline-comment red line are covered by 237 automated tests,
 including a 400-claim concurrency stress with zero observed double-claims. v1.1.0 added the **quality
 gate** — a deployment can make "done" a checked fact rather than a worker's claim — and a reproducible
 **benchmark** that measures capability routing against blind round-robin; v1.2.0 added the anti-blockage
@@ -45,9 +45,35 @@ worker's held task is already over `max_budget_tokens`.
 (skip docs-only changes, defer the local gate with `pending_review` and run one global gate at the end)
 remove the repeated CPU and waiting that dominated completion time. The safety mechanisms are
 unchanged; the wins come from caching, routing and batching.
+**v1.7.0 is the dispatch release**: one worker can hold only **one running task** (`worker_busy`),
+`swarm_status` warns when the pool has ready work but nobody is running, low-complexity work prefers a
+proven standard worker over premium, and the new **`swarm_dispatch`** tool physically isolates dispatch
+context — long messages are clipped at 500 characters and the worker is told to read the task pool.
 > **安全是为了保障交付，效率是调度器的生命线。** Security is what protects delivery; efficiency is
 > the scheduler's lifeblood. Caching, routing and tiered gates buy throughput *without* lowering the
 > bar.
+
+## What's new in 1.7.0
+
+- **One running task per worker (`worker_busy`).** `swarm_claim` scans the pool first: if the claiming
+  worker already has a task with `status === 'running'`, the claim is refused with
+  `worker_busy` and the task stays pending. A `claimed` reservation does **not** block — the guard is
+  about execution, not booking. Parallelism comes from waking more workers, not from stacking tasks on
+  one.
+- **Idle-pool watermark.** When `swarm_status` sees `ready > 0` with zero claimed/running tasks and a
+  non-empty `worker_profiles`, it appends the exact line
+  `[WARNING] Idle workers available. Please send_message to wake them up.` The plugin cannot read DSH
+  teammate state, so this is an approximation derived from the pool and the configured profiles — it
+  is a prompt to dispatch, not telemetry.
+- **Low-tier routing.** A `premium` worker claiming `low`-complexity work is refused
+  (`worker_not_preferred`) when a configured standard worker has at least one recorded attempt and a
+  success rate ≥ 50%; without such a candidate the premium worker keeps the job, so capacity is never
+  stranded. High-complexity routing keeps its v1.6.0 health preference.
+- **`swarm_dispatch(worker_id, message, task_id?)`.** The context-stripping red line made physical:
+  the instruction is written to the worker's whisper inbox instead of a long conversation, requirement
+  prose stays in the pool `description`, and a message past 500 characters is clipped with the exact
+  `[SYSTEM] Message truncated to save tokens. Instruct the worker to read the task pool for full
+  context.` notice. Passing `task_id` prepends the short standard instruction naming the task to pull.
 
 ## What's new in 1.6.0
 
@@ -213,6 +239,14 @@ unchanged; the wins come from caching, routing and batching.
   `skip_local_gate: true` parks a success in `pending_review` for one strict global gate at the end,
   finalised by `swarm_complete(..., reviewed: true)`. That removes repeated per-task CPU and model
   waiting without removing the check.
+- **One running task per worker (v1.7.0)** — `worker_busy` refuses a second running claim for the same
+  worker; `claimed` reservations do not block. Parallelism means waking more workers, not stacking
+  tasks on one, and `swarm_status` warns when ready work sits beside an idle pool.
+- **Low-tier routing (v1.7.0)** — premium workers are refused `low` work only when a configured
+  standard worker has a proven record (≥ 1 attempt, ≥ 50% success); otherwise the job is allowed.
+- **Context-stripping dispatch (v1.7.0)** — `swarm_dispatch` writes instructions to the worker inbox,
+  clips messages past 500 characters with a `[SYSTEM]` notice, and keeps requirement prose in the pool
+  `description` instead of duplicating it into the conversation.
 - **Deadline highlighting** — a task may declare `max_duration_ms`. `swarm_status` marks a `running`
   task `[OVERDUE]` once it exceeds that budget. This is deliberately *not* a kill: nothing is
   reclaimed. `STALE` asks "is anyone alive?", `OVERDUE` asks "is this taking longer than planned?" — a
@@ -376,7 +410,7 @@ instead of retrying the same assignment.
 |---|---|---|
 | `swarm_plan` | Create the task pool; one JSON file per task; returns advisory `cache_hints` (completed result + anchors) for ≥90% similar work | `tasks[]`: `task_id`, `big_task_id`, `title`, `description`, `write_scopes`, `blocked_by`, `priority`, `complexity`, `required_worker_tier`, `required_capabilities`, `estimated_tokens`, `max_cost_tokens`, `max_duration_ms`, `model`, `max_budget_tokens`, `anchors`, `required_files`, `required_hashes` |
 | `swarm_ready` | List tasks a worker can start right now | `big_task_id` (optional filter) |
-| `swarm_claim` | Atomically claim one task for one worker; a `high`-complexity claim also returns an isolated `workspace` path, and refuses `worker_not_preferred` when a healthier worker exists | `task_id`, `claimed_by` |
+| `swarm_claim` | Atomically claim one task for one worker; a `high`-complexity claim also returns an isolated `workspace` path; refuses `worker_not_preferred` (health/low-tier routing) and `worker_busy` when the worker already has a running task | `task_id`, `claimed_by` |
 | `swarm_start` | `claimed → running`; records start time and first heartbeat | `task_id`, `started_by` |
 | `swarm_heartbeat` | Renew the lease on a held task | `task_id`, `agent_id` |
 | `swarm_complete` | Record the outcome; `success=false` triggers retry logic; a configured quality gate can downgrade a success; merge conflicts/budget blocks apply; `skip_local_gate: true` parks a success in `pending_review`; `reviewed: true` finalises it | `task_id`, `result`, `completed_by`, `success`, `actual_tokens`, `duration_ms`, `anchors`, `skip_local_gate`, `reviewed` |
@@ -384,9 +418,10 @@ instead of retrying the same assignment.
 | `swarm_reap` | Watchdog sweep: release, flag STALE, or fail stale tasks (and remove their worktrees) | none |
 | `swarm_escalate` | Hand a task back as `blocked` with a reason (Lead may force); replies with an explicit stop instruction | `task_id`, `agent_id`, `reason`, `force` |
 | `swarm_set_deps` | Lead-only: replace a task's `blocked_by` list | `task_id`, `blocked_by[]`, `updated_by` |
-| `swarm_status` | Report the whole pool and per-worker performance (seven states incl. `pending_review`), with `[ROUTING]`, `[budget]` and `[health: rate% · avg]` annotations | `include_log` |
+| `swarm_status` | Report the whole pool and per-worker performance (seven states incl. `pending_review`), with `[ROUTING]`, `[budget]` and `[health: rate% · avg]` annotations; appends the idle-pool `[WARNING]` when ready work exists with no active workers | `include_log` |
 | `swarm_whisper` | Leave an instruction in a worker's inbox without starting its turn (≤ 1000 chars) | `worker_id`, `message`, `from` |
 | `swarm_inbox` | Drain a worker's inbox (ack semantics: reading clears the slot); appends a `[SYSTEM]` budget warning when a held task has spent its ceiling | `worker_id` |
+| `swarm_dispatch` | Send a short instruction into a worker's inbox (context-stripping red line): messages > 500 chars are clipped with a `[SYSTEM]` notice; `task_id` adds the standard pull instruction | `worker_id`, `message`, `task_id?` |
 | `swarm_recall` | Find tasks by anchor, title, description or result (case-insensitive substring) | `query`, `limit` |
 
 For refusal codes, routing gates, and transition rules in full, see `DESIGN.md`.
@@ -455,6 +490,11 @@ about everything else.
    cannot select one, and has no fallback path. Recording `model` affects only the `[ROUTING]`
    annotation; `needs_upgrade` only advises. Any actual substitution is an explicit action by the
    developer or the Lead.
+10. **The idle-pool warning is an approximation, not teammate telemetry (v1.7.0).** The plugin cannot
+    read DSH's live teammate state, so `swarm_status` infers a stalled dispatch from the pool: `ready >
+    0`, zero claimed/running tasks, and a non-empty `worker_profiles`. A pool that is quiet because
+    every worker is busy *outside* this scheduler is indistinguishable from a pool nobody woke; the
+    `[WARNING]` is a prompt to check `list_agents`, not a claim about reality.
 
 ## Testing
 
@@ -465,12 +505,12 @@ about everything else.
 stdio in a confined environment and fails with `spawn EPERM`. Single-process execution avoids that
 entirely. `npm run test:sandbox` is a retained alias for the same command.
 
-The suite contains **227 tests** covering the seven-state lifecycle, retry and blocked transitions,
+The suite contains **237 tests** covering the seven-state lifecycle, retry and blocked transitions,
 scope admission, hash verification, routing refusals, the two-phase STALE window, the quality gate,
 the token budget and `needs_upgrade` accounting, worktree create/merge/conflict/remove, the
 inline-comment audit, the whisper inbox and its ack semantics (including the budget warning), anchor
-recall, the v1.6.0 task cache/health routing/tiered gates, and concurrent races. Eight cases deserve
-note:
+recall, the v1.6.0 task cache/health routing/tiered gates, the v1.7.0 worker-busy guard/idle
+watermark/dispatch truncation/low routing, and concurrent races. Nine cases deserve note:
 
 - `test/core/stress.test.ts` runs 10 workers against 50 tasks over 10 scopes and asserts every task
   is claimed exactly once and that no two overlapping scopes were ever held simultaneously.
@@ -498,6 +538,11 @@ note:
 - `test/core/similarity.test.ts` pins the v1.6.0 cache contract: identical work scores 1 and returns
   the historical result/anchors, the same prose with a different capability set is not a hit,
   pending/unresolved tasks are never reused, and CJK tokenization keeps Jaccard meaningful.
+- `test/core/inbox.test.ts` and `test/core/task-store.test.ts` pin the v1.7.0 rules: the dispatch
+  builder clips at exactly 500 characters and appends the `[SYSTEM]` notice, a worker with a running
+  task is refused (`worker_busy`) while a claimed one is not, the idle watermark fires only for
+  ready-work-with-no-active-workers-and-configured-profiles, and low work yields to a proven standard
+  worker but not to an unproven one.
 
 Stress cases use a **wider clock budget on Windows** than on Linux/CI, because local filesystem
 latency dominates their wall time. Every functional assertion is identical on all platforms; only the

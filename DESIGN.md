@@ -1,9 +1,9 @@
 # DSH Multi-Session Parallel Coding Scheduler Plugin — Complete Design Document
 
-- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.6.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
+- Plugin package name: `dsh-swarm-scheduler-beta` (**v1.7.0**; the loader entry id stays `swarm-scheduler`, see §12.2.9)
 - Target runtime: DeepSeek Harness `0.2.0-rc.2` (Cordis ~4.0.4)
-- Test suite: **227 automated tests** (`npm test`, single-process, sandbox-safe)
-- **Current architecture (v1.6.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
+- Test suite: **237 automated tests** (`npm test`, single-process, sandbox-safe)
+- **Current architecture (v1.7.0)**: a pure core with no DSH-host dependency, plus one thin host adapter.
   The task pool is a **file pool** at `.dsh-tasks/<task_id>.json` guarded by atomic lock files — *not*
   the kernel's `agentTeams` task board. See §1 for the current design; **§1.4–§1.6 are superseded
   early-draft sections kept for history.**
@@ -16,12 +16,13 @@
 > is now a hard claim requirement, and a gate note can no longer be invented for a gate that never
 > ran) → §12.17 (v1.5.0: the inline-comment red line, its audit, and the `forbid_inline_comments`
 > switch) → §12.18 (v1.5.1: three-case scope overlap and the inbox budget warning) → §12.19
-> (v1.6.0: task-result cache, health-based routing, tiered gates and the `pending_review` state).
+> (v1.6.0: task-result cache, health-based routing, tiered gates and the `pending_review` state) →
+> §12.20 (v1.7.0: worker-busy guard, idle watermark, dispatch truncation and low-tier routing).
 > Sections §0.1–§0.3 and §2–§11 are
 > **historical design notes from before the route-B decision**; they are useful as rationale, not as
 > a description of the shipped code.
 >
-> *Document revision: v2.8 (2026-11-14). Earlier revisions of this file recorded the pre-route-B design.*
+> *Document revision: v2.9 (2026-11-14). Earlier revisions of this file recorded the pre-route-B design.*
 
 ### Contents
 
@@ -43,6 +44,7 @@
 | §12.17 | **CURRENT** | v1.5.0: the inline-comment red line — diff-based audit, hard block on two added comment lines, and the `forbid_inline_comments` switch |
 | §12.18 | **CURRENT** | v1.5.1: three-case write-scope overlap (dir↔file admitted) and the inbox-time budget warning |
 | §12.19 | **CURRENT** | v1.6.0: advisory task-result cache, health-based claim preference, docs/test gate skipping, `pending_review` + reviewed finalisation |
+| §12.20 | **CURRENT** | v1.7.0: one-running-task guard (`worker_busy`), idle-pool watermark, context-stripping `swarm_dispatch`, low-tier routing |
 
 ---
 
@@ -2617,6 +2619,78 @@ v1.6.0 新增 **16** 个用例（6 个 `similarity.test.ts` + 10 个 `task-store
 | `npm test` | 227 / 227 通过 |
 | `npx tsup` | 构建成功（`lib/`） |
 | `npm pack` | `dsh-swarm-scheduler-beta-1.6.0.tgz` |
+
+## 12.20 v1.7.0：调度守卫、上下文物理隔离与协议
+
+v1.6.0 用缓存与分级门禁省掉了重复计算；v1.7.0 处理的是**调度行为本身的三类浪费**：一个 Worker 同时背多个任务（注意力被切碎）、池子有活却没人被唤醒（空转）、以及把整份需求塞进派发消息（同一份上下文在 Lead 会话、派发消息、Worker 上下文里各存一遍）。
+
+### 12.20.1 `worker_busy`：一个 Worker 同时只能有一个 running 任务
+
+`claimTask` 在锁内读取全池（这次读取本来就要为 scope 冲突做），若存在 `status === 'running'` 且 `claimed_by === claimedBy` 的任务，直接返回：
+
+```json
+{ "ok": false, "code": "worker_busy", "message": "<worker> already has a running task; finish or escalate it before claiming another" }
+```
+
+- `claimed` 只是预占，**不**算 busy；`running` 才是执行。
+- 拒绝发生在写 claimed 之前，任务保持 `pending`，锁在 `finally` 正常释放。
+- 返回码加入 claim union 与 `swarm_claim` 输出 enum；协议要求并行走**唤醒更多 Worker**，而不是把任务堆给一个 Worker。
+
+### 12.20.2 闲置预警：插件看不到 teammate，只能近似
+
+`swarm_status` 无法读取 DSH 的 teammate 实时状态，因此用池子的签名做近似：
+
+```
+ready > 0 且 claimed + running === 0 且 worker_profiles 非空
+  → 末尾追加 [WARNING] Idle workers available. Please send_message to wake them up.
+```
+
+实现为纯函数 `idlePoolWarning(ready, active, configuredWorkers)`，便于单测；schema 增加 `warning?: string`。**局限**（同时写进 README Known Limitations）：在调度器之外繁忙的 Worker 与「没人被唤醒」在池子上不可区分，这条 WARNING 是「去 list_agents 看看」的提示，不是事实断言。
+
+### 12.20.3 `swarm_dispatch`：上下文剥离红线
+
+插件不拥有 `send_message`，因此新增工具 `swarm_dispatch(worker_id, message, task_id?)`：
+
+1. `buildDispatchText(message, taskId?)`（`src/core/inbox.ts`）：
+   - `message` 超过 **500** 字符 → 截断到 500，并追加 exact 行 `[SYSTEM] Message truncated to save tokens. Instruct the worker to read the task pool for full context.`；
+   - 提供 `task_id` 时前置标准指令 `去任务池领取任务 <id>，自己读 description。`。
+2. 最终文本通过 `appendInbox` 写入该 Worker 信箱（复用 inbox），返回 `final_text`、`truncated`、`chars`。
+3. 需求本体只存在于 `swarm_plan` 的 `description`；派发消息只负责「做什么 + 去哪里读」，同一份上下文不再复制三份。
+
+### 12.20.4 low 分级路由
+
+`claimTask` 增加 low 侧规则：任务 `complexity === 'low'`、claim 者 `tier === 'premium'`，且配置中存在一个 standard Worker（`worker_profiles` 里 tier 非 premium，或 legacy `worker_tiers` 值非 premium）其 stats `attempts >= 1` 且 `rate >= 0.5` → 拒绝 `worker_not_preferred`，消息点名该 standard Worker。没有合格候选时 premium 照常领取，避免把 low 任务晾在池子里。
+
+v1.6.0 的 `cache_hints`、`gateNeededFor`、`skip_local_gate → pending_review`、`reviewed` 收口**保持不变**，本次只补协议与测试（见 §12.19）。
+
+### 12.20.5 协议新增（PROTOCOL_TEXT）
+
+- 第 18 条《负载均衡铁律》：一个 Worker 同时只跑一个；有 ready 且有可用 Worker 必须唤醒；low 优先 standard。
+- 第 19 条《上下文剥离红线》：严禁把需求长文塞给 Worker；需求写进 `swarm_plan` 的 description；派发只用 `swarm_dispatch`，>500 字自动截断。
+
+### 12.20.6 测试与发布
+
+v1.7.0 新增 **10** 个用例（4 个 inbox dispatch + 6 个 task-store），全量 **237** 个全部通过：
+
+| 新增用例 | 断言 |
+|---|---|
+| `a short dispatch instruction passes through unchanged` | 短消息原样透传，`truncated` false |
+| `a dispatch longer than 500 characters is clipped with the exact notice` | 恰好截到 500 + exact `[SYSTEM]` 提示，尾部不泄漏 |
+| `a task_id adds the standard pull instruction and still truncates` | 含 task_id 的标准指令 + 截断 |
+| `the built dispatch text lands in the worker inbox intact` | 写入信箱后 readInbox 原样取回 |
+| `a worker with a running task cannot claim another one` | `worker_busy`，任务仍 pending，另一 Worker 可领 |
+| `a merely claimed task does not make its worker busy` | claimed 不触发 busy |
+| `low work prefers a standard worker that has a usable record` | `worker_not_preferred` 且点名 standard |
+| `a premium worker keeps low work when no standard worker has a record` | 无记录 → 放行 |
+| `a standard worker without recorded attempts does not take low work from premium` | attempts=0 → 放行 |
+| `the idle warning fires only for ready work with no active workers and configured workers` | 三条件缺一不触发 |
+
+| 验证项 | 结果 |
+|---|---|
+| `npx tsc -p tsconfig.json --noEmit` | exit 0 |
+| `npm test` | 237 / 237 通过 |
+| `npx tsup` | 构建成功（`lib/`） |
+| `npm pack` | `dsh-swarm-scheduler-beta-1.7.0.tgz` |
 
 ## 13. References and evidence sources
 | Conclusion | Source |

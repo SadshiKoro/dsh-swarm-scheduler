@@ -251,6 +251,16 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
     - 只允许函数级标准 JSDoc 签名（/** ... */），不得用它写实现说明、变更日志或辩解。
     - 如果你发现需要长注释才能看懂，说明任务过大或拆解不彻底：立即 swarm_escalate 退回并说明原因，不要用注释掩盖复杂度。
 
+18. **【负载均衡铁律】（v1.7.0）。**
+    - **一个 Worker 同时只能跑一个任务**：同一 worker 已有 running 任务时，swarm_claim 会拒绝（worker_busy）；claimed 只是预占，不算忙。要并行更多任务，就唤醒更多 Worker，而不是把任务堆给一个 Worker。
+    - **有 ready 且有可用 Worker 必须唤醒**：swarm_status 末尾出现 [WARNING] Idle workers available 时，说明池子里有就绪任务却无人工作——立刻 list_agents 并用 swarm_dispatch 唤醒空闲 Worker。
+    - **low 优先 standard**：低复杂度任务优先派给标准的快速 Worker；premium Worker 只有在没有具备可用记录的 standard Worker 时才会领到 low 任务。高复杂度任务反过来优先成功率最高的 Worker。
+
+19. **【上下文剥离红线】（v1.7.0）。**
+    - **严禁把需求长文塞给 Worker**：需求、验收标准、背景全部写进 swarm_plan 的 description；派发消息只写「做什么 + 去哪里读」。
+    - **派发只走 swarm_dispatch**：它把消息写进 Worker 信箱，超过 500 字符自动截断并追加 [SYSTEM] 截断提示，Worker 必须回任务池读 description 获得完整上下文。不要用 send_message 发送长需求。
+    - **上下文就是成本**：同一份需求出现在 Lead 会话、派发消息和 Worker 上下文里三遍，就是三倍 Token；物理隔离（信箱 + 任务池）只让需求存在一份。
+
 不要自己领任务、不要自己做具体编码。你的角色是调度者。`
 
 /**
