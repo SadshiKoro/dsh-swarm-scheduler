@@ -3,8 +3,8 @@
 A production-ready, event-driven parallel coding scheduler for DSH.
 
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Tests](https://img.shields.io/badge/Tests-196%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
-[![Version](https://img.shields.io/badge/Version-1.4.1-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Tests](https://img.shields.io/badge/Tests-203%20passing-brightgreen)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
+[![Version](https://img.shields.io/badge/Version-1.5.0-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 [![License](https://img.shields.io/badge/License-MIT-blue)](https://github.com/SadshiKoro/dsh-swarm-scheduler)
 
 ## Overview
@@ -22,17 +22,36 @@ Three properties make the parallelism safe rather than merely fast:
 - **The pool heals itself.** Abandoned claims are released, silent workers are flagged before they
   are killed, and a worker that cannot finish escalates instead of writing code it knows is wrong.
 
-Version 1.4.1 is the current production release: the six-state lifecycle, routing gates, watchdog,
-conflict checks, and the quality gate are covered by 196 automated tests, including a 400-claim
-concurrency stress with zero observed double-claims. v1.1.0 added the **quality gate** — a deployment
-can make "done" a checked fact rather than a worker's claim — and a reproducible **benchmark** that
-measures capability routing against blind round-robin; v1.2.0 added the anti-blockage protocol.
+Version 1.5.0 is the current production release: the six-state lifecycle, routing gates, watchdog,
+conflict checks, the quality gate and the inline-comment red line are covered by 203 automated tests,
+including a 400-claim concurrency stress with zero observed double-claims. v1.1.0 added the **quality
+gate** — a deployment can make "done" a checked fact rather than a worker's claim — and a reproducible
+**benchmark** that measures capability routing against blind round-robin; v1.2.0 added the anti-blockage
+protocol.
 **v1.4.0 adds the isolation and knowledge layer**: high-complexity work runs in a linked git worktree
 whose merge conflict blocks the task instead of damaging the main checkout, a task token budget that
 trips a circuit breaker, `needs_upgrade` escalation when a recorded model keeps failing, a
 non-interrupting **whisper inbox**, and **anchor recall** for finding earlier work. It also states,
 explicitly, the property the feature set was built to keep: **there is no hidden model downgrade —
 model control belongs to the developer.**
+**v1.5.0 adds the comment red line**: a completion that adds two or more inline comment lines is
+blocked, because *无法被执行的注释，就是未被验证的谎言。* (a comment that cannot be executed is a lie
+that was never verified). Design intent belongs in `anchors`, where `swarm_recall` can find it.
+
+## What's new in 1.5.0
+
+- **Inline-comment red line (`forbid_inline_comments`, default on).** `swarm_complete` audits the
+  task's declared `write_scopes` on every success claim: it diffs the isolated workspace against
+  `HEAD` (`git diff --unified=0`), counts **only the added lines** that are inline comments (a line
+  starting with `//`, or a trailing ` // ` not part of a `://` scheme), exempts JSDoc/block-comment
+  lines, and counts untracked files in full. Two or more added comment lines block the task with
+  `Too many inline comments. Code must be self-explanatory. Move your design intent to anchors, or
+  escalate if the task is too complex.` The audit runs after the quality gate and before the budget
+  check, while the isolated worktree still exists. Set `forbid_inline_comments: false` to opt out.
+- **Design rationale, stated in the protocol.** The dispatch protocol now carries a four-part
+  「代码洁净与无注释红线」 clause: no explanatory/defensive inline comments, self-explanatory code,
+  design intent in `anchors` instead of source prose, JSDoc signatures only, and escalate rather than
+  hide complexity behind a wall of comments.
 
 ## What's new in 1.4.1
 
@@ -133,13 +152,19 @@ model control belongs to the developer.**
   runs that command, and a **non-zero exit turns the completion into a failure** (`retry_count + 1`,
   with the command's output quoted into `failure_reason`). A worker saying "done" is a claim, not a
   decision. Off by default: an empty command changes nothing.
+- **Inline-comment red line** — `forbid_inline_comments` (default on) audits the lines the worker added
+  in its declared scopes: two or more new inline comment lines block the completion (`Too many inline
+  comments…`) instead of completing it. JSDoc/block comments are exempt, untouched comments are not
+  counted, and design intent belongs in `anchors` — a comment cannot be executed, so nothing can verify
+  it is still true.
 - **Explicit non-feature: no model control** — the scheduler knows nothing about providers and has no
   code path that selects, swaps, or downgrades a model. `model` is a recorded assignment, `needs_upgrade`
   is a signal, and replacing either is an explicit Lead action. Model control belongs to the developer.
-- **Test coverage** — 196 automated tests, including a claim-lock stress suite of 400 concurrent
+- **Test coverage** — 203 automated tests, including a claim-lock stress suite of 400 concurrent
   claims (10 workers × 2 cases × 20 rounds) that produced zero double-claims, a cross-process
-  case where two real OS processes race one lock file, and six real-git worktree cases covering
-  create/merge/conflict/remove.
+  case where two real OS processes race one lock file, six real-git worktree cases covering
+  create/merge/conflict/remove, and the v1.5.0 comment-audit cases (diff, JSDoc exemption, untracked
+  files, directory scopes).
 
 ## Installation
 
@@ -185,6 +210,8 @@ Give the plugin's entry a `config` block in the profile's `cordis.patch.yml`:
         tasksRoot: 'C:/your/workspace/absolute/path'
         # optional: refuse a completion unless this command exits 0
         quality_gate_command: 'npm test && npx tsc --noEmit'
+        # optional: the inline-comment red line (default true)
+        forbid_inline_comments: true
 
 Use an **absolute path with forward slashes**. The pool is created as
 `<tasksRoot>/.dsh-tasks/<task_id>.json`.
@@ -198,6 +225,15 @@ pool, *not* `.dsh-tasks/`, and *not* the profile directory). A non-zero exit rec
 - The gate judges the **whole workspace**, so a task can be failed by someone else's breakage. Run
   builds and tests locally before completing, and say which command you ran in your result.
 - `success: false` never runs the gate: a worker that already admits failure does not need to be told.
+
+**`forbid_inline_comments` (optional, default on).** The v1.5.0 red line. Every `success: true`
+completion audits the task's `write_scopes` for lines the worker **added**: a line starting with `//`,
+or a trailing ` // ` (a `://` scheme is excluded), while JSDoc/block-comment lines are exempt. Two or
+more added comment lines block the task; untracked files are counted in full. The audit reads the
+isolated worktree before any merge, so it judges exactly the worker's own diff. Why the rule exists:
+**无法被执行的注释，就是未被验证的谎言。** A comment cannot be executed, so nothing can catch it when it
+becomes false. Put design intent in `anchors`, where `swarm_recall` can find it, not in the source.
+Set `forbid_inline_comments: false` only for a repository whose style genuinely needs prose in code.
 
 Other settings, all optional: `staleAssignmentSec` (default 600, also the `swarm_status` STALE
 threshold), `max_workers` (default 3 concurrent claimed + running tasks), `auto_reap` (default true),
@@ -344,10 +380,11 @@ about everything else.
 stdio in a confined environment and fails with `spawn EPERM`. Single-process execution avoids that
 entirely. `npm run test:sandbox` is a retained alias for the same command.
 
-The suite contains **196 tests** covering the six-state lifecycle, retry and blocked transitions,
+The suite contains **203 tests** covering the six-state lifecycle, retry and blocked transitions,
 scope admission, hash verification, routing refusals, the two-phase STALE window, the quality gate,
-the token budget and `needs_upgrade` accounting, worktree create/merge/conflict/remove, the whisper
-inbox and its ack semantics, anchor recall, and concurrent races. Six cases deserve note:
+the token budget and `needs_upgrade` accounting, worktree create/merge/conflict/remove, the
+inline-comment audit, the whisper inbox and its ack semantics, anchor recall, and concurrent races.
+Six cases deserve note:
 
 - `test/core/stress.test.ts` runs 10 workers against 50 tasks over 10 scopes and asserts every task
   is claimed exactly once and that no two overlapping scopes were ever held simultaneously.

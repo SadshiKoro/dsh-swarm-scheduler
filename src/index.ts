@@ -234,6 +234,13 @@ const PROTOCOL_TEXT = `当用户提出一个较大的编码需求（涉及多个
     - Worker 不确定某个 API/字段存不存在时，**直接读源码**（src/core/*.ts 与工具定义），不要猜；猜出来的字段会让 tsc 或测试变红。
     - **不存在任何自动模型降级/自动换模型**：调度器不认识 provider，也不会自作主张换模型。swarm_status 行尾的 [ROUTING] Task X on <model|inherit> 只是**记录**；同一任务连续失败两次会置 needs_upgrade=true，而「换成一个更强的模型/Worker」是 **Lead 唯一允许的替换动作**，必须由你显式执行——它绝不会自动发生。
 
+16. **【代码洁净与无注释红线】。**
+    这是硬门禁（配置项 forbid_inline_comments，默认开启）：每次成功完成会审计 write_scopes 内**新增**的行，新增行内注释达到 2 行即打回 blocked。
+    - 严禁解释性/辩解性行内注释：「// TODO」「// 暂时这样」「// 这里可能有问题」一律不允许。注释无法被执行，因此无法被验证——**无法被执行的注释，就是未被验证的谎言。**
+    - 代码必须自解释：命名与结构能表达清楚的，就不要写注释；设计意图必须写进 swarm_complete 的 anchors，不得写进代码文件。
+    - 只允许函数级标准 JSDoc 签名（/** ... */），不得用它写实现说明、变更日志或辩解。
+    - 如果你发现需要长注释才能看懂，说明任务过大或拆解不彻底：立即 swarm_escalate 退回并说明原因，不要用注释掩盖复杂度。
+
 不要自己领任务、不要自己做具体编码。你的角色是调度者。`
 
 /**
@@ -275,6 +282,7 @@ export function apply(ctx: Context, config: SwarmConfig) {
       worker_tiers: config.worker_tiers ?? {},
       worker_profiles: config.worker_profiles ?? {},
       quality_gate_command: config.quality_gate_command ?? '',
+      forbid_inline_comments: config.forbid_inline_comments ?? true,
       disposers,
     })
 

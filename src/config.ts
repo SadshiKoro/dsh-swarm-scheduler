@@ -97,6 +97,16 @@ export interface Config {
    * is opt-in, so a deployment that never sets it behaves exactly as before.
    */
   quality_gate_command: string
+  /**
+   * Refuse completions that add inline comments (v1.5.0). Default true.
+   *
+   * A comment cannot be executed, so nothing verifies that it is still true; the
+   * audit counts only the lines the worker added (see `comment-audit.ts`) and
+   * blocks the completion when two or more are inline commentary. Design intent
+   * belongs in `anchors`, which `swarm_recall` can find. Set `false` to opt out
+   * for a repository whose style requires prose in code.
+   */
+  forbid_inline_comments: boolean
 }
 
 /**
@@ -132,6 +142,7 @@ export const Config: Schema<Config> = Schema.object({
     cost_per_1k_tokens: Schema.number().default(0.01),
   })).default({}),
   quality_gate_command: Schema.string().default(''),
+  forbid_inline_comments: Schema.boolean().default(true),
 })
 
 /**

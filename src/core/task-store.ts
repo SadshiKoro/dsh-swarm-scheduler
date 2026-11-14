@@ -36,6 +36,7 @@ import {
 } from './state-machine.ts'
 import { findScopeConflict, normalizeScope, scopesOverlap } from './scope.ts'
 import { createWorkspace, mergeWorkspace, removeWorkspace } from './workspace.ts'
+import { auditInlineComments } from './comment-audit.ts'
 
 // Re-exported so callers keep one import site for the pool surface.
 export {
@@ -1381,7 +1382,21 @@ export interface CompleteTaskOptions {
   }
   /** Working directory for the gate; defaults to the workspace (the pool's parent). */
   cwd?: string
+  /**
+   * Inline-comment red line (v1.5.0): audit the task's added lines before a
+   * success is recorded. `workspace` is the isolated worktree (empty when the
+   * task ran in the main checkout), `scopes` are its declared `write_scopes`.
+   */
+  commentAudit?: {
+    repoRoot: string
+    workspace: string
+    scopes: string[]
+  }
 }
+
+/** Exact `failure_reason` written when the v1.5.0 inline-comment audit fails. */
+export const TOO_MANY_INLINE_COMMENTS =
+  'Too many inline comments. Code must be self-explanatory. Move your design intent to anchors, or escalate if the task is too complex.'
 
 /**
  * Mark a task completed or failed, with retry logic.
@@ -1442,6 +1457,22 @@ export async function completeTask(
   // A gate failure is a failure with a reason: same retry path as below.
   const effectiveSuccess = success && gateFailure === undefined
 
+  // --- inline-comment red line (v1.5.0) -----------------------------------
+  // Runs after the quality gate and before the budget/merge work, because it
+  // must read the changes in their isolated tree: after a merge it would be
+  // reading the main checkout, and after `removeWorkspace` there is nothing
+  // left to audit.
+  const commentAudit = options?.commentAudit
+  let commentFailure: string | undefined
+  if (effectiveSuccess && commentAudit !== undefined) {
+    const audited = auditInlineComments({
+      repoRoot: commentAudit.repoRoot,
+      workspace: commentAudit.workspace,
+      scopes: commentAudit.scopes,
+    })
+    if (!audited.ok) commentFailure = TOO_MANY_INLINE_COMMENTS
+  }
+
   // --- budget accounting (v1.4.0) ----------------------------------------
   // A successful attempt's self-reported tokens accumulate even when the pool
   // then refuses to call it completed: the spend happened either way.
@@ -1454,6 +1485,7 @@ export async function completeTask(
   // attempt already has its own retry accounting and must not be rewritten into
   // a budget block (that would silently swallow the failure).
   const budgetExceeded = effectiveSuccess
+    && commentFailure === undefined
     && found.task.max_budget_tokens > 0
     && tokensUsed > found.task.max_budget_tokens
 
@@ -1463,7 +1495,7 @@ export async function completeTask(
   // overwriting the record into a completed/failed one.
   let workspaceFailure: string | undefined
   if (found.task.workspace !== '') {
-    if (effectiveSuccess && !budgetExceeded) {
+    if (effectiveSuccess && !budgetExceeded && commentFailure === undefined) {
       const merged = mergeWorkspace(found.task.workspace)
       if (!merged.ok) {
         workspaceFailure = merged.conflict ? 'Merge conflict' : `Merge failed: ${merged.message}`
@@ -1476,7 +1508,21 @@ export async function completeTask(
   let next: TaskRecord
   let code: 'completed' | 'failed' | 'blocked'
   let message: string
-  if (effectiveSuccess && budgetExceeded) {
+  if (effectiveSuccess && commentFailure !== undefined) {
+    next = {
+      ...found.task,
+      status: 'blocked',
+      claimed_by: '',
+      claimed_at: '',
+      completed_at: stamp,
+      result,
+      tokens_used: tokensUsed,
+      failure_reason: commentFailure,
+      workspace: '',
+    }
+    code = 'blocked'
+    message = `${taskId} blocked — ${commentFailure}`
+  } else if (effectiveSuccess && budgetExceeded) {
     next = {
       ...found.task,
       status: 'blocked',
@@ -1553,14 +1599,16 @@ export async function completeTask(
   if (!written.ok) {
     return { ok: false, code: 'io_error', message: `${code} not persisted: ${written.error ?? 'unknown'}`, degraded: written.degraded }
   }
-  // The budget brake explicitly drops the claim: the task is blocked, not held
-  // by a worker that already reported in.
-  if (budgetExceeded) removeLock(store.dirPath, taskId)
-  const event = budgetExceeded
-    ? 'blocked:budget'
-    : workspaceFailure !== undefined
-      ? 'blocked:merge'
-      : gateFailure !== undefined ? `${code}:quality-gate` : code
+  // The budget brake and the comment red line explicitly drop the claim: the
+  // task is blocked, not held by a worker that already reported in.
+  if (budgetExceeded || commentFailure !== undefined) removeLock(store.dirPath, taskId)
+  const event = commentFailure !== undefined
+    ? 'blocked:comments'
+    : budgetExceeded
+      ? 'blocked:budget'
+      : workspaceFailure !== undefined
+        ? 'blocked:merge'
+        : gateFailure !== undefined ? `${code}:quality-gate` : code
   await logTransition(store, taskId, event, completedBy)
   // Reliability and performance telemetry: record the attempt, and on success
   // accumulate the worker's self-reported tokens/runtime. This feeds the
